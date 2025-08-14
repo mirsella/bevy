@@ -322,7 +322,7 @@ pub struct Mesh2dPipeline {
 }
 
 impl FromWorld for Mesh2dPipeline {
-    fn from_world(world: &mut World) -> Self {
+     fn from_world(world: &mut World) -> Self {
         let mut system_state: SystemState<(
             Res<RenderDevice>,
             Res<RenderQueue>,
@@ -368,17 +368,18 @@ impl FromWorld for Mesh2dPipeline {
                 }
             };
 
-            let format_size = image.texture_descriptor.format.pixel_size();
-            render_queue.write_texture(
-                texture.as_image_copy(),
-                image.data.as_ref().expect("Image has no data"),
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(image.width() * format_size as u32),
-                    rows_per_image: None,
-                },
-                image.texture_descriptor.size,
-            );
+            if let Ok(format_size) = image.texture_descriptor.format.pixel_size() {
+                render_queue.write_texture(
+                    texture.as_image_copy(),
+                    image.data.as_ref().expect("Image has no data"),
+                    TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(image.width() * format_size as u32),
+                        rows_per_image: None,
+                    },
+                    image.texture_descriptor.size,
+                );
+            }
 
             let texture_view = texture.create_view(&TextureViewDescriptor::default());
             GpuImage {
