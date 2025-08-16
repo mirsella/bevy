@@ -322,7 +322,7 @@ pub struct Mesh2dPipeline {
 }
 
 impl FromWorld for Mesh2dPipeline {
-     fn from_world(world: &mut World) -> Self {
+    fn from_world(world: &mut World) -> Self {
         let mut system_state: SystemState<(
             Res<RenderDevice>,
             Res<RenderQueue>,

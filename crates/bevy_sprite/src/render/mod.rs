@@ -51,7 +51,7 @@ pub struct SpritePipeline {
 }
 
 impl FromWorld for SpritePipeline {
-     fn from_world(world: &mut World) -> Self {
+    fn from_world(world: &mut World) -> Self {
         let mut system_state: SystemState<(
             Res<RenderDevice>,
             Res<DefaultImageSampler>,
