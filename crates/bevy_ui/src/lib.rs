@@ -226,7 +226,8 @@ impl Plugin for UiPlugin {
         }
 
         #[cfg(feature = "bevy_ui_debug")]
-        app.init_resource::<UiDebugOptions>();
+        app.init_resource::<UiDebugOptions>()
+            .register_type::<UiDebugOptions>();
 
         build_ui_render(app);
     }

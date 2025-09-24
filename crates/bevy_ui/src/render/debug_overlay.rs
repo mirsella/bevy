@@ -4,6 +4,7 @@ use crate::ComputedNode;
 use bevy_asset::AssetId;
 use bevy_color::Hsla;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::prelude::ReflectResource;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::system::Commands;
 use bevy_ecs::system::Query;
@@ -11,6 +12,7 @@ use bevy_ecs::system::Res;
 use bevy_ecs::system::ResMut;
 use bevy_math::Rect;
 use bevy_math::Vec2;
+use bevy_reflect::Reflect;
 use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::view::InheritedVisibility;
 use bevy_render::Extract;
@@ -24,7 +26,8 @@ use super::NodeType;
 use super::UiCameraMap;
 
 /// Configuration for the UI debug overlay
-#[derive(Resource)]
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
 pub struct UiDebugOptions {
     /// Set to true to enable the UI debug overlay
     pub enabled: bool,
