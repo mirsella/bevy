@@ -43,14 +43,18 @@ pub use texture_slice::*;
 
 use bevy_app::prelude::*;
 use bevy_asset::{load_internal_asset, weak_handle, AssetEvents, Assets, Handle};
-use bevy_core_pipeline::core_2d::{AlphaMask2d, Opaque2d, Transparent2d};
+use bevy_core_pipeline::core_2d::{
+    graph::{Core2d, Node2d},
+    AlphaMask2d, Opaque2d,
+};
 use bevy_ecs::prelude::*;
 use bevy_image::{prelude::*, TextureAtlasPlugin};
 use bevy_render::{
     batching::sort_binned_render_phase,
     mesh::{Mesh, Mesh2d, MeshAabb},
     primitives::Aabb,
-    render_phase::AddRenderCommand,
+    render_graph::{RenderGraphApp, ViewNodeRunner},
+    render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions, ViewSortedRenderPhases},
     render_resource::{Shader, SpecializedRenderPipelines},
     view::{NoFrustumCulling, VisibilitySystems},
     ExtractSchedule, Render, RenderApp, RenderSet,
@@ -64,6 +68,8 @@ pub const SPRITE_SHADER_HANDLE: Handle<Shader> =
     weak_handle!("ed996613-54c0-49bd-81be-1c2d1a0d03c2");
 pub const SPRITE_VIEW_BINDINGS_SHADER_HANDLE: Handle<Shader> =
     weak_handle!("43947210-8df6-459a-8f2a-12f350d174cc");
+pub const SRGB_COMPOSITE_SHADER_HANDLE: Handle<Shader> =
+    weak_handle!("a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d");
 
 /// System set for sprite rendering.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
@@ -84,6 +90,12 @@ impl Plugin for SpritePlugin {
             app,
             SPRITE_VIEW_BINDINGS_SHADER_HANDLE,
             "render/sprite_view_bindings.wgsl",
+            Shader::from_wgsl
+        );
+        load_internal_asset!(
+            app,
+            SRGB_COMPOSITE_SHADER_HANDLE,
+            "render/srgb_composite.wgsl",
             Shader::from_wgsl
         );
 
@@ -116,30 +128,43 @@ impl Plugin for SpritePlugin {
             render_app
                 .init_resource::<ImageBindGroups>()
                 .init_resource::<SpecializedRenderPipelines<SpritePipeline>>()
+                .init_resource::<SpecializedRenderPipelines<SrgbSpritePipeline>>()
                 .init_resource::<SpriteMeta>()
                 .init_resource::<ExtractedSprites>()
                 .init_resource::<ExtractedSlices>()
                 .init_resource::<SpriteAssetEvents>()
-                .add_render_command::<Transparent2d, DrawSprite>()
+                .init_resource::<DrawFunctions<SrgbTransparent2d>>()
+                .init_resource::<ViewSortedRenderPhases<SrgbTransparent2d>>()
+                .add_render_command::<SrgbTransparent2d, DrawSprite>()
                 .add_systems(
                     ExtractSchedule,
                     (
-                        extract_sprites.in_set(SpriteSystem::ExtractSprites),
                         extract_sprite_events,
+                        extract_sprites,
+                        extract_srgb_sprite_camera_phases,
                     ),
                 )
                 .add_systems(
                     Render,
                     (
-                        queue_sprites
-                            .in_set(RenderSet::Queue)
-                            .ambiguous_with(queue_material2d_meshes::<ColorMaterial>),
-                        prepare_sprite_image_bind_groups.in_set(RenderSet::PrepareBindGroups),
                         prepare_sprite_view_bind_groups.in_set(RenderSet::PrepareBindGroups),
+                        prepare_srgb_sprite_textures.in_set(RenderSet::PrepareResources),
+                        prepare_srgb_composite_bind_groups.in_set(RenderSet::PrepareBindGroups),
+                        queue_sprites.in_set(RenderSet::Queue),
+                        prepare_sprite_image_bind_groups.in_set(RenderSet::PrepareBindGroups),
+                        sort_phase_system::<SrgbTransparent2d>.in_set(RenderSet::PhaseSort),
                         sort_binned_render_phase::<Opaque2d>.in_set(RenderSet::PhaseSort),
                         sort_binned_render_phase::<AlphaMask2d>.in_set(RenderSet::PhaseSort),
                     ),
-                );
+                )
+                .add_render_graph_node::<ViewNodeRunner<SrgbSpritePassNode>>(Core2d, SrgbSpritePass)
+                .add_render_graph_node::<ViewNodeRunner<SrgbCompositePassNode>>(
+                    Core2d,
+                    SrgbCompositePass,
+                )
+                .add_render_graph_edge(Core2d, Node2d::MainOpaquePass, SrgbSpritePass)
+                .add_render_graph_edge(Core2d, SrgbSpritePass, SrgbCompositePass)
+                .add_render_graph_edge(Core2d, SrgbCompositePass, Node2d::MainTransparentPass);
         };
     }
 
@@ -147,7 +172,9 @@ impl Plugin for SpritePlugin {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<SpriteBatches>()
-                .init_resource::<SpritePipeline>();
+                .init_resource::<SpritePipeline>()
+                .init_resource::<SrgbSpritePipeline>()
+                .init_resource::<SrgbCompositePipeline>();
         }
     }
 }
