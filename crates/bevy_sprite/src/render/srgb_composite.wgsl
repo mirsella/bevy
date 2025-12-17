@@ -7,12 +7,9 @@
 @group(0) @binding(0) var srgb_texture: texture_2d<f32>;
 @group(0) @binding(1) var srgb_sampler: sampler;
 
-// Convert sRGB to linear RGB (precise formula matching sRGB standard)
+// Convert sRGB to linear RGB (approximate Gamma 2.2)
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
-    let cutoff = vec3<f32>(0.04045);
-    let low = c / 12.92;
-    let high = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
-    return select(low, high, c > cutoff);
+    return pow(c, vec3<f32>(2.2));
 }
 
 @fragment

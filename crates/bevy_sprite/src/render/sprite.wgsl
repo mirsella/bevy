@@ -3,7 +3,7 @@
 #endif
 
 #import bevy_render::{
-    maths::affine3_to_square,
+    maths::{affine3_to_square, powsafe},
     view::View,
 }
 
@@ -53,10 +53,7 @@ fn vertex(in: VertexInput) -> VertexOutput {
 
 #ifdef SRGB_SPRITE_PASS
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    let cutoff = vec3<f32>(0.0031308);
-    let low = 12.92 * c;
-    let high = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
-    return select(low, high, c > cutoff);
+    return powsafe(c, 1.0 / 2.2);
 }
 #endif
 
