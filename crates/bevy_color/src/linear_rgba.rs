@@ -251,19 +251,103 @@ impl EuclideanDistance for LinearRgba {
 
 impl ColorToComponents for LinearRgba {
     fn to_f32_array(self) -> [f32; 4] {
-        [self.red, self.green, self.blue, self.alpha]
+        // Clamp values to [0.0, 1.0] to prevent rendering issues, especially on WebGPU.
+        // Out-of-range values can cause black screens or other artifacts.
+        // NaN is intentionally preserved as it's used for some rendering hacks (e.g., hiding geometry).
+        [
+            if self.red.is_nan() {
+                self.red
+            } else {
+                self.red.clamp(0.0, 1.0)
+            },
+            if self.green.is_nan() {
+                self.green
+            } else {
+                self.green.clamp(0.0, 1.0)
+            },
+            if self.blue.is_nan() {
+                self.blue
+            } else {
+                self.blue.clamp(0.0, 1.0)
+            },
+            if self.alpha.is_nan() {
+                self.alpha
+            } else {
+                self.alpha.clamp(0.0, 1.0)
+            },
+        ]
     }
 
     fn to_f32_array_no_alpha(self) -> [f32; 3] {
-        [self.red, self.green, self.blue]
+        // Clamp values to [0.0, 1.0] to prevent rendering issues, especially on WebGPU.
+        // Out-of-range values can cause black screens or other artifacts.
+        // NaN is intentionally preserved as it's used for some rendering hacks (e.g., hiding geometry).
+        [
+            if self.red.is_nan() {
+                self.red
+            } else {
+                self.red.clamp(0.0, 1.0)
+            },
+            if self.green.is_nan() {
+                self.green
+            } else {
+                self.green.clamp(0.0, 1.0)
+            },
+            if self.blue.is_nan() {
+                self.blue
+            } else {
+                self.blue.clamp(0.0, 1.0)
+            },
+        ]
     }
 
     fn to_vec4(self) -> Vec4 {
-        Vec4::new(self.red, self.green, self.blue, self.alpha)
+        // Clamp values to [0.0, 1.0] to prevent rendering issues, especially on WebGPU.
+        // NaN is intentionally preserved as it's used for some rendering hacks.
+        Vec4::new(
+            if self.red.is_nan() {
+                self.red
+            } else {
+                self.red.clamp(0.0, 1.0)
+            },
+            if self.green.is_nan() {
+                self.green
+            } else {
+                self.green.clamp(0.0, 1.0)
+            },
+            if self.blue.is_nan() {
+                self.blue
+            } else {
+                self.blue.clamp(0.0, 1.0)
+            },
+            if self.alpha.is_nan() {
+                self.alpha
+            } else {
+                self.alpha.clamp(0.0, 1.0)
+            },
+        )
     }
 
     fn to_vec3(self) -> Vec3 {
-        Vec3::new(self.red, self.green, self.blue)
+        // Clamp values to [0.0, 1.0] to prevent rendering issues, especially on WebGPU.
+        // NaN is intentionally preserved as it's used for some rendering hacks.
+        Vec3::new(
+            if self.red.is_nan() {
+                self.red
+            } else {
+                self.red.clamp(0.0, 1.0)
+            },
+            if self.green.is_nan() {
+                self.green
+            } else {
+                self.green.clamp(0.0, 1.0)
+            },
+            if self.blue.is_nan() {
+                self.blue
+            } else {
+                self.blue.clamp(0.0, 1.0)
+            },
+        )
     }
 
     fn from_f32_array(color: [f32; 4]) -> Self {
