@@ -241,7 +241,9 @@ impl Plugin for UiPlugin {
             return;
         };
 
-        render_app.init_resource::<UiPipeline>();
+        render_app
+            .init_resource::<UiPipeline>()
+            .init_resource::<SrgbUiCompositePipeline>();
     }
 }
 

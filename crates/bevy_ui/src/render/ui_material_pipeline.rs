@@ -10,7 +10,6 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_image::BevyDefault as _;
 use bevy_math::{FloatOrd, Mat4, Rect, Vec2, Vec4Swizzles};
 use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
 use bevy_render::{
@@ -162,7 +161,7 @@ where
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
+        let shader_defs = vec!["MANUAL_SRGB".into()];
 
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
@@ -176,11 +175,7 @@ where
                 shader_defs,
                 entry_point: "fragment".into(),
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -621,7 +616,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     pipeline_cache: Res<PipelineCache>,
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    render_views: Query<&UiCameraView, With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
@@ -633,8 +628,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             continue;
         };
 
-        let Ok(default_camera_view) =
-            render_views.get_mut(extracted_uinode.extracted_camera_entity)
+        let Ok(default_camera_view) = render_views.get(extracted_uinode.extracted_camera_entity)
         else {
             continue;
         };
@@ -652,10 +646,10 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             &pipeline_cache,
             &ui_material_pipeline,
             UiMaterialKey {
-                hdr: view.hdr,
                 bind_group_data: material.key.clone(),
             },
         );
+
         if transparent_phase.items.capacity() < extracted_uinodes.uinodes.len() {
             transparent_phase.items.reserve_exact(
                 extracted_uinodes.uinodes.len() - transparent_phase.items.capacity(),

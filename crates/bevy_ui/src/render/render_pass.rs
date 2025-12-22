@@ -1,34 +1,42 @@
 use core::ops::Range;
 
-use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
+use super::{ImageNodeBindGroups, SrgbUiComposite, UiBatch, UiMeta, UiViewTarget};
 use crate::UiCameraView;
+use bevy_color::LinearRgba;
 use bevy_ecs::{
     prelude::*,
     system::{lifetimeless::*, SystemParamItem},
 };
-use bevy_math::FloatOrd;
+use bevy_math::{FloatOrd, UVec2};
 use bevy_render::sync_world::MainEntity;
 use bevy_render::{
     camera::ExtractedCamera,
     render_graph::*,
     render_phase::*,
-    render_resource::{CachedRenderPipelineId, RenderPassDescriptor},
+    render_resource::{
+        CachedRenderPipelineId, LoadOp, Operations, PipelineCache, RenderPassColorAttachment,
+        RenderPassDescriptor, StoreOp,
+    },
     renderer::*,
     view::*,
 };
 use tracing::error;
 
 pub struct UiPassNode {
-    ui_view_query: QueryState<(&'static ExtractedView, &'static UiViewTarget)>,
-    ui_view_target_query: QueryState<(&'static ViewTarget, &'static ExtractedCamera)>,
+    ui_view_query: QueryState<(
+        &'static ExtractedView,
+        &'static UiViewTarget,
+        Option<&'static SrgbUiComposite>,
+    )>,
+    view_target_query: QueryState<(&'static ViewTarget, &'static ExtractedCamera)>,
     ui_camera_view_query: QueryState<&'static UiCameraView>,
 }
 
 impl UiPassNode {
     pub fn new(world: &mut World) -> Self {
         Self {
-            ui_view_query: world.query_filtered(),
-            ui_view_target_query: world.query(),
+            ui_view_query: world.query(),
+            view_target_query: world.query(),
             ui_camera_view_query: world.query(),
         }
     }
@@ -37,17 +45,16 @@ impl UiPassNode {
 impl Node for UiPassNode {
     fn update(&mut self, world: &mut World) {
         self.ui_view_query.update_archetypes(world);
-        self.ui_view_target_query.update_archetypes(world);
+        self.view_target_query.update_archetypes(world);
         self.ui_camera_view_query.update_archetypes(world);
     }
 
-    fn run(
+    fn run<'w>(
         &self,
         graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
+        render_context: &mut RenderContext<'w>,
+        world: &'w World,
     ) -> Result<(), NodeRunError> {
-        // Extract the UI view.
         let input_view_entity = graph.view_entity();
 
         let Some(transparent_render_phases) =
@@ -56,15 +63,13 @@ impl Node for UiPassNode {
             return Ok(());
         };
 
-        // Query the UI view components.
-        let Ok((view, ui_view_target)) = self.ui_view_query.get_manual(world, input_view_entity)
+        let Ok((view, ui_view_target, srgb_composite)) =
+            self.ui_view_query.get_manual(world, input_view_entity)
         else {
             return Ok(());
         };
 
-        let Ok((target, camera)) = self
-            .ui_view_target_query
-            .get_manual(world, ui_view_target.0)
+        let Ok((target, camera)) = self.view_target_query.get_manual(world, ui_view_target.0)
         else {
             return Ok(());
         };
@@ -78,7 +83,6 @@ impl Node for UiPassNode {
             return Ok(());
         }
 
-        // use the UI view entity if it is defined
         let view_entity = if let Ok(ui_camera_view) = self
             .ui_camera_view_query
             .get_manual(world, input_view_entity)
@@ -87,18 +91,68 @@ impl Node for UiPassNode {
         } else {
             input_view_entity
         };
-        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("ui_pass"),
-            color_attachments: &[Some(target.get_unsampled_color_attachment())],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        if let Some(viewport) = camera.viewport.as_ref() {
-            render_pass.set_camera_viewport(viewport);
-        }
-        if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the ui phase {err:?}");
+
+        if let Some(composite) = srgb_composite {
+            {
+                let mut render_pass =
+                    render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                        label: Some("ui_pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &composite.texture_view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(LinearRgba::NONE.into()),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                if let Some(viewport) = camera.viewport.as_ref() {
+                    let mut viewport = viewport.clone();
+                    viewport.physical_position = UVec2::ZERO;
+                    render_pass.set_camera_viewport(&viewport);
+                }
+                if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
+                    error!("Error encountered while rendering the ui phase {err:?}");
+                }
+            }
+
+            let pipeline_cache = world.resource::<PipelineCache>();
+            if let Some(render_pipeline) = pipeline_cache.get_render_pipeline(composite.pipeline_id)
+            {
+                let mut render_pass =
+                    render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                        label: Some("ui_composite_pass"),
+                        color_attachments: &[Some(target.get_unsampled_color_attachment())],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+
+                if let Some(viewport) = camera.viewport.as_ref() {
+                    render_pass.set_camera_viewport(viewport);
+                }
+
+                render_pass.set_render_pipeline(render_pipeline);
+                render_pass.set_bind_group(0, &composite.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
+        } else {
+            let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("ui_pass"),
+                color_attachments: &[Some(target.get_unsampled_color_attachment())],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if let Some(viewport) = camera.viewport.as_ref() {
+                render_pass.set_camera_viewport(viewport);
+            }
+            if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
+                error!("Error encountered while rendering the ui phase {err:?}");
+            }
         }
 
         Ok(())
@@ -254,15 +308,12 @@ impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
             return RenderCommandResult::Failure("missing indices to draw ui");
         };
 
-        // Store the vertices
         pass.set_vertex_buffer(0, vertices.slice(..));
-        // Define how to "connect" the vertices
         pass.set_index_buffer(
             indices.slice(..),
             0,
             bevy_render::render_resource::IndexFormat::Uint32,
         );
-        // Draw the vertices
         pass.draw_indexed(batch.range.clone(), 0, 0..1);
         RenderCommandResult::Success
     }

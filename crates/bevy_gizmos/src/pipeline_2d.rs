@@ -100,11 +100,7 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
     type Key = LineGizmoPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let format = if key.mesh_key.contains(Mesh2dPipelineKey::HDR) {
-            ViewTarget::TEXTURE_FORMAT_HDR
-        } else {
-            TextureFormat::bevy_default()
-        };
+        let format = TextureFormat::bevy_default();
 
         let shader_defs = vec![
             #[cfg(feature = "webgl")]
@@ -197,11 +193,7 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
     type Key = LineJointGizmoPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let format = if key.mesh_key.contains(Mesh2dPipelineKey::HDR) {
-            ViewTarget::TEXTURE_FORMAT_HDR
-        } else {
-            TextureFormat::bevy_default()
-        };
+        let format = TextureFormat::bevy_default();
 
         let shader_defs = vec![
             #[cfg(feature = "webgl")]
@@ -311,8 +303,7 @@ fn queue_line_gizmos_2d(
             continue;
         };
 
-        let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
-            | Mesh2dPipelineKey::from_hdr(view.hdr);
+        let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples());
 
         let render_layers = render_layers.unwrap_or_default();
         for (entity, main_entity, config) in &line_gizmos {
@@ -391,8 +382,7 @@ fn queue_line_joint_gizmos_2d(
             continue;
         };
 
-        let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
-            | Mesh2dPipelineKey::from_hdr(view.hdr);
+        let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples());
 
         let render_layers = render_layers.unwrap_or_default();
         for (entity, main_entity, config) in &line_gizmos {

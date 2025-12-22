@@ -17,7 +17,6 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_image::BevyDefault as _;
 use bevy_math::{vec2, FloatOrd, Mat4, Rect, Vec2, Vec3Swizzles, Vec4Swizzles};
 use bevy_render::sync_world::MainEntity;
 use bevy_render::RenderApp;
@@ -135,7 +134,6 @@ impl FromWorld for BoxShadowPipeline {
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct BoxShadowPipelineKey {
-    pub hdr: bool,
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
 }
@@ -163,10 +161,10 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = vec![ShaderDefVal::UInt(
-            "SHADOW_SAMPLES".to_string(),
-            key.samples,
-        )];
+        let shader_defs = vec![
+            ShaderDefVal::UInt("SHADOW_SAMPLES".to_string(), key.samples),
+            "MANUAL_SRGB".into(),
+        ];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -180,15 +178,12 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 shader_defs,
                 entry_point: "fragment".into(),
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
+
             layout: vec![self.view_layout.clone()],
             push_constant_ranges: Vec::new(),
             primitive: PrimitiveState {
@@ -329,7 +324,7 @@ pub fn queue_shadows(
     box_shadow_pipeline: Res<BoxShadowPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BoxShadowPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
+    render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -338,7 +333,7 @@ pub fn queue_shadows(
     for (index, extracted_shadow) in extracted_box_shadows.box_shadows.iter().enumerate() {
         let entity = extracted_shadow.render_entity;
         let Ok((default_camera_view, shadow_samples)) =
-            render_views.get_mut(extracted_shadow.extracted_camera_entity)
+            render_views.get(extracted_shadow.extracted_camera_entity)
         else {
             continue;
         };
@@ -356,8 +351,9 @@ pub fn queue_shadows(
             &pipeline_cache,
             &box_shadow_pipeline,
             BoxShadowPipelineKey {
-                hdr: view.hdr,
-                samples: shadow_samples.copied().unwrap_or_default().0,
+                samples: shadow_samples
+                    .map(|s| s.0)
+                    .unwrap_or(BoxShadowSamples::default().0),
             },
         );
 

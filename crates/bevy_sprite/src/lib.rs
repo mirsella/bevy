@@ -129,6 +129,7 @@ impl Plugin for SpritePlugin {
                 .init_resource::<ImageBindGroups>()
                 .init_resource::<SpecializedRenderPipelines<SpritePipeline>>()
                 .init_resource::<SpecializedRenderPipelines<SrgbSpritePipeline>>()
+                .init_resource::<SpecializedRenderPipelines<SrgbCompositePipeline>>()
                 .init_resource::<SpriteMeta>()
                 .init_resource::<ExtractedSprites>()
                 .init_resource::<ExtractedSlices>()

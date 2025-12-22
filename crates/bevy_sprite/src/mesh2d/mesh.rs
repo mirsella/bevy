@@ -120,11 +120,10 @@ impl Plugin for Mesh2dRenderPlugin {
                             sweep_old_entities::<AlphaMask2d>,
                         )
                             .in_set(RenderSet::QueueSweep),
-                        batch_and_prepare_binned_render_phase::<Opaque2d, Mesh2dPipeline>
-                            .in_set(RenderSet::PrepareResources),
-                        batch_and_prepare_binned_render_phase::<AlphaMask2d, Mesh2dPipeline>
-                            .in_set(RenderSet::PrepareResources),
-                        batch_and_prepare_sorted_render_phase::<Transparent2d, Mesh2dPipeline>
+                        batch_and_prepare_sorted_render_phase::<
+                            crate::render::SrgbTransparent2d,
+                            Mesh2dPipeline,
+                        >
                             .in_set(RenderSet::PrepareResources),
                         write_batched_instance_buffer::<Mesh2dPipeline>
                             .in_set(RenderSet::PrepareResourcesFlush),
@@ -196,18 +195,15 @@ pub fn check_views_need_specialization(
     )>,
     ticks: SystemChangeTick,
 ) {
-    for (view_entity, view, msaa, tonemapping, dither) in &views {
-        let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
-            | Mesh2dPipelineKey::from_hdr(view.hdr);
+    for (view_entity, _view, msaa, tonemapping, dither) in &views {
+        let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples());
 
-        if !view.hdr {
-            if let Some(tonemapping) = tonemapping {
-                view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
-                view_key |= tonemapping_pipeline_key(*tonemapping);
-            }
-            if let Some(DebandDither::Enabled) = dither {
-                view_key |= Mesh2dPipelineKey::DEBAND_DITHER;
-            }
+        if let Some(tonemapping) = tonemapping {
+            view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= tonemapping_pipeline_key(*tonemapping);
+        }
+        if let Some(DebandDither::Enabled) = dither {
+            view_key |= Mesh2dPipelineKey::DEBAND_DITHER;
         }
 
         if !view_key_cache
@@ -518,7 +514,6 @@ bitflags::bitflags! {
     // FIXME: make normals optional?
     pub struct Mesh2dPipelineKey: u32 {
         const NONE                              = 0;
-        const HDR                               = 1 << 0;
         const TONEMAP_IN_SHADER                 = 1 << 1;
         const DEBAND_DITHER                     = 1 << 2;
         const BLEND_ALPHA                       = 1 << 3;
@@ -550,14 +545,6 @@ impl Mesh2dPipelineKey {
         let msaa_bits =
             (msaa_samples.trailing_zeros() & Self::MSAA_MASK_BITS) << Self::MSAA_SHIFT_BITS;
         Self::from_bits_retain(msaa_bits)
-    }
-
-    pub fn from_hdr(hdr: bool) -> Self {
-        if hdr {
-            Mesh2dPipelineKey::HDR
-        } else {
-            Mesh2dPipelineKey::NONE
-        }
     }
 
     pub fn msaa_samples(&self) -> u32 {
@@ -673,10 +660,8 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
 
         let vertex_buffer_layout = layout.0.get_layout(&vertex_attributes)?;
 
-        let format = match key.contains(Mesh2dPipelineKey::HDR) {
-            true => ViewTarget::TEXTURE_FORMAT_HDR,
-            false => TextureFormat::bevy_default(),
-        };
+        let format = TextureFormat::Rgba8Unorm;
+        shader_defs.push("SRGB_MESH2D_PASS".into());
 
         let (depth_write_enabled, label, blend);
         if key.contains(Mesh2dPipelineKey::BLEND_ALPHA) {

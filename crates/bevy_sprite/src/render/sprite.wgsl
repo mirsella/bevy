@@ -3,7 +3,7 @@
 #endif
 
 #import bevy_render::{
-    maths::{affine3_to_square, powsafe},
+    maths::affine3_to_square,
     view::View,
 }
 
@@ -51,12 +51,6 @@ fn vertex(in: VertexInput) -> VertexOutput {
 @group(1) @binding(0) var sprite_texture: texture_2d<f32>;
 @group(1) @binding(1) var sprite_sampler: sampler;
 
-#ifdef SRGB_SPRITE_PASS
-fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    return powsafe(c, 1.0 / 2.2);
-}
-#endif
-
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = in.color * textureSample(sprite_texture, sprite_sampler, in.uv);
@@ -67,8 +61,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
 #ifdef SRGB_SPRITE_PASS
     // Encode to sRGB so blending in Rgba8Unorm happens in sRGB space
-    let encoded = linear_to_srgb(color.rgb);
-    color = vec4<f32>(encoded, color.a);
+    color = vec4<f32>(pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.2)), color.a);
 #endif
 
     return color;

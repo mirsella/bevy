@@ -28,5 +28,12 @@ fn vertex(
 
 @fragment
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(1.0);
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space.
+    // NOTE: If you are using a custom fragment shader, you must also 
+    // encode your output color to sRGB using `pow(color.rgb, vec3(1.0 / 2.2))`.
+#ifdef MANUAL_SRGB
+    return vec4<f32>(pow(vec3<f32>(1.0), vec3(1.0 / 2.2)), 1.0);
+#else
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+#endif
 }

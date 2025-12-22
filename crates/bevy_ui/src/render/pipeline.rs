@@ -1,12 +1,11 @@
 use bevy_ecs::prelude::*;
-use bevy_image::BevyDefault as _;
 use bevy_render::{
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
     renderer::RenderDevice,
-    view::{ViewTarget, ViewUniform},
+    view::ViewUniform,
 };
 
 #[derive(Resource)]
@@ -47,7 +46,6 @@ impl FromWorld for UiPipeline {
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UiPipelineKey {
-    pub hdr: bool,
     pub anti_alias: bool,
 }
 
@@ -76,11 +74,13 @@ impl SpecializedRenderPipeline for UiPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec!["ANTI_ALIAS".into()]
         } else {
             Vec::new()
         };
+
+        shader_defs.push("MANUAL_SRGB".into());
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -94,11 +94,7 @@ impl SpecializedRenderPipeline for UiPipeline {
                 shader_defs,
                 entry_point: "fragment".into(),
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],

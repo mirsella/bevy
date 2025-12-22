@@ -119,7 +119,6 @@ pub trait UiMaterial: AsBindGroup + Asset + Clone + Sized {
 }
 
 pub struct UiMaterialKey<M: UiMaterial> {
-    pub hdr: bool,
     pub bind_group_data: M::Data,
 }
 
@@ -130,7 +129,7 @@ where
     M::Data: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.hdr == other.hdr && self.bind_group_data == other.bind_group_data
+        self.bind_group_data == other.bind_group_data
     }
 }
 
@@ -140,7 +139,6 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            hdr: self.hdr,
             bind_group_data: self.bind_group_data.clone(),
         }
     }
@@ -151,7 +149,6 @@ where
     M::Data: Hash,
 {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.hdr.hash(state);
         self.bind_group_data.hash(state);
     }
 }

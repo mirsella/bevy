@@ -69,8 +69,18 @@ fn fragment(
 #ifdef TONEMAP_IN_SHADER
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
+
+#ifdef SRGB_MESH2D_PASS
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB space
+    color = vec4<f32>(pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.2)), color.a);
+#endif
+
     return color;
 #else
-    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    var color = vec4<f32>(1.0, 0.0, 1.0, 1.0);
+#ifdef SRGB_MESH2D_PASS
+    color = vec4<f32>(pow(color.rgb, vec3(1.0 / 2.2)), color.a);
+#endif
+    return color;
 #endif
 }

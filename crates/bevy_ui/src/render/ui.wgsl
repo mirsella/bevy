@@ -1,4 +1,6 @@
-#import bevy_render::view::View
+#import bevy_render::{
+    view::View,
+}
 
 const TEXTURED = 1u;
 const RIGHT_VERTEX = 2u;
@@ -153,8 +155,12 @@ fn draw(in: VertexOutput, texture_color: vec4<f32>) -> vec4<f32> {
     let t = 1.0 - step(0.0, border_distance);
 #endif
 
-    // Blend mode ALPHA_BLENDING is used for UI elements, so we don't premultiply alpha here.
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    return vec4(pow(color.rgb, vec3(1.0 / 2.2)), saturate(color.a * t));
+#else
     return vec4(color.rgb, saturate(color.a * t));
+#endif
 }
 
 fn draw_background(in: VertexOutput, texture_color: vec4<f32>) -> vec4<f32> {
@@ -169,7 +175,12 @@ fn draw_background(in: VertexOutput, texture_color: vec4<f32>) -> vec4<f32> {
     let t = 1.0 - step(0.0, internal_distance);
 #endif
 
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    return vec4(pow(color.rgb, vec3(1.0 / 2.2)), saturate(color.a * t));
+#else
     return vec4(color.rgb, saturate(color.a * t));
+#endif
 }
 
 @fragment

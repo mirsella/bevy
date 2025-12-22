@@ -17,6 +17,7 @@ use bevy_asset::{load_internal_asset, weak_handle, AssetEvent, AssetId, Assets, 
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
 use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
+use bevy_core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy_core_pipeline::{core_2d::Camera2d, core_3d::Camera3d};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
@@ -33,15 +34,16 @@ use bevy_render::{
     render_asset::RenderAssets,
     render_graph::{Node as RenderGraphNode, RenderGraph},
     render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions},
+    render_resource::binding_types::{sampler, texture_2d},
     render_resource::*,
     renderer::{RenderDevice, RenderQueue},
-    view::{ExtractedView, ViewUniforms},
+    view::{ExtractedView, ViewTarget, ViewUniforms},
     Extract, RenderApp, RenderSet,
 };
 use bevy_render::{
     render_phase::{PhaseItem, PhaseItemExtraIndex},
     sync_world::{RenderEntity, TemporaryRenderEntity},
-    texture::GpuImage,
+    texture::{GpuImage, TextureCache},
     view::InheritedVisibility,
     ExtractSchedule, Render,
 };
@@ -74,20 +76,6 @@ pub mod graph {
     }
 }
 
-/// Z offsets of "extracted nodes" for a given entity. These exist to allow rendering multiple "extracted nodes"
-/// for a given source entity (ex: render both a background color _and_ a custom material for a given node).
-///
-/// When possible these offsets should be defined in _this_ module to ensure z-index coordination across contexts.
-/// When this is _not_ possible, pick a suitably unique index unlikely to clash with other things (ex: `0.1826823` not `0.1`).
-///
-/// Offsets should be unique for a given node entity to avoid z fighting.
-/// These should pretty much _always_ be larger than -0.5 and smaller than 0.5 to avoid clipping into nodes
-/// above / below the current node in the stack.
-///
-/// A z-index of 0.0 is the baseline, which is used as the primary "background color" of the node.
-///
-/// Note that nodes "stack" on each other, so a negative offset on the node above could clip _into_
-/// a positive offset on a node below.
 pub mod stack_z_offsets {
     pub const BOX_SHADOW: f32 = -0.1;
     pub const TEXTURE_SLICE: f32 = 0.0;
@@ -96,6 +84,76 @@ pub mod stack_z_offsets {
 }
 
 pub const UI_SHADER_HANDLE: Handle<Shader> = weak_handle!("7d190d05-545b-42f5-bd85-22a0da85b0f6");
+pub const SRGB_UI_COMPOSITE_SHADER_HANDLE: Handle<Shader> =
+    weak_handle!("a3c8e2b1-9f4d-4e6a-b7c2-1d8f3a5e9b0c");
+
+#[derive(Component)]
+pub struct SrgbUiComposite {
+    pub texture_view: TextureView,
+    pub bind_group: BindGroup,
+    pub pipeline_id: CachedRenderPipelineId,
+}
+
+#[derive(Resource)]
+pub struct SrgbUiCompositePipeline {
+    pub layout: BindGroupLayout,
+    pub sampler: Sampler,
+}
+
+impl FromWorld for SrgbUiCompositePipeline {
+    fn from_world(world: &mut World) -> Self {
+        let render_device = world.resource::<RenderDevice>();
+        let layout = render_device.create_bind_group_layout(
+            "srgb_ui_composite_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    sampler(SamplerBindingType::Filtering),
+                ),
+            ),
+        );
+        let sampler = render_device.create_sampler(&SamplerDescriptor {
+            label: Some("srgb_ui_composite_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        Self { layout, sampler }
+    }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct SrgbUiCompositePipelineKey {
+    pub format: TextureFormat,
+}
+
+impl SpecializedRenderPipeline for SrgbUiCompositePipeline {
+    type Key = SrgbUiCompositePipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("srgb_ui_composite_pipeline".into()),
+            layout: vec![self.layout.clone()],
+            push_constant_ranges: vec![],
+            vertex: fullscreen_shader_vertex_state(),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                shader: SRGB_UI_COMPOSITE_SHADER_HANDLE,
+                shader_defs: vec![],
+                entry_point: "fragment".into(),
+                targets: vec![Some(ColorTargetState {
+                    format: key.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            zero_initialize_workgroup_memory: false,
+        }
+    }
+}
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderUiSystem {
@@ -112,6 +170,12 @@ pub enum RenderUiSystem {
 
 pub fn build_ui_render(app: &mut App) {
     load_internal_asset!(app, UI_SHADER_HANDLE, "ui.wgsl", Shader::from_wgsl);
+    load_internal_asset!(
+        app,
+        SRGB_UI_COMPOSITE_SHADER_HANDLE,
+        "srgb_ui_composite.wgsl",
+        Shader::from_wgsl
+    );
 
     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
         return;
@@ -119,6 +183,7 @@ pub fn build_ui_render(app: &mut App) {
 
     render_app
         .init_resource::<SpecializedRenderPipelines<UiPipeline>>()
+        .init_resource::<SpecializedRenderPipelines<SrgbUiCompositePipeline>>()
         .init_resource::<ImageNodeBindGroups>()
         .init_resource::<UiMeta>()
         .init_resource::<ExtractedUiNodes>()
@@ -160,6 +225,7 @@ pub fn build_ui_render(app: &mut App) {
                 queue_uinodes.in_set(RenderSet::Queue),
                 sort_phase_system::<TransparentUi>.in_set(RenderSet::PhaseSort),
                 prepare_uinodes.in_set(RenderSet::PrepareBindGroups),
+                prepare_srgb_ui_rendering.in_set(RenderSet::Prepare),
             ),
         );
 
@@ -201,15 +267,12 @@ pub struct ExtractedUiNode {
     pub rect: Rect,
     pub image: AssetId<Image>,
     pub clip: Option<Rect>,
-    /// Render world entity of the extracted camera corresponding to this node's target camera.
     pub extracted_camera_entity: Entity,
     pub item: ExtractedUiItem,
     pub main_entity: MainEntity,
     pub render_entity: Entity,
 }
 
-/// The type of UI node.
-/// This is used to determine how to render the UI node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NodeType {
     Rect,
@@ -221,18 +284,12 @@ pub enum ExtractedUiItem {
         atlas_scaling: Option<Vec2>,
         flip_x: bool,
         flip_y: bool,
-        /// Border radius of the UI node.
-        /// Ordering: top left, top right, bottom right, bottom left.
         border_radius: ResolvedBorderRadius,
-        /// Border thickness of the UI node.
-        /// Ordering: left, top, right, bottom.
         border: BorderRect,
         node_type: NodeType,
         transform: Mat4,
     },
-    /// A contiguous sequence of text glyphs from the same section
     Glyphs {
-        /// Indices into [`ExtractedUiNodes::glyphs`]
         range: Range<usize>,
     },
 }
@@ -257,11 +314,10 @@ impl ExtractedUiNodes {
 
 #[derive(SystemParam)]
 pub struct UiCameraMap<'w, 's> {
-    mapping: Query<'w, 's, RenderEntity>,
+    mapping: Query<'w, 's, &'static RenderEntity>,
 }
 
 impl<'w, 's> UiCameraMap<'w, 's> {
-    /// Get the default camera and create the mapper
     pub fn get_mapper(&'w self) -> UiCameraMapper<'w, 's> {
         UiCameraMapper {
             mapping: &self.mapping,
@@ -272,20 +328,19 @@ impl<'w, 's> UiCameraMap<'w, 's> {
 }
 
 pub struct UiCameraMapper<'w, 's> {
-    mapping: &'w Query<'w, 's, RenderEntity>,
+    mapping: &'w Query<'w, 's, &'static RenderEntity>,
     camera_entity: Entity,
     render_entity: Entity,
 }
 
 impl<'w, 's> UiCameraMapper<'w, 's> {
-    /// Returns the render entity corresponding to the given `UiTargetCamera` or the default camera if `None`.
     pub fn map(&mut self, computed_target: &ComputedNodeTarget) -> Option<Entity> {
         let camera_entity = computed_target.camera;
         if self.camera_entity != camera_entity {
             let Ok(new_render_camera_entity) = self.mapping.get(camera_entity) else {
                 return None;
             };
-            self.render_entity = new_render_camera_entity;
+            self.render_entity = new_render_camera_entity.id();
             self.camera_entity = camera_entity;
         }
 
@@ -297,8 +352,6 @@ impl<'w, 's> UiCameraMapper<'w, 's> {
     }
 }
 
-/// A [`RenderGraphNode`] that executes the UI rendering subgraph on the UI
-/// view.
 struct RunUiSubgraphOnUiViewNode;
 
 impl RenderGraphNode for RunUiSubgraphOnUiViewNode {
@@ -308,7 +361,6 @@ impl RenderGraphNode for RunUiSubgraphOnUiViewNode {
         _: &mut RenderContext<'w>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
-        // Fetch the UI view.
         let Some(mut render_views) = world.try_query::<&UiCameraView>() else {
             return Ok(());
         };
@@ -316,7 +368,6 @@ impl RenderGraphNode for RunUiSubgraphOnUiViewNode {
             return Ok(());
         };
 
-        // Run the subgraph on the UI view.
         graph.run_sub_graph(SubGraphUi, vec![], Some(default_camera_view.0))?;
         Ok(())
     }
@@ -343,7 +394,6 @@ pub fn extract_uinode_background_colors(
     for (entity, uinode, transform, inherited_visibility, clip, camera, background_color) in
         &uinode_query
     {
-        // Skip invisible backgrounds
         if !inherited_visibility.get()
             || background_color.0.is_fully_transparent()
             || uinode.is_empty()
@@ -399,7 +449,6 @@ pub fn extract_uinode_images(
 ) {
     let mut camera_mapper = camera_map.get_mapper();
     for (entity, uinode, transform, inherited_visibility, clip, camera, image) in &uinode_query {
-        // Skip invisible images
         if !inherited_visibility.get()
             || image.color.is_fully_transparent()
             || image.image.id() == TRANSPARENT_IMAGE_HANDLE.id()
@@ -495,7 +544,6 @@ pub fn extract_uinode_borders(
         (maybe_border_color, maybe_outline),
     ) in &uinode_query
     {
-        // Skip invisible borders and removed nodes
         if !inherited_visibility.get() || node.display == Display::None {
             continue;
         }
@@ -504,7 +552,6 @@ pub fn extract_uinode_borders(
             continue;
         };
 
-        // Don't extract borders with zero width along all edges
         if computed_node.border() != BorderRect::ZERO {
             if let Some(border_color) = maybe_border_color.filter(|bc| !bc.0.is_fully_transparent())
             {
@@ -566,44 +613,16 @@ pub fn extract_uinode_borders(
     }
 }
 
-/// The UI camera is "moved back" by this many units (plus the [`UI_CAMERA_TRANSFORM_OFFSET`]) and also has a view
-/// distance of this many units. This ensures that with a left-handed projection,
-/// as ui elements are "stacked on top of each other", they are within the camera's view
-/// and have room to grow.
-// TODO: Consider computing this value at runtime based on the maximum z-value.
 const UI_CAMERA_FAR: f32 = 1000.0;
-
-// This value is subtracted from the far distance for the camera's z-position to ensure nodes at z == 0.0 are rendered
-// TODO: Evaluate if we still need this.
 const UI_CAMERA_TRANSFORM_OFFSET: f32 = -0.1;
-
-/// The ID of the subview associated with a camera on which UI is to be drawn.
-///
-/// When UI is present, cameras extract to two views: the main 2D/3D one and a
-/// UI one. The main 2D or 3D camera gets subview 0, and the corresponding UI
-/// camera gets this subview, 1.
 const UI_CAMERA_SUBVIEW: u32 = 1;
 
-/// A render-world component that lives on the main render target view and
-/// specifies the corresponding UI view.
-///
-/// For example, if UI is being rendered to a 3D camera, this component lives on
-/// the 3D camera and contains the entity corresponding to the UI view.
 #[derive(Component)]
-/// Entity id of the temporary render entity with the corresponding extracted UI view.
 pub struct UiCameraView(pub Entity);
 
-/// A render-world component that lives on the UI view and specifies the
-/// corresponding main render target view.
-///
-/// For example, if the UI is being rendered to a 3D camera, this component
-/// lives on the UI view and contains the entity corresponding to the 3D camera.
-///
-/// This is the inverse of [`UiCameraView`].
 #[derive(Component)]
 pub struct UiViewTarget(pub Entity);
 
-/// Extracts all UI elements associated with a camera into the render world.
 pub fn extract_ui_camera_view(
     mut commands: Commands,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
@@ -611,7 +630,7 @@ pub fn extract_ui_camera_view(
         Query<
             (
                 Entity,
-                RenderEntity,
+                &RenderEntity,
                 &Camera,
                 Option<&UiAntiAlias>,
                 Option<&BoxShadowSamples>,
@@ -624,17 +643,15 @@ pub fn extract_ui_camera_view(
     live_entities.clear();
 
     for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples) in &query {
-        // ignore inactive cameras
         if !camera.is_active {
             commands
-                .get_entity(render_entity)
+                .get_entity(render_entity.id())
                 .expect("Camera entity wasn't synced.")
                 .remove::<(UiCameraView, UiAntiAlias, BoxShadowSamples)>();
             continue;
         }
 
         if let Some(physical_viewport_rect) = camera.physical_viewport_rect() {
-            // use a projection matrix with the origin in the top left instead of the bottom left that comes with OrthographicProjection
             let projection_matrix = Mat4::orthographic_rh(
                 0.0,
                 physical_viewport_rect.width() as f32,
@@ -643,11 +660,8 @@ pub fn extract_ui_camera_view(
                 0.0,
                 UI_CAMERA_FAR,
             );
-            // We use `UI_CAMERA_SUBVIEW` here so as not to conflict with the
-            // main 3D or 2D camera, which will have subview index 0.
             let retained_view_entity =
                 RetainedViewEntity::new(main_entity.into(), None, UI_CAMERA_SUBVIEW);
-            // Creates the UI view.
             let ui_camera_view = commands
                 .spawn((
                     ExtractedView {
@@ -666,16 +680,14 @@ pub fn extract_ui_camera_view(
                         )),
                         color_grading: Default::default(),
                     },
-                    // Link to the main camera view.
-                    UiViewTarget(render_entity),
+                    UiViewTarget(render_entity.id()),
                     TemporaryRenderEntity,
                 ))
                 .id();
 
             let mut entity_commands = commands
-                .get_entity(render_entity)
+                .get_entity(render_entity.id())
                 .expect("Camera entity wasn't synced.");
-            // Link from the main 2D/3D camera view to the UI view.
             entity_commands.insert(UiCameraView(ui_camera_view));
             if let Some(ui_anti_alias) = ui_anti_alias {
                 entity_commands.insert(*ui_anti_alias);
@@ -726,7 +738,6 @@ pub fn extract_text_sections(
         text_layout_info,
     ) in &uinode_query
     {
-        // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
         if !inherited_visibility.get() || uinode.is_empty() {
             continue;
         }
@@ -823,7 +834,6 @@ pub fn extract_text_shadows(
         shadow,
     ) in &uinode_query
     {
-        // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
         if !inherited_visibility.get() || uinode.is_empty() {
             continue;
         }
@@ -885,18 +895,10 @@ struct UiVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
     pub color: [f32; 4],
-    /// Shader flags to determine how to render the UI node.
-    /// See [`shader_flags`] for possible values.
     pub flags: u32,
-    /// Border radius of the UI node.
-    /// Ordering: top left, top right, bottom right, bottom left.
     pub radius: [f32; 4],
-    /// Border thickness of the UI node.
-    /// Ordering: left, top, right, bottom.
     pub border: [f32; 4],
-    /// Size of the UI node.
     pub size: [f32; 2],
-    /// Position relative to the center of the UI node.
     pub point: [f32; 2],
 }
 
@@ -932,11 +934,9 @@ pub struct UiBatch {
     pub image: AssetId<Image>,
 }
 
-/// The values here should match the values for the constants in `ui.wgsl`
 pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     pub const TEXTURED: u32 = 1;
-    /// Ordering: top left, top right, bottom right, bottom left.
     pub const CORNERS: [u32; 4] = [0, 2, 2 | 4, 4];
     pub const BORDER: u32 = 8;
 }
@@ -973,7 +973,6 @@ pub fn queue_uinodes(
             &pipeline_cache,
             &ui_pipeline,
             UiPipelineKey {
-                hdr: view.hdr,
                 anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
             },
         );
@@ -983,7 +982,6 @@ pub fn queue_uinodes(
             entity: (entity, extracted_uinode.main_entity),
             sort_key: FloatOrd(extracted_uinode.stack_index as f32 + stack_z_offsets::NODE),
             index,
-            // batch_range will be calculated in prepare_uinodes
             batch_range: 0..0,
             extra_index: PhaseItemExtraIndex::None,
             indexed: true,
@@ -1010,13 +1008,11 @@ pub fn prepare_uinodes(
     events: Res<SpriteAssetEvents>,
     mut previous_len: Local<usize>,
 ) {
-    // If an image has changed, the GpuImage has (probably) changed
     for event in &events.images {
         match event {
-            AssetEvent::Added { .. } |
-            AssetEvent::Unused { .. } |
-            // Images don't have dependencies
-            AssetEvent::LoadedWithDependencies { .. } => {}
+            AssetEvent::Added { .. }
+            | AssetEvent::Unused { .. }
+            | AssetEvent::LoadedWithDependencies { .. } => {}
             AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
                 image_bind_groups.values.remove(id);
             }
@@ -1034,7 +1030,6 @@ pub fn prepare_uinodes(
             &BindGroupEntries::single(view_binding),
         ));
 
-        // Buffer indexes
         let mut vertices_index = 0;
         let mut indices_index = 0;
 
@@ -1127,16 +1122,11 @@ pub fn prepare_uinodes(
                             };
 
                             let mut uinode_rect = extracted_uinode.rect;
-
                             let rect_size = uinode_rect.size().extend(1.0);
-
-                            // Specify the corners of the node
                             let positions = QUAD_VERTEX_POSITIONS
                                 .map(|pos| (*transform * (pos * rect_size).extend(1.)).xyz());
                             let points = QUAD_VERTEX_POSITIONS.map(|pos| pos.xy() * rect_size.xy());
 
-                            // Calculate the effect of clipping
-                            // Note: this won't work with rotation/scaling, but that's much more complex (may need more that 2 quads)
                             let mut positions_diff = if let Some(clip) = extracted_uinode.clip {
                                 [
                                     Vec2::new(
@@ -1153,7 +1143,7 @@ pub fn prepare_uinodes(
                                     ),
                                     Vec2::new(
                                         f32::max(clip.min.x - positions[3].x, 0.),
-                                        f32::min(clip.max.y - positions[3].y, 0.),
+                                        f32::max(clip.min.y - positions[3].y, 0.),
                                     ),
                                 ]
                             } else {
@@ -1176,14 +1166,7 @@ pub fn prepare_uinodes(
 
                             let transformed_rect_size = transform.transform_vector3(rect_size);
 
-                            // Don't try to cull nodes that have a rotation
-                            // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                            // In those two cases, the culling check can proceed normally as corners will be on
-                            // horizontal / vertical lines
-                            // For all other angles, bypass the culling check
-                            // This does not properly handles all rotations on all axis
                             if transform.x_axis[1] == 0.0 {
-                                // Cull nodes that are completely clipped
                                 if positions_diff[0].x - positions_diff[1].x
                                     >= transformed_rect_size.x
                                     || positions_diff[1].y - positions_diff[2].y
@@ -1198,7 +1181,6 @@ pub fn prepare_uinodes(
                                 let image = gpu_images.get(extracted_uinode.image).expect(
                                     "Image was checked during batching and should still exist",
                                 );
-                                // Rescale atlases. This is done here because we need texture data that might not be available in Extract.
                                 let atlas_extent = atlas_scaling
                                     .map(|scaling| image.size_2d().as_vec2() * scaling)
                                     .unwrap_or(uinode_rect.max);
@@ -1273,15 +1255,11 @@ pub fn prepare_uinodes(
                                 .expect("Image was checked during batching and should still exist");
 
                             let atlas_extent = image.size_2d().as_vec2();
-
                             let color = extracted_uinode.color.to_f32_array();
                             for glyph in &extracted_uinodes.glyphs[range.clone()] {
                                 let glyph_rect = glyph.rect;
                                 let size = glyph.rect.size();
-
                                 let rect_size = glyph_rect.size().extend(1.0);
-
-                                // Specify the corners of the glyph
                                 let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
                                     (glyph.transform * (pos * rect_size).extend(1.)).xyz()
                                 });
@@ -1302,7 +1280,7 @@ pub fn prepare_uinodes(
                                         ),
                                         Vec2::new(
                                             f32::max(clip.min.x - positions[3].x, 0.),
-                                            f32::min(clip.max.y - positions[3].y, 0.),
+                                            f32::max(clip.min.y - positions[3].y, 0.),
                                         ),
                                     ]
                                 } else {
@@ -1316,7 +1294,6 @@ pub fn prepare_uinodes(
                                     positions[3] + positions_diff[3].extend(0.),
                                 ];
 
-                                // cull nodes that are completely clipped
                                 let transformed_rect_size =
                                     glyph.transform.transform_vector3(rect_size);
                                 if positions_diff[0].x - positions_diff[1].x
@@ -1383,4 +1360,76 @@ pub fn prepare_uinodes(
         commands.try_insert_batch(batches);
     }
     extracted_uinodes.clear();
+}
+
+pub fn prepare_srgb_ui_rendering(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    mut texture_cache: ResMut<TextureCache>,
+    pipeline_cache: Res<PipelineCache>,
+    mut specialized_pipelines: ResMut<SpecializedRenderPipelines<SrgbUiCompositePipeline>>,
+    pipeline: Res<SrgbUiCompositePipeline>,
+    transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
+    views: Query<(Entity, &ExtractedView, &UiViewTarget)>,
+    view_targets: Query<&ViewTarget>,
+) {
+    for (entity, view, ui_view_target) in &views {
+        commands.entity(entity).remove::<SrgbUiComposite>();
+
+        if !transparent_render_phases.contains_key(&view.retained_view_entity) {
+            continue;
+        }
+
+        let Ok(view_target) = view_targets.get(ui_view_target.0) else {
+            continue;
+        };
+
+        if view.viewport.z == 0 || view.viewport.w == 0 {
+            continue;
+        }
+
+        let size = Extent3d {
+            width: view.viewport.z,
+            height: view.viewport.w,
+            depth_or_array_layers: 1,
+        };
+
+        let cached_texture = texture_cache.get(
+            &render_device,
+            TextureDescriptor {
+                label: Some("srgb_ui_texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        );
+
+        let pipeline_id = specialized_pipelines.specialize(
+            &pipeline_cache,
+            &pipeline,
+            SrgbUiCompositePipelineKey {
+                format: if view.hdr {
+                    TextureFormat::Rgba16Float
+                } else {
+                    view_target.main_texture_format()
+                },
+            },
+        );
+
+        let bind_group = render_device.create_bind_group(
+            "srgb_ui_composite_bind_group",
+            &pipeline.layout,
+            &BindGroupEntries::sequential((&cached_texture.default_view, &pipeline.sampler)),
+        );
+
+        commands.entity(entity).insert(SrgbUiComposite {
+            texture_view: cached_texture.default_view,
+            bind_group,
+            pipeline_id,
+        });
+    }
 }

@@ -149,14 +149,12 @@ impl FromWorld for UiTextureSlicePipeline {
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct UiTextureSlicePipelineKey {
-    pub hdr: bool,
-}
+pub struct UiTextureSlicePipelineKey {}
 
 impl SpecializedRenderPipeline for UiTextureSlicePipeline {
     type Key = UiTextureSlicePipelineKey;
 
-    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+    fn specialize(&self, _key: Self::Key) -> RenderPipelineDescriptor {
         let vertex_layout = VertexBufferLayout::from_vertex_formats(
             VertexStepMode::Vertex,
             vec![
@@ -176,7 +174,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
+        let shader_defs = vec!["MANUAL_SRGB".into()];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -190,15 +188,12 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 shader_defs,
                 entry_point: "fragment".into(),
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
+
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
             push_constant_ranges: Vec::new(),
             primitive: PrimitiveState {
@@ -340,15 +335,14 @@ pub fn queue_ui_slices(
     ui_slicer_pipeline: Res<UiTextureSlicePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiTextureSlicePipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    render_views: Query<&UiCameraView, With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
 ) {
     let draw_function = draw_functions.read().id::<DrawUiTextureSlices>();
     for (index, extracted_slicer) in extracted_ui_slicers.slices.iter().enumerate() {
-        let Ok(default_camera_view) =
-            render_views.get_mut(extracted_slicer.extracted_camera_entity)
+        let Ok(default_camera_view) = render_views.get(extracted_slicer.extracted_camera_entity)
         else {
             continue;
         };
@@ -365,7 +359,7 @@ pub fn queue_ui_slices(
         let pipeline = pipelines.specialize(
             &pipeline_cache,
             &ui_slicer_pipeline,
-            UiTextureSlicePipelineKey { hdr: view.hdr },
+            UiTextureSlicePipelineKey {},
         );
 
         transparent_phase.add(TransparentUi {

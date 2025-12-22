@@ -1,5 +1,6 @@
-#import bevy_render::view::View;
-#import bevy_render::globals::Globals;
+#import bevy_render::{
+    view::View,
+}
 
 const PI: f32 = 3.14159265358979323846;
 const SAMPLES: i32 = #SHADOW_SAMPLES;
@@ -91,7 +92,14 @@ fn fragment(
     in: BoxShadowVertexOutput,
 ) -> @location(0) vec4<f32> {
     let g = in.color.a * roundedBoxShadow(-0.5 * in.size, 0.5 * in.size, in.point, max(in.blur, 0.01), in.radius);
-    return vec4(in.color.rgb, g);
+    
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    let encoded = pow(max(in.color.rgb, vec3(0.0)), vec3(1.0 / 2.2));
+#else
+    let encoded = in.color.rgb;
+#endif
+    return vec4(encoded, g);
 }
 
 

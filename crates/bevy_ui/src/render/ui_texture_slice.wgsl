@@ -1,5 +1,7 @@
-#import bevy_render::view::View;
-#import bevy_render::globals::Globals;
+#import bevy_render::{
+    view::View,
+    globals::Globals,
+}
 
 @group(0) @binding(0)
 var<uniform> view: View;
@@ -123,5 +125,13 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     // map the slice coords to texture coords
     let atlas_uv = in.atlas_rect.xy + uv * (in.atlas_rect.zw - in.atlas_rect.xy);
 
-    return in.color * textureSample(sprite_texture, sprite_sampler, atlas_uv);
+    let color = in.color * textureSample(sprite_texture, sprite_sampler, atlas_uv);
+    
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    let encoded = pow(color.rgb, vec3(1.0 / 2.2));
+#else
+    let encoded = color.rgb;
+#endif
+    return vec4(encoded, color.a);
 }
