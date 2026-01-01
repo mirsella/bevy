@@ -1,4 +1,5 @@
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
+use bevy_core_pipeline::FullscreenShader;
 use bevy_ecs::prelude::*;
 use bevy_image::BevyDefault as _;
 use bevy_mesh::VertexBufferLayout;
@@ -20,10 +21,19 @@ pub struct UiPipeline {
     pub shader: Handle<Shader>,
 }
 
+#[derive(Resource)]
+pub struct SrgbUiCompositePipeline {
+    pub layout: BindGroupLayout,
+    pub sampler: Sampler,
+    pub shader: Handle<Shader>,
+    pub fullscreen_shader: Handle<Shader>,
+}
+
 pub fn init_ui_pipeline(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
+    fullscreen_shader: Res<FullscreenShader>,
 ) {
     let view_layout = render_device.create_bind_group_layout(
         "ui_view_layout",
@@ -48,6 +58,31 @@ pub fn init_ui_pipeline(
         view_layout,
         image_layout,
         shader: load_embedded_asset!(asset_server.as_ref(), "ui.wgsl"),
+    });
+
+    let composite_layout = render_device.create_bind_group_layout(
+        "srgb_ui_composite_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+            ),
+        ),
+    );
+
+    let composite_sampler = render_device.create_sampler(&SamplerDescriptor {
+        label: Some("srgb_ui_composite_sampler"),
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        ..Default::default()
+    });
+
+    commands.insert_resource(SrgbUiCompositePipeline {
+        layout: composite_layout,
+        sampler: composite_sampler,
+        shader: load_embedded_asset!(asset_server.as_ref(), "srgb_ui_composite.wgsl"),
+        fullscreen_shader: fullscreen_shader.shader(),
     });
 }
 
@@ -82,11 +117,15 @@ impl SpecializedRenderPipeline for UiPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec!["ANTI_ALIAS".into()]
         } else {
             Vec::new()
         };
+
+        // UI is always rendered to an sRGB intermediate texture with Rgba8Unorm format
+        // The shader needs to manually encode to sRGB
+        shader_defs.push("MANUAL_SRGB".into());
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -99,11 +138,7 @@ impl SpecializedRenderPipeline for UiPipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -112,6 +147,43 @@ impl SpecializedRenderPipeline for UiPipeline {
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
             label: Some("ui_pipeline".into()),
             ..default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct SrgbUiCompositePipelineKey {
+    pub format: TextureFormat,
+}
+
+impl SpecializedRenderPipeline for SrgbUiCompositePipeline {
+    type Key = SrgbUiCompositePipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("srgb_ui_composite_pipeline".into()),
+            layout: vec![self.layout.clone()],
+            push_constant_ranges: vec![],
+            vertex: VertexState {
+                shader: self.fullscreen_shader.clone(),
+                shader_defs: Vec::new(),
+                entry_point: Some("fullscreen_vertex_shader".into()),
+                buffers: Vec::new(),
+            },
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("fragment".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: key.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            zero_initialize_workgroup_memory: false,
         }
     }
 }

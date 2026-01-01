@@ -31,7 +31,7 @@ use bevy_ui::{
 };
 
 use bevy_app::prelude::*;
-use bevy_asset::{AssetEvent, AssetId, Assets};
+use bevy_asset::{embedded_asset, AssetEvent, AssetId, Assets};
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
 use bevy_core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -49,7 +49,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity, TemporaryRenderEntity},
-    texture::GpuImage,
+    texture::{CachedTexture, GpuImage, TextureCache},
     view::{ExtractedView, Hdr, RetainedViewEntity, ViewUniforms},
     Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -74,14 +74,17 @@ pub use ui_material_pipeline::*;
 use ui_texture_slice_pipeline::UiTextureSlicerPlugin;
 
 pub mod graph {
-    use bevy_render::render_graph::{RenderLabel, RenderSubGraph};
+use bevy_render::render_graph::{RenderLabel, RenderSubGraph};
 
-    #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
-    pub struct SubGraphUi;
+pub use crate::render_pass::SrgbUiCompositePassNode;
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
+pub struct SubGraphUi;
 
     #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
     pub enum NodeUi {
         UiPass,
+        CompositePass,
     }
 }
 
@@ -202,6 +205,7 @@ pub struct UiRenderPlugin;
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui.wgsl");
+        embedded_asset!(app, "srgb_ui_composite.wgsl");
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<UiDebugOptions>();
@@ -212,6 +216,7 @@ impl Plugin for UiRenderPlugin {
 
         render_app
             .init_resource::<SpecializedRenderPipelines<UiPipeline>>()
+            .init_resource::<SpecializedRenderPipelines<SrgbUiCompositePipeline>>()
             .init_resource::<ImageNodeBindGroups>()
             .init_resource::<UiMeta>()
             .init_resource::<ExtractedUiNodes>()
@@ -255,8 +260,11 @@ impl Plugin for UiRenderPlugin {
                 Render,
                 (
                     queue_uinodes.in_set(RenderSystems::Queue),
+                    queue_srgb_ui_composite_pipelines.in_set(RenderSystems::Queue),
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
                     prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_srgb_ui_textures.in_set(RenderSystems::PrepareResources),
+                    prepare_srgb_ui_composite_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
 
@@ -291,8 +299,11 @@ impl Plugin for UiRenderPlugin {
 
 fn new_ui_graph(world: &mut World) -> RenderGraph {
     let ui_pass_node = UiPassNode::new(world);
+    let composite_pass_node = SrgbUiCompositePassNode::new(world);
     let mut ui_graph = RenderGraph::default();
     ui_graph.add_node(NodeUi::UiPass, ui_pass_node);
+    ui_graph.add_node(NodeUi::CompositePass, composite_pass_node);
+    ui_graph.add_node_edge(NodeUi::UiPass, NodeUi::CompositePass);
     ui_graph
 }
 
@@ -1146,6 +1157,9 @@ pub fn extract_text_background_colors(
         }
     }
 }
+
+pub use prepare_srgb::*;
+mod prepare_srgb;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]

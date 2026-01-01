@@ -130,7 +130,6 @@ pub fn init_box_shadow_pipeline(
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct BoxShadowPipelineKey {
-    pub hdr: bool,
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
 }
@@ -158,10 +157,10 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = vec![ShaderDefVal::UInt(
-            "SHADOW_SAMPLES".to_string(),
-            key.samples,
-        )];
+        let shader_defs = vec![
+            ShaderDefVal::UInt("SHADOW_SAMPLES".to_string(), key.samples),
+            "MANUAL_SRGB".into(),
+        ];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -174,11 +173,7 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -337,8 +332,9 @@ pub fn queue_shadows(
             &pipeline_cache,
             &box_shadow_pipeline,
             BoxShadowPipelineKey {
-                hdr: view.hdr,
-                samples: shadow_samples.copied().unwrap_or_default().0,
+                samples: shadow_samples
+                    .map(|s| s.0)
+                    .unwrap_or(BoxShadowSamples::default().0),
             },
         );
 

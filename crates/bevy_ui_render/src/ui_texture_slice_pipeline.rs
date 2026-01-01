@@ -140,14 +140,12 @@ pub fn init_ui_texture_slice_pipeline(
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct UiTextureSlicePipelineKey {
-    pub hdr: bool,
-}
+pub struct UiTextureSlicePipelineKey;
 
 impl SpecializedRenderPipeline for UiTextureSlicePipeline {
     type Key = UiTextureSlicePipelineKey;
 
-    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+    fn specialize(&self, _key: Self::Key) -> RenderPipelineDescriptor {
         let vertex_layout = VertexBufferLayout::from_vertex_formats(
             VertexStepMode::Vertex,
             vec![
@@ -167,7 +165,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
+        let shader_defs = vec!["MANUAL_SRGB".into()];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -180,11 +178,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
+                    format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -340,7 +334,7 @@ pub fn queue_ui_slices(
         let pipeline = pipelines.specialize(
             &pipeline_cache,
             &ui_slicer_pipeline,
-            UiTextureSlicePipelineKey { hdr: view.hdr },
+            UiTextureSlicePipelineKey,
         );
 
         transparent_phase.add(TransparentUi {

@@ -1,16 +1,14 @@
 use crate::{
     init_mesh_2d_pipeline, DrawMesh2d, Mesh2d, Mesh2dPipeline, Mesh2dPipelineKey,
-    RenderMesh2dInstances, SetMesh2dBindGroup, SetMesh2dViewBindGroup, ViewKeyCache,
-    ViewSpecializationTicks,
+    RenderMesh2dInstances, SetMesh2dBindGroup, SetMesh2dViewBindGroup, SrgbTransparent2d,
+    ViewKeyCache, ViewSpecializationTicks,
 };
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::prelude::AssetChanged;
 use bevy_asset::{AsAssetId, Asset, AssetApp, AssetEventSystems, AssetId, AssetServer, Handle};
 use bevy_camera::visibility::ViewVisibility;
 use bevy_core_pipeline::{
-    core_2d::{
-        AlphaMask2d, AlphaMask2dBinKey, BatchSetKey2d, Opaque2d, Opaque2dBinKey, Transparent2d,
-    },
+    core_2d::{AlphaMask2d, Opaque2d, Transparent2d},
     tonemapping::Tonemapping,
 };
 use bevy_derive::{Deref, DerefMut};
@@ -31,9 +29,9 @@ use bevy_render::{
         prepare_assets, PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets,
     },
     render_phase::{
-        AddRenderCommand, BinnedRenderPhaseType, DrawFunctionId, DrawFunctions, InputUniformIndex,
-        PhaseItem, PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline,
-        TrackedRenderPass, ViewBinnedRenderPhases, ViewSortedRenderPhases,
+        AddRenderCommand, BinnedRenderPhaseType, DrawFunctionId, DrawFunctions, PhaseItem,
+        PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline,
+        TrackedRenderPass, ViewSortedRenderPhases,
     },
     render_resource::{
         AsBindGroup, AsBindGroupError, BindGroup, BindGroupId, BindGroupLayout, BindingResources,
@@ -285,9 +283,7 @@ where
             render_app
                 .init_resource::<EntitySpecializationTickPair<M>>()
                 .init_resource::<SpecializedMaterial2dPipelineCache<M>>()
-                .add_render_command::<Opaque2d, DrawMaterial2d<M>>()
-                .add_render_command::<AlphaMask2d, DrawMaterial2d<M>>()
-                .add_render_command::<Transparent2d, DrawMaterial2d<M>>()
+                .add_render_command::<SrgbTransparent2d, DrawMaterial2d<M>>()
                 .init_resource::<RenderMaterial2dInstances<M>>()
                 .init_resource::<SpecializedMeshPipelines<Material2dPipeline<M>>>()
                 .add_systems(
@@ -697,9 +693,7 @@ pub fn specialize_material2d_meshes<M: Material2d>(
     ),
     mut render_mesh_instances: ResMut<RenderMesh2dInstances>,
     render_material_instances: Res<RenderMaterial2dInstances<M>>,
-    transparent_render_phases: Res<ViewSortedRenderPhases<Transparent2d>>,
-    opaque_render_phases: Res<ViewBinnedRenderPhases<Opaque2d>>,
-    alpha_mask_render_phases: Res<ViewBinnedRenderPhases<AlphaMask2d>>,
+    srgb_render_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
     views: Query<(&MainEntity, &ExtractedView, &RenderVisibleEntities)>,
     view_key_cache: Res<ViewKeyCache>,
     entity_specialization_ticks: Res<EntitySpecializationTickPair<M>>,
@@ -714,10 +708,7 @@ pub fn specialize_material2d_meshes<M: Material2d>(
     }
 
     for (view_entity, view, visible_entities) in &views {
-        if !transparent_render_phases.contains_key(&view.retained_view_entity)
-            && !opaque_render_phases.contains_key(&view.retained_view_entity)
-            && !alpha_mask_render_phases.contains_key(&view.retained_view_entity)
-        {
+        if !srgb_render_phases.contains_key(&view.retained_view_entity) {
             continue;
         }
 
@@ -792,11 +783,9 @@ pub fn queue_material2d_meshes<M: Material2d>(
     ),
     mut render_mesh_instances: ResMut<RenderMesh2dInstances>,
     render_material_instances: Res<RenderMaterial2dInstances<M>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
-    mut opaque_render_phases: ResMut<ViewBinnedRenderPhases<Opaque2d>>,
-    mut alpha_mask_render_phases: ResMut<ViewBinnedRenderPhases<AlphaMask2d>>,
+    mut srgb_render_phases: ResMut<ViewSortedRenderPhases<SrgbTransparent2d>>,
     views: Query<(&MainEntity, &ExtractedView, &RenderVisibleEntities)>,
-    specialized_material_pipeline_cache: ResMut<SpecializedMaterial2dPipelineCache<M>>,
+    specialized_material_pipeline_cache: Res<SpecializedMaterial2dPipelineCache<M>>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
@@ -811,32 +800,18 @@ pub fn queue_material2d_meshes<M: Material2d>(
             continue;
         };
 
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
-            continue;
-        };
-        let Some(opaque_phase) = opaque_render_phases.get_mut(&view.retained_view_entity) else {
-            continue;
-        };
-        let Some(alpha_mask_phase) = alpha_mask_render_phases.get_mut(&view.retained_view_entity)
-        else {
+        let Some(srgb_phase) = srgb_render_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
 
         for (render_entity, visible_entity) in visible_entities.iter::<Mesh2d>() {
-            let Some((current_change_tick, pipeline_id)) = view_specialized_material_pipeline_cache
-                .get(visible_entity)
-                .map(|(current_change_tick, pipeline_id)| (*current_change_tick, *pipeline_id))
+            let Some((_current_change_tick, pipeline_id)) =
+                view_specialized_material_pipeline_cache
+                    .get(visible_entity)
+                    .map(|(current_change_tick, pipeline_id)| (*current_change_tick, *pipeline_id))
             else {
                 continue;
             };
-
-            // Skip the entity if it's cached in a bin and up to date.
-            if opaque_phase.validate_cached_entity(*visible_entity, current_change_tick)
-                || alpha_mask_phase.validate_cached_entity(*visible_entity, current_change_tick)
-            {
-                continue;
-            }
 
             let Some(material_asset_id) = render_material_instances.get(visible_entity) else {
                 continue;
@@ -859,67 +834,22 @@ pub fn queue_material2d_meshes<M: Material2d>(
             // `BinnedRenderPhaseType::mesh`, which can return
             // `BinnedRenderPhaseType::MultidrawableMesh` if the hardware
             // supports multidraw.
-            let binned_render_phase_type = if mesh_instance.automatic_batching {
+            let _binned_render_phase_type = if mesh_instance.automatic_batching {
                 BinnedRenderPhaseType::BatchableMesh
             } else {
                 BinnedRenderPhaseType::UnbatchableMesh
             };
 
-            match material_2d.properties.alpha_mode {
-                AlphaMode2d::Opaque => {
-                    let bin_key = Opaque2dBinKey {
-                        pipeline: pipeline_id,
-                        draw_function: material_2d.properties.draw_function_id,
-                        asset_id: mesh_instance.mesh_asset_id.into(),
-                        material_bind_group_id: material_2d.get_bind_group_id().0,
-                    };
-                    opaque_phase.add(
-                        BatchSetKey2d {
-                            indexed: mesh.indexed(),
-                        },
-                        bin_key,
-                        (*render_entity, *visible_entity),
-                        InputUniformIndex::default(),
-                        binned_render_phase_type,
-                        current_change_tick,
-                    );
-                }
-                AlphaMode2d::Mask(_) => {
-                    let bin_key = AlphaMask2dBinKey {
-                        pipeline: pipeline_id,
-                        draw_function: material_2d.properties.draw_function_id,
-                        asset_id: mesh_instance.mesh_asset_id.into(),
-                        material_bind_group_id: material_2d.get_bind_group_id().0,
-                    };
-                    alpha_mask_phase.add(
-                        BatchSetKey2d {
-                            indexed: mesh.indexed(),
-                        },
-                        bin_key,
-                        (*render_entity, *visible_entity),
-                        InputUniformIndex::default(),
-                        binned_render_phase_type,
-                        current_change_tick,
-                    );
-                }
-                AlphaMode2d::Blend => {
-                    transparent_phase.add(Transparent2d {
-                        entity: (*render_entity, *visible_entity),
-                        draw_function: material_2d.properties.draw_function_id,
-                        pipeline: pipeline_id,
-                        // NOTE: Back-to-front ordering for transparent with ascending sort means far should have the
-                        // lowest sort key and getting closer should increase. As we have
-                        // -z in front of the camera, the largest distance is -far with values increasing toward the
-                        // camera. As such we can just use mesh_z as the distance
-                        sort_key: FloatOrd(mesh_z + material_2d.properties.depth_bias),
-                        // Batching is done in batch_and_prepare_render_phase
-                        batch_range: 0..1,
-                        extra_index: PhaseItemExtraIndex::None,
-                        extracted_index: usize::MAX,
-                        indexed: mesh.indexed(),
-                    });
-                }
-            }
+            srgb_phase.add(SrgbTransparent2d {
+                entity: (*render_entity, *visible_entity),
+                draw_function: material_2d.properties.draw_function_id,
+                pipeline: pipeline_id,
+                sort_key: FloatOrd(mesh_z + material_2d.properties.depth_bias),
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::None,
+                extracted_index: usize::MAX,
+                indexed: mesh.indexed(),
+            });
         }
     }
 }
@@ -963,23 +893,16 @@ impl<M: Material2d> RenderAsset for PreparedMaterial2d<M> {
     type Param = (
         SRes<RenderDevice>,
         SRes<Material2dPipeline<M>>,
-        SRes<DrawFunctions<Opaque2d>>,
-        SRes<DrawFunctions<AlphaMask2d>>,
-        SRes<DrawFunctions<Transparent2d>>,
+        SRes<DrawFunctions<SrgbTransparent2d>>,
         M::Param,
     );
 
     fn prepare_asset(
         material: Self::SourceAsset,
         _: AssetId<Self::SourceAsset>,
-        (
-            render_device,
-            pipeline,
-            opaque_draw_functions,
-            alpha_mask_draw_functions,
-            transparent_draw_functions,
-            material_param,
-        ): &mut SystemParamItem<Self::Param>,
+        (render_device, pipeline, draw_functions, material_param): &mut SystemParamItem<
+            Self::Param,
+        >,
         _: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
         let bind_group_data = material.bind_group_data();
@@ -988,15 +911,7 @@ impl<M: Material2d> RenderAsset for PreparedMaterial2d<M> {
                 let mut mesh_pipeline_key_bits = Mesh2dPipelineKey::empty();
                 mesh_pipeline_key_bits.insert(alpha_mode_pipeline_key(material.alpha_mode()));
 
-                let draw_function_id = match material.alpha_mode() {
-                    AlphaMode2d::Opaque => opaque_draw_functions.read().id::<DrawMaterial2d<M>>(),
-                    AlphaMode2d::Mask(_) => {
-                        alpha_mask_draw_functions.read().id::<DrawMaterial2d<M>>()
-                    }
-                    AlphaMode2d::Blend => {
-                        transparent_draw_functions.read().id::<DrawMaterial2d<M>>()
-                    }
-                };
+                let draw_function_id = draw_functions.read().id::<DrawMaterial2d<M>>();
 
                 Ok(PreparedMaterial2d {
                     bindings: prepared.bindings,

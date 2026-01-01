@@ -187,8 +187,12 @@ fn draw_uinode_border(
     let t = 1.0 - step(0.0, border_distance);
 #endif
 
-    // Blend mode ALPHA_BLENDING is used for UI elements, so we don't premultiply alpha here.
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    return vec4(pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.2)), saturate(color.a * t * nearest_border));
+#else
     return vec4(color.rgb, saturate(color.a * t * nearest_border));
+#endif
 }
 
 fn draw_uinode_background(
@@ -207,7 +211,12 @@ fn draw_uinode_background(
     let t = 1.0 - step(0.0, internal_distance);
 #endif
 
+    // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
+#ifdef MANUAL_SRGB
+    return vec4(pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.2)), saturate(color.a * t));
+#else
     return vec4(color.rgb, saturate(color.a * t));
+#endif
 }
 
 @fragment

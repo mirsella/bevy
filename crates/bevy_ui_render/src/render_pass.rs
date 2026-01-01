@@ -2,7 +2,8 @@ use core::ops::Range;
 
 use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
 
-use crate::UiCameraView;
+use crate::{SrgbUiCompositeBindGroup, SrgbUiCompositePipelineId, SrgbUiTexture, UiCameraView};
+use bevy_color::LinearRgba;
 use bevy_ecs::{
     prelude::*,
     system::{lifetimeless::*, SystemParamItem},
@@ -13,7 +14,10 @@ use bevy_render::{
     diagnostic::RecordDiagnostics,
     render_graph::*,
     render_phase::*,
-    render_resource::{CachedRenderPipelineId, RenderPassDescriptor},
+    render_resource::{
+        CachedRenderPipelineId, LoadOp, Operations, PipelineCache, RenderPassColorAttachment,
+        RenderPassDescriptor, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp,
+    },
     renderer::*,
     sync_world::MainEntity,
     view::*,
@@ -21,7 +25,11 @@ use bevy_render::{
 use tracing::error;
 
 pub struct UiPassNode {
-    ui_view_query: QueryState<(&'static ExtractedView, &'static UiViewTarget)>,
+    ui_view_query: QueryState<(
+        &'static ExtractedView,
+        &'static UiViewTarget,
+        &'static SrgbUiTexture,
+    )>,
     ui_view_target_query: QueryState<(&'static ViewTarget, &'static ExtractedCamera)>,
     ui_camera_view_query: QueryState<&'static UiCameraView>,
 }
@@ -59,12 +67,13 @@ impl Node for UiPassNode {
         };
 
         // Query the UI view components.
-        let Ok((view, ui_view_target)) = self.ui_view_query.get_manual(world, input_view_entity)
+        let Ok((view, ui_view_target, srgb_texture)) =
+            self.ui_view_query.get_manual(world, input_view_entity)
         else {
             return Ok(());
         };
 
-        let Ok((target, camera)) = self
+        let Ok((_target, camera)) = self
             .ui_view_target_query
             .get_manual(world, ui_view_target.0)
         else {
@@ -93,7 +102,18 @@ impl Node for UiPassNode {
         };
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("ui"),
-            color_attachments: &[Some(target.get_unsampled_color_attachment())],
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &srgb_texture.texture.default_view,
+                resolve_target: srgb_texture
+                    .resolve_texture
+                    .as_ref()
+                    .map(|t| &*t.default_view),
+                ops: Operations {
+                    load: LoadOp::Clear(LinearRgba::NONE.into()),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -108,6 +128,88 @@ impl Node for UiPassNode {
         }
 
         pass_span.end(&mut render_pass);
+
+        Ok(())
+    }
+}
+
+pub struct SrgbUiCompositePassNode {
+    query: QueryState<(
+        &'static UiViewTarget,
+        &'static SrgbUiTexture,
+        &'static SrgbUiCompositeBindGroup,
+        &'static SrgbUiCompositePipelineId,
+        &'static ExtractedView,
+    )>,
+    target_query: QueryState<&'static ViewTarget>,
+}
+
+impl SrgbUiCompositePassNode {
+    pub fn new(world: &mut World) -> Self {
+        Self {
+            query: world.query(),
+            target_query: world.query(),
+        }
+    }
+}
+
+impl Node for SrgbUiCompositePassNode {
+    fn update(&mut self, world: &mut World) {
+        self.query.update_archetypes(world);
+        self.target_query.update_archetypes(world);
+    }
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let view_entity = graph.view_entity();
+
+        let Ok((ui_view_target, _srgb_texture, composite_bind_group, pipeline_id, view)) =
+            self.query.get_manual(world, view_entity)
+        else {
+            return Ok(());
+        };
+
+        // Check if we should run the composite pass
+        let Some(transparent_render_phases) =
+            world.get_resource::<ViewSortedRenderPhases<TransparentUi>>()
+        else {
+            return Ok(());
+        };
+
+        let Some(transparent_phase) = transparent_render_phases.get(&view.retained_view_entity)
+        else {
+            return Ok(());
+        };
+
+        if transparent_phase.items.is_empty() {
+            return Ok(());
+        }
+
+        let Ok(target) = self.target_query.get_manual(world, ui_view_target.0) else {
+            return Ok(());
+        };
+
+        let pipeline_cache = world.resource::<PipelineCache>();
+
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
+            return Ok(());
+        };
+
+        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("srgb_ui_composite_pass"),
+            color_attachments: &[Some(target.get_unsampled_color_attachment())],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        render_pass.set_render_pipeline(pipeline);
+        render_pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
 
         Ok(())
     }
