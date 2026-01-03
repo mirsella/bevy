@@ -1,7 +1,7 @@
 //! Showcase how to use and configure FPS overlay.
 
 use bevy::{
-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin},
     prelude::*,
     text::FontSmoothing,
 };
@@ -33,13 +33,6 @@ fn main() {
                     // We can also set the refresh interval for the FPS counter
                     refresh_interval: core::time::Duration::from_millis(100),
                     enabled: true,
-                    frame_time_graph_config: FrameTimeGraphConfig {
-                        enabled: true,
-                        // The minimum acceptable fps
-                        min_fps: 30.0,
-                        // The target fps
-                        target_fps: 144.0,
-                    },
                 },
             },
         ))
@@ -88,8 +81,5 @@ fn customize_config(input: Res<ButtonInput<KeyCode>>, mut overlay: ResMut<FpsOve
     }
     if input.just_pressed(KeyCode::Digit4) {
         overlay.enabled = !overlay.enabled;
-    }
-    if input.just_released(KeyCode::Digit5) {
-        overlay.frame_time_graph_config.enabled = !overlay.frame_time_graph_config.enabled;
     }
 }
