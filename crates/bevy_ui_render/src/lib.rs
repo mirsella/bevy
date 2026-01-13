@@ -74,12 +74,12 @@ pub use ui_material_pipeline::*;
 use ui_texture_slice_pipeline::UiTextureSlicerPlugin;
 
 pub mod graph {
-use bevy_render::render_graph::{RenderLabel, RenderSubGraph};
+    use bevy_render::render_graph::{RenderLabel, RenderSubGraph};
 
-pub use crate::render_pass::SrgbUiCompositePassNode;
+    pub use crate::render_pass::SrgbUiCompositePassNode;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
-pub struct SubGraphUi;
+    #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
+    pub struct SubGraphUi;
 
     #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
     pub enum NodeUi {

@@ -53,7 +53,9 @@ fn vertex(in: VertexInput) -> VertexOutput {
 
 #ifdef SRGB_SPRITE_PASS
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    // Clamp to [0, 1] before gamma correction to handle HDR values gracefully
+    let clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return pow(clamped, vec3<f32>(1.0 / 2.2));
 }
 #endif
 

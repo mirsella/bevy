@@ -419,7 +419,7 @@ impl FromWorld for SrgbCompositePipeline {
                         entry_point: Some("fragment".into()),
                         targets: vec![Some(ColorTargetState {
                             format: TextureFormat::bevy_default(),
-                            blend: None,
+                            blend: Some(BlendState::ALPHA_BLENDING),
                             write_mask: ColorWrites::ALL,
                         })],
                     }),

@@ -70,35 +70,11 @@ fn fragment(
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
 #ifdef SRGB_MESH2D_PASS
-    // The texture is Rgba8Unorm, so we need to manually encode to sRGB.
-    // However, the pipeline expects premultiplied alpha for blending.
-    // The sRGB conversion should happen on the straight color, then premultiply again.
-    // But standard sRGB encoding is usually done at the very end.
-    
-    // For Rgba8Unorm targets where we want sRGB results:
-    // 1. We have linear color here.
-    // 2. We convert to sRGB.
-    // 3. We output that.
-    
-    // Wait, typical bevy pipeline:
-    // Main pass (HDR/Linear) -> Tonemapping -> sRGB (if SwapChain)
-    
-    // Here we are rendering to an intermediate texture (Rgba8Unorm).
-    // If we want this texture to contain sRGB data (so that standard blending works? No wait).
-    // The previous commit a19973c41 says:
-    // "Adds max(0.0) clamping to gamma conversion in shaders to prevent NaNs/artifacts."
-    // And it seems they are doing manual sRGB encoding.
-    
-    // Let's look at what `bevy_sprite` did in `sprite.wgsl` (I should check that too).
-    // But for `mesh2d.wgsl`, the reference commit did something.
-    
     let alpha = color.a;
-    // Prevent NaNs/Artifacts by clamping to 0.0
-    let rgb = max(color.rgb, vec3<f32>(0.0));
-    
+    // Clamp to [0, 1] before gamma correction to handle HDR values gracefully
+    let rgb = clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     // Manual sRGB encoding (simplified gamma 2.2)
     let srgb = pow(rgb, vec3<f32>(1.0 / 2.2));
-    
     color = vec4<f32>(srgb, alpha);
 #endif
     return color;

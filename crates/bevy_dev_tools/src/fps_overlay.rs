@@ -154,7 +154,10 @@ fn customize_overlay(
     }
 }
 
-fn toggle_display(overlay_config: Res<FpsOverlayConfig>, mut text_node: Single<&mut Node, With<FpsText>>) {
+fn toggle_display(
+    overlay_config: Res<FpsOverlayConfig>,
+    mut text_node: Single<&mut Node, With<FpsText>>,
+) {
     text_node.display = if overlay_config.enabled {
         bevy_ui::Display::DEFAULT
     } else {
