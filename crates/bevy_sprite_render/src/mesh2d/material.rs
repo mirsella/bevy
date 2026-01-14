@@ -7,10 +7,7 @@ use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::prelude::AssetChanged;
 use bevy_asset::{AsAssetId, Asset, AssetApp, AssetEventSystems, AssetId, AssetServer, Handle};
 use bevy_camera::visibility::ViewVisibility;
-use bevy_core_pipeline::{
-    core_2d::{AlphaMask2d, Opaque2d, Transparent2d},
-    tonemapping::Tonemapping,
-};
+use bevy_core_pipeline::tonemapping::Tonemapping;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::component::Tick;
 use bevy_ecs::system::SystemChangeTick;

@@ -6,7 +6,7 @@ use bevy_shader::{load_shader_library, Shader, ShaderDefVal, ShaderSettings};
 
 use crate::{tonemapping_pipeline_key, Material2dBindGroupId};
 use bevy_core_pipeline::{
-    core_2d::{AlphaMask2d, Opaque2d, CORE_2D_DEPTH_FORMAT},
+    core_2d::{AlphaMask2d, Opaque2d},
     tonemapping::{
         get_lut_bind_group_layout_entries, get_lut_bindings, DebandDither, Tonemapping,
         TonemappingLuts,
@@ -621,15 +621,13 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
         let format = TextureFormat::Rgba8Unorm;
         shader_defs.push("SRGB_MESH2D_PASS".into());
 
-        let (depth_write_enabled, label, blend);
+        let (label, blend);
         if key.contains(Mesh2dPipelineKey::BLEND_ALPHA) {
             label = "transparent_mesh2d_pipeline";
             blend = Some(BlendState::ALPHA_BLENDING);
-            depth_write_enabled = false;
         } else {
             label = "opaque_mesh2d_pipeline";
             blend = None;
-            depth_write_enabled = true;
         }
 
         Ok(RenderPipelineDescriptor {
@@ -659,22 +657,7 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
                 topology: key.primitive_topology(),
                 strip_index_format: None,
             },
-            depth_stencil: Some(DepthStencilState {
-                format: CORE_2D_DEPTH_FORMAT,
-                depth_write_enabled,
-                depth_compare: CompareFunction::GreaterEqual,
-                stencil: StencilState {
-                    front: StencilFaceState::IGNORE,
-                    back: StencilFaceState::IGNORE,
-                    read_mask: 0,
-                    write_mask: 0,
-                },
-                bias: DepthBiasState {
-                    constant: 0,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
-                },
-            }),
+            depth_stencil: None,
             multisample: MultisampleState {
                 count: key.msaa_samples(),
                 mask: !0,
