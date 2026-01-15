@@ -352,15 +352,23 @@ impl SpecializedRenderPipeline for SrgbSpritePipeline {
         }
         let mut desc = self.sprite_pipeline.specialize(base_key);
 
-        // Override the format to Rgba8Unorm (no automatic sRGB conversion)
-        // and add shader def for sRGB encoding
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        // Always encode to gamma space for perceptually correct blending
+        let format = if key.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
         if let Some(ref mut fragment) = desc.fragment {
             for target in &mut fragment.targets {
                 if let Some(state) = target {
-                    state.format = TextureFormat::Rgba8Unorm;
+                    state.format = format;
                 }
             }
-            // Add shader def so the sprite shader encodes to sRGB before writing
+            // Always add SRGB_SPRITE_PASS - gamma encoding for perceptual blending
+            // HDR values > 1.0 are preserved (not clamped in shader)
             fragment.shader_defs.push("SRGB_SPRITE_PASS".into());
         }
 
@@ -377,7 +385,8 @@ impl SpecializedRenderPipeline for SrgbSpritePipeline {
 pub struct SrgbCompositePipeline {
     pub layout: BindGroupLayout,
     pub sampler: Sampler,
-    pub pipeline_id: CachedRenderPipelineId,
+    pub shader: Handle<Shader>,
+    pub fullscreen_shader: FullscreenShader,
 }
 
 impl FromWorld for SrgbCompositePipeline {
@@ -403,38 +412,90 @@ impl FromWorld for SrgbCompositePipeline {
         });
 
         let shader = load_embedded_asset!(world, "srgb_composite.wgsl");
-
         let fullscreen_shader = world.resource::<FullscreenShader>().clone();
-
-        let pipeline_id =
-            world
-                .resource_mut::<PipelineCache>()
-                .queue_render_pipeline(RenderPipelineDescriptor {
-                    label: Some("srgb_composite_pipeline".into()),
-                    layout: vec![layout.clone()],
-                    vertex: fullscreen_shader.to_vertex_state(),
-                    fragment: Some(FragmentState {
-                        shader,
-                        shader_defs: vec![],
-                        entry_point: Some("fragment".into()),
-                        targets: vec![Some(ColorTargetState {
-                            format: TextureFormat::bevy_default(),
-                            blend: Some(BlendState::ALPHA_BLENDING),
-                            write_mask: ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: MultisampleState::default(),
-                    push_constant_ranges: vec![],
-                    zero_initialize_workgroup_memory: false,
-                });
 
         Self {
             layout,
             sampler,
-            pipeline_id,
+            shader,
+            fullscreen_shader,
         }
+    }
+}
+
+/// Pipeline key for the sRGB composite pass - varies by output format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SrgbCompositePipelineKey {
+    pub format: TextureFormat,
+    pub sample_count: u32,
+}
+
+impl SpecializedRenderPipeline for SrgbCompositePipeline {
+    type Key = SrgbCompositePipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("srgb_composite_pipeline".into()),
+            layout: vec![self.layout.clone()],
+            vertex: self.fullscreen_shader.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs: vec![],
+                entry_point: Some("fragment".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: key.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: key.sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            push_constant_ranges: vec![],
+            zero_initialize_workgroup_memory: false,
+        }
+    }
+}
+
+/// Component storing the specialized composite pipeline ID for a view.
+#[derive(Component)]
+pub struct SrgbCompositePipelineId {
+    pub pipeline_id: CachedRenderPipelineId,
+}
+
+/// Queue sRGB composite pipelines for views that need them.
+pub fn queue_srgb_composite_pipelines(
+    mut commands: Commands,
+    composite_pipeline: Res<SrgbCompositePipeline>,
+    mut pipelines: ResMut<SpecializedRenderPipelines<SrgbCompositePipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    views: Query<(Entity, &ViewTarget, &Msaa)>,
+    srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
+    extracted_views: Query<&ExtractedView>,
+) {
+    for (entity, view_target, msaa) in &views {
+        let Ok(view) = extracted_views.get(entity) else {
+            continue;
+        };
+
+        if !srgb_phases.contains_key(&view.retained_view_entity) {
+            continue;
+        }
+
+        let format = view_target.main_texture_format();
+        let key = SrgbCompositePipelineKey {
+            format,
+            sample_count: msaa.samples(),
+        };
+        let pipeline_id = pipelines.specialize(&pipeline_cache, &composite_pipeline, key);
+
+        commands
+            .entity(entity)
+            .insert(SrgbCompositePipelineId { pipeline_id });
     }
 }
 
@@ -538,10 +599,7 @@ pub fn extract_sprites(
             continue;
         }
 
-        let color: LinearRgba = sprite.color.into();
-        if color.red > 1.0 || color.green > 1.0 || color.blue > 1.0 {
-            bevy_utils::once!(tracing::warn!("HDR sprites (color values > 1.0) are not supported by the sRGB sprite pipeline and will be clamped to 1.0"));
-        }
+        let _color: LinearRgba = sprite.color.into();
 
         if let Some(slices) = slices {
             let start = extracted_slices.slices.len();
@@ -753,20 +811,6 @@ pub fn queue_sprites(
         let Some(srgb_phase) = srgb_render_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-
-        if view.hdr {
-            bevy_utils::once!(tracing::warn!(
-                "HDR views are not fully supported by the sRGB sprite pipeline. \
-                The composite pass uses a fixed SDR format which may cause rendering issues."
-            ));
-        }
-
-        if msaa.samples() > 1 {
-            bevy_utils::once!(tracing::warn!(
-                "MSAA is not fully supported by the sRGB sprite pipeline. \
-                The composite pass does not account for multisampled targets which may cause rendering failures."
-            ));
-        }
 
         let hdr = tonemapping.is_some_and(|t| *t != Tonemapping::None);
         let key = SrgbSpritePipelineKey {
@@ -1092,6 +1136,8 @@ pub struct SrgbSpriteTexture {
     /// The resolve target texture. Only present when MSAA > 1.
     /// This is the non-multisampled texture that will be sampled in the composite pass.
     pub resolve_texture: Option<CachedTexture>,
+    /// Whether this view uses HDR rendering.
+    pub hdr: bool,
 }
 
 /// Component storing the bind group for the sRGB composite pass.
@@ -1121,6 +1167,13 @@ pub fn prepare_srgb_sprite_textures(
 
         let sample_count = msaa.samples();
 
+        // Use HDR format when the view is HDR to preserve HDR values for bloom
+        let format = if view.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
         let texture = texture_cache.get(
             &render_device,
             TextureDescriptor {
@@ -1129,7 +1182,7 @@ pub fn prepare_srgb_sprite_textures(
                 mip_level_count: 1,
                 sample_count,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8Unorm,
+                format,
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -1145,7 +1198,7 @@ pub fn prepare_srgb_sprite_textures(
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
@@ -1157,6 +1210,7 @@ pub fn prepare_srgb_sprite_textures(
         commands.entity(entity).insert(SrgbSpriteTexture {
             texture,
             resolve_texture,
+            hdr: view.hdr,
         });
     }
 }
@@ -1266,6 +1320,7 @@ impl ViewNode for SrgbCompositePassNode {
         &'static ViewTarget,
         &'static SrgbSpriteTexture,
         &'static SrgbCompositeBindGroup,
+        &'static SrgbCompositePipelineId,
         &'static ExtractedView,
     );
 
@@ -1273,7 +1328,7 @@ impl ViewNode for SrgbCompositePassNode {
         &self,
         _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        (view_target, _srgb_texture, composite_bind_group, view): QueryItem<
+        (view_target, _srgb_texture, composite_bind_group, composite_pipeline_id, view): QueryItem<
             'w,
             '_,
             Self::ViewQuery,
@@ -1293,15 +1348,18 @@ impl ViewNode for SrgbCompositePassNode {
         }
 
         let pipeline_cache = world.resource::<PipelineCache>();
-        let composite_pipeline = world.resource::<SrgbCompositePipeline>();
 
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(composite_pipeline.pipeline_id)
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(composite_pipeline_id.pipeline_id)
         else {
             return Ok(());
         };
 
         let color_attachment = RenderPassColorAttachment {
-            view: view_target.main_texture_view(),
+            // Use the sampled texture view if it exists (MSAA enabled), otherwise use the main texture view.
+            // This ensures we draw into the correct buffer (MSAA or single-sampled) preserving previous passes.
+            view: view_target
+                .sampled_main_texture_view()
+                .unwrap_or(view_target.main_texture_view()),
             resolve_target: None,
             ops: Operations {
                 load: LoadOp::Load,

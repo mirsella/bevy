@@ -89,6 +89,7 @@ impl Plugin for SpriteRenderPlugin {
                 .init_resource::<ImageBindGroups>()
                 .init_resource::<SpecializedRenderPipelines<SpritePipeline>>()
                 .init_resource::<SpecializedRenderPipelines<SrgbSpritePipeline>>()
+                .init_resource::<SpecializedRenderPipelines<SrgbCompositePipeline>>()
                 .init_resource::<SpriteMeta>()
                 .init_resource::<ExtractedSprites>()
                 .init_resource::<ExtractedSlices>()
@@ -117,6 +118,7 @@ impl Plugin for SpriteRenderPlugin {
                         queue_sprites
                             .in_set(RenderSystems::Queue)
                             .ambiguous_with(queue_material2d_meshes::<ColorMaterial>),
+                        queue_srgb_composite_pipelines.in_set(RenderSystems::Queue),
                         prepare_sprite_image_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         prepare_sprite_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         prepare_srgb_sprite_textures.in_set(RenderSystems::PrepareResources),

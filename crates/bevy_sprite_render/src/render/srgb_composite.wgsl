@@ -16,11 +16,18 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(srgb_texture, srgb_sampler, in.uv);
 
-    // color.rgb: sRGB-encoded composite from sprite pass
-    // color.a  : composite alpha from sprite pass
-    let linear_rgb = srgb_to_linear(color.rgb);
+    // The texture contains sRGB-encoded colors with premultiplied alpha.
+    // To convert to linear space correctly, we must:
+    // 1. Un-premultiply to get straight sRGB
+    // 2. Convert straight sRGB to straight Linear
+    // 3. Output straight alpha as BlendState::ALPHA_BLENDING (SrcAlpha, OneMinusSrcAlpha) handles the multiplication by alpha.
+
+    let alpha = max(color.a, 0.00001);
+    let straight_srgb = color.rgb / alpha;
+
+    let straight_linear = srgb_to_linear(straight_srgb);
 
     // Output straight alpha as BlendState::ALPHA_BLENDING (SrcAlpha, OneMinusSrcAlpha)
     // handles the multiplication by alpha.
-    return vec4<f32>(linear_rgb, color.a);
+    return vec4<f32>(straight_linear, color.a);
 }

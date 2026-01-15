@@ -144,6 +144,14 @@ where
         );
         let shader_defs = vec!["MANUAL_SRGB".into()];
 
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        let format = if key.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.vertex_shader.clone(),
@@ -155,7 +163,7 @@ where
                 shader: self.fragment_shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -607,6 +615,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             &ui_material_pipeline,
             UiMaterialKey {
                 bind_group_data: material.key.clone(),
+                hdr: view.hdr,
             },
         );
         if transparent_phase.items.capacity() < extracted_uinodes.uinodes.len() {

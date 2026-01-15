@@ -130,16 +130,9 @@ pub fn check_views_need_specialization(
     )>,
     ticks: SystemChangeTick,
 ) {
-    for (view_entity, _view, msaa, tonemapping, dither) in &views {
-        let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples());
-
-        if let Some(tonemapping) = tonemapping {
-            view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
-            view_key |= tonemapping_pipeline_key(*tonemapping);
-        }
-        if let Some(DebandDither::Enabled) = dither {
-            view_key |= Mesh2dPipelineKey::DEBAND_DITHER;
-        }
+    for (view_entity, view, msaa, _tonemapping, _dither) in &views {
+        let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
+            | Mesh2dPipelineKey::from_hdr(view.hdr);
 
         if !view_key_cache
             .get_mut(view_entity)
@@ -472,6 +465,7 @@ bitflags::bitflags! {
     // FIXME: make normals optional?
     pub struct Mesh2dPipelineKey: u32 {
         const NONE                              = 0;
+        const HDR                               = 1 << 0;
         const TONEMAP_IN_SHADER                 = 1 << 1;
         const DEBAND_DITHER                     = 1 << 2;
         const BLEND_ALPHA                       = 1 << 3;
@@ -526,6 +520,15 @@ impl Mesh2dPipelineKey {
             x if x == PrimitiveTopology::TriangleList as u32 => PrimitiveTopology::TriangleList,
             x if x == PrimitiveTopology::TriangleStrip as u32 => PrimitiveTopology::TriangleStrip,
             _ => PrimitiveTopology::default(),
+        }
+    }
+
+    #[inline]
+    pub const fn from_hdr(hdr: bool) -> Self {
+        if hdr {
+            Mesh2dPipelineKey::HDR
+        } else {
+            Mesh2dPipelineKey::NONE
         }
     }
 }
@@ -618,7 +621,16 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
 
         let vertex_buffer_layout = layout.0.get_layout(&vertex_attributes)?;
 
-        let format = TextureFormat::Rgba8Unorm;
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        let format = if key.contains(Mesh2dPipelineKey::HDR) {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
+        // Always encode to gamma space for perceptually correct blending
+        // HDR values > 1.0 are preserved (not clamped in shader)
         shader_defs.push("SRGB_MESH2D_PASS".into());
 
         let (label, blend);

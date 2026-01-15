@@ -123,9 +123,17 @@ impl SpecializedRenderPipeline for UiPipeline {
             Vec::new()
         };
 
-        // UI is always rendered to an sRGB intermediate texture with Rgba8Unorm format
-        // The shader needs to manually encode to sRGB
+        // UI is always rendered to an sRGB intermediate texture
+        // The shader needs to manually encode to sRGB (gamma correction)
         shader_defs.push("MANUAL_SRGB".into());
+
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        let format = if key.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -138,7 +146,7 @@ impl SpecializedRenderPipeline for UiPipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],

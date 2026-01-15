@@ -46,6 +46,14 @@ pub fn prepare_srgb_ui_textures(
 
         let sample_count = msaa.map(|m| m.samples()).unwrap_or(1);
 
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        let format = if view.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
         let texture = texture_cache.get(
             &render_device,
             TextureDescriptor {
@@ -54,7 +62,7 @@ pub fn prepare_srgb_ui_textures(
                 mip_level_count: 1,
                 sample_count,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8Unorm,
+                format,
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -70,7 +78,7 @@ pub fn prepare_srgb_ui_textures(
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },

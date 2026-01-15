@@ -127,7 +127,7 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     
     // Encode to sRGB so blending in Rgba8Unorm happens in sRGB/gamma space
 #ifdef MANUAL_SRGB
-    let encoded = pow(clamp(color.rgb, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+    let encoded = pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.2));
 #else
     let encoded = color.rgb;
 #endif

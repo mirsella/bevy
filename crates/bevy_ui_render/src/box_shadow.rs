@@ -132,6 +132,7 @@ pub fn init_box_shadow_pipeline(
 pub struct BoxShadowPipelineKey {
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
+    pub hdr: bool,
 }
 
 impl SpecializedRenderPipeline for BoxShadowPipeline {
@@ -162,6 +163,14 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
             "MANUAL_SRGB".into(),
         ];
 
+        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
+        // Use Rgba8Unorm for SDR
+        let format = if key.hdr {
+            TextureFormat::Rgba16Float
+        } else {
+            TextureFormat::Rgba8Unorm
+        };
+
         RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.shader.clone(),
@@ -173,7 +182,7 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
+                    format,
                     blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -335,6 +344,7 @@ pub fn queue_shadows(
                 samples: shadow_samples
                     .map(|s| s.0)
                     .unwrap_or(BoxShadowSamples::default().0),
+                hdr: view.hdr,
             },
         );
 

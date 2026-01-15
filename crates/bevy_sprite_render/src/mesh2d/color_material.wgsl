@@ -49,8 +49,8 @@ fn fragment(
 
 #ifdef SRGB_MESH2D_PASS
     let alpha = output_color.a;
-    // Clamp to [0, 1] before gamma correction to handle HDR values gracefully
-    let rgb = clamp(output_color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Only clamp negative values to avoid NaN from pow, preserve HDR values > 1.0
+    let rgb = max(output_color.rgb, vec3<f32>(0.0));
     let srgb = pow(rgb, vec3<f32>(1.0 / 2.2));
     output_color = vec4<f32>(srgb, alpha);
 #endif
