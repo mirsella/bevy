@@ -53,6 +53,18 @@ pub(super) unsafe fn observer_system_runner<E: Event, B: Bundle, S: ObserverSyst
     }
     state.last_trigger_id = last_trigger;
 
+    // Check run conditions
+    // SAFETY:
+    // - Conditions are initialized during hook_on_add with exclusive world access
+    // - Conditions are ReadOnlySystem (SystemCondition bound), so they won't cause aliasing issues
+    // - Observer holds &mut Observer through state, preventing aliased mutation
+    for condition in &mut state.conditions {
+        // SAFETY: Conditions are initialized and world access is valid
+        if !unsafe { condition.check(world) } {
+            return;
+        }
+    }
+
     // SAFETY: Caller ensures `trigger_ptr` is castable to `&mut E::Trigger<'_>`
     // The soundness story here is complicated: This casts to &'a mut E::Trigger<'a> which notably
     // casts the _arbitrary lifetimes_ of the passed in `trigger_ptr` (&'w E::Trigger<'t>, which are
