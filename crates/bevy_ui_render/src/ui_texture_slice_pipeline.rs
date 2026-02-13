@@ -356,6 +356,7 @@ pub fn queue_ui_slices(
             extra_index: PhaseItemExtraIndex::None,
             index,
             indexed: true,
+            clip: extracted_slicer.clip,
         });
     }
 }
@@ -406,6 +407,7 @@ pub fn prepare_ui_slices(
             let mut batch_item_index = 0;
             let mut batch_image_handle = AssetId::invalid();
             let mut batch_image_size = Vec2::ZERO;
+            let mut batch_clip: Option<Rect> = None;
 
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
@@ -418,6 +420,7 @@ pub fn prepare_ui_slices(
 
                     if batch_image_handle == AssetId::invalid()
                         || existing_batch.is_none()
+                        || batch_clip != texture_slices.clip
                         || (batch_image_handle != AssetId::default()
                             && texture_slices.image != AssetId::default()
                             && batch_image_handle != texture_slices.image)
@@ -426,6 +429,7 @@ pub fn prepare_ui_slices(
                             batch_item_index = item_index;
                             batch_image_handle = texture_slices.image;
                             batch_image_size = gpu_image.size_2d().as_vec2();
+                            batch_clip = texture_slices.clip;
 
                             let new_batch = UiTextureSlicerBatch {
                                 range: vertices_index..vertices_index,
@@ -488,85 +492,26 @@ pub fn prepare_ui_slices(
                         (texture_slices.transform.transform_point2(pos * rect_size)).extend(0.)
                     });
 
-                    // Calculate the effect of clipping
-                    // Note: this won't work with rotation/scaling, but that's much more complex (may need more that 2 quads)
-                    let positions_diff = if let Some(clip) = texture_slices.clip {
-                        [
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[0].x, 0.),
-                                f32::max(clip.min.y - positions[0].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[1].x, 0.),
-                                f32::max(clip.min.y - positions[1].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[2].x, 0.),
-                                f32::min(clip.max.y - positions[2].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[3].x, 0.),
-                                f32::min(clip.max.y - positions[3].y, 0.),
-                            ),
-                        ]
-                    } else {
-                        [Vec2::ZERO; 4]
-                    };
+                    // Cull nodes that are completely outside the clip.
+                    if let Some(clip) = texture_slices.clip {
+                        let mut aabb_min = positions[0].truncate();
+                        let mut aabb_max = aabb_min;
+                        for position in &positions[1..] {
+                            let position = position.truncate();
+                            aabb_min = aabb_min.min(position);
+                            aabb_max = aabb_max.max(position);
+                        }
 
-                    let positions_clipped = [
-                        positions[0] + positions_diff[0].extend(0.),
-                        positions[1] + positions_diff[1].extend(0.),
-                        positions[2] + positions_diff[2].extend(0.),
-                        positions[3] + positions_diff[3].extend(0.),
-                    ];
-
-                    let transformed_rect_size =
-                        texture_slices.transform.transform_vector2(rect_size);
-
-                    // Don't try to cull nodes that have a rotation
-                    // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                    // In those two cases, the culling check can proceed normally as corners will be on
-                    // horizontal / vertical lines
-                    // For all other angles, bypass the culling check
-                    // This does not properly handles all rotations on all axis
-                    if texture_slices.transform.x_axis[1] == 0.0 {
-                        // Cull nodes that are completely clipped
-                        if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                            || positions_diff[1].y - positions_diff[2].y >= transformed_rect_size.y
+                        if aabb_max.x <= clip.min.x
+                            || clip.max.x <= aabb_min.x
+                            || aabb_max.y <= clip.min.y
+                            || clip.max.y <= aabb_min.y
                         {
                             continue;
                         }
                     }
-                    let flags = if texture_slices.image != AssetId::default() {
-                        shader_flags::TEXTURED
-                    } else {
-                        shader_flags::UNTEXTURED
-                    };
 
-                    let uvs = if flags == shader_flags::UNTEXTURED {
-                        [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]
-                    } else {
-                        let atlas_extent = uinode_rect.max;
-                        [
-                            Vec2::new(
-                                uinode_rect.min.x + positions_diff[0].x,
-                                uinode_rect.min.y + positions_diff[0].y,
-                            ),
-                            Vec2::new(
-                                uinode_rect.max.x + positions_diff[1].x,
-                                uinode_rect.min.y + positions_diff[1].y,
-                            ),
-                            Vec2::new(
-                                uinode_rect.max.x + positions_diff[2].x,
-                                uinode_rect.max.y + positions_diff[2].y,
-                            ),
-                            Vec2::new(
-                                uinode_rect.min.x + positions_diff[3].x,
-                                uinode_rect.max.y + positions_diff[3].y,
-                            ),
-                        ]
-                        .map(|pos| pos / atlas_extent)
-                    };
+                    let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y];
 
                     let color = texture_slices.color.to_f32_array();
 
@@ -600,7 +545,7 @@ pub fn prepare_ui_slices(
 
                     for i in 0..4 {
                         ui_meta.vertices.push(UiTextureSliceVertex {
-                            position: positions_clipped[i].into(),
+                            position: positions[i].into(),
                             uv: uvs[i].into(),
                             color,
                             slices,
@@ -634,6 +579,7 @@ pub fn prepare_ui_slices(
 
 pub type DrawUiTextureSlices = (
     SetItemPipeline,
+    SetUiScissorRect,
     SetSlicerViewBindGroup<0>,
     SetSlicerTextureBindGroup<1>,
     DrawSlicer,

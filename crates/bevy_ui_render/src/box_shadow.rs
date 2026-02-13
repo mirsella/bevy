@@ -34,7 +34,7 @@ use bevy_ui::{
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
 
-use crate::{BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap};
+use crate::{BoxShadowSamples, RenderUiSystems, SetUiScissorRect, TransparentUi, UiCameraMap};
 
 use super::{stack_z_offsets, UiCameraView, QUAD_INDICES, QUAD_VERTEX_POSITIONS};
 
@@ -358,6 +358,7 @@ pub fn queue_shadows(
             extra_index: PhaseItemExtraIndex::None,
             index,
             indexed: true,
+            clip: extracted_shadow.clip,
         });
     }
 }
@@ -408,75 +409,30 @@ pub fn prepare_shadows(
                         .extend(0.)
                 });
 
-                // Calculate the effect of clipping
-                // Note: this won't work with rotation/scaling, but that's much more complex (may need more that 2 quads)
-                let positions_diff = if let Some(clip) = box_shadow.clip {
-                    [
-                        Vec2::new(
-                            f32::max(clip.min.x - positions[0].x, 0.),
-                            f32::max(clip.min.y - positions[0].y, 0.),
-                        ),
-                        Vec2::new(
-                            f32::min(clip.max.x - positions[1].x, 0.),
-                            f32::max(clip.min.y - positions[1].y, 0.),
-                        ),
-                        Vec2::new(
-                            f32::min(clip.max.x - positions[2].x, 0.),
-                            f32::min(clip.max.y - positions[2].y, 0.),
-                        ),
-                        Vec2::new(
-                            f32::max(clip.min.x - positions[3].x, 0.),
-                            f32::min(clip.max.y - positions[3].y, 0.),
-                        ),
-                    ]
-                } else {
-                    [Vec2::ZERO; 4]
-                };
+                // Cull nodes that are completely outside the clip.
+                if let Some(clip) = box_shadow.clip {
+                    let mut aabb_min = positions[0].truncate();
+                    let mut aabb_max = aabb_min;
+                    for position in &positions[1..] {
+                        let position = position.truncate();
+                        aabb_min = aabb_min.min(position);
+                        aabb_max = aabb_max.max(position);
+                    }
 
-                let positions_clipped = [
-                    positions[0] + positions_diff[0].extend(0.),
-                    positions[1] + positions_diff[1].extend(0.),
-                    positions[2] + positions_diff[2].extend(0.),
-                    positions[3] + positions_diff[3].extend(0.),
-                ];
-
-                let transformed_rect_size = box_shadow.transform.transform_vector2(rect_size);
-
-                // Don't try to cull nodes that have a rotation
-                // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                // In those two cases, the culling check can proceed normally as corners will be on
-                // horizontal / vertical lines
-                // For all other angles, bypass the culling check
-                // This does not properly handles all rotations on all axis
-                if box_shadow.transform.x_axis[1] == 0.0 {
-                    // Cull nodes that are completely clipped
-                    if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                        || positions_diff[1].y - positions_diff[2].y >= transformed_rect_size.y
+                    if aabb_max.x <= clip.min.x
+                        || clip.max.x <= aabb_min.x
+                        || aabb_max.y <= clip.min.y
+                        || clip.max.y <= aabb_min.y
                     {
                         continue;
                     }
                 }
 
-                let uvs = [
-                    Vec2::new(positions_diff[0].x, positions_diff[0].y),
-                    Vec2::new(
-                        box_shadow.bounds.x + positions_diff[1].x,
-                        positions_diff[1].y,
-                    ),
-                    Vec2::new(
-                        box_shadow.bounds.x + positions_diff[2].x,
-                        box_shadow.bounds.y + positions_diff[2].y,
-                    ),
-                    Vec2::new(
-                        positions_diff[3].x,
-                        box_shadow.bounds.y + positions_diff[3].y,
-                    ),
-                ]
-                .map(|pos| pos / box_shadow.bounds);
+                let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y];
 
                 for i in 0..4 {
                     ui_meta.vertices.push(BoxShadowVertex {
-                        position: positions_clipped[i].into(),
+                        position: positions[i].into(),
                         uvs: uvs[i].into(),
                         vertex_color: box_shadow.color.to_f32_array(),
                         size: box_shadow.size.into(),
@@ -514,7 +470,12 @@ pub fn prepare_shadows(
     extracted_shadows.box_shadows.clear();
 }
 
-pub type DrawBoxShadows = (SetItemPipeline, SetBoxShadowViewBindGroup<0>, DrawBoxShadow);
+pub type DrawBoxShadows = (
+    SetItemPipeline,
+    SetUiScissorRect,
+    SetBoxShadowViewBindGroup<0>,
+    DrawBoxShadow,
+);
 
 pub struct SetBoxShadowViewBindGroup<const I: usize>;
 impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetBoxShadowViewBindGroup<I> {

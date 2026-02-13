@@ -8,7 +8,7 @@ use bevy_ecs::{
     prelude::*,
     system::{lifetimeless::*, SystemParamItem},
 };
-use bevy_math::FloatOrd;
+use bevy_math::{FloatOrd, Rect, Vec2};
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -224,6 +224,10 @@ pub struct TransparentUi {
     pub extra_index: PhaseItemExtraIndex,
     pub index: usize,
     pub indexed: bool,
+    /// Clipping rect in UI view coordinates (physical pixels).
+    ///
+    /// When set, the draw function will apply it using a GPU scissor rect.
+    pub clip: Option<Rect>,
 }
 
 impl PhaseItem for TransparentUi {
@@ -290,10 +294,62 @@ impl CachedRenderPipelinePhaseItem for TransparentUi {
 
 pub type DrawUi = (
     SetItemPipeline,
+    SetUiScissorRect,
     SetUiViewBindGroup<0>,
     SetUiTextureBindGroup<1>,
     DrawUiNode,
 );
+
+pub struct SetUiScissorRect;
+impl RenderCommand<TransparentUi> for SetUiScissorRect {
+    type Param = ();
+    type ViewQuery = Read<ExtractedView>;
+    type ItemQuery = ();
+
+    #[inline]
+    fn render<'w>(
+        item: &TransparentUi,
+        view: &'w ExtractedView,
+        _entity: Option<()>,
+        _param: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let view_width = view.viewport.z;
+        let view_height = view.viewport.w;
+
+        // wgpu validation requires width/height > 0
+        if view_width == 0 || view_height == 0 {
+            return RenderCommandResult::Skip;
+        }
+
+        let (x0, y0, x1, y1) = if let Some(clip) = item.clip {
+            // Clamp clip to the view bounds.
+            let max = Vec2::new(view_width as f32, view_height as f32);
+            let clip_min = clip.min.clamp(Vec2::ZERO, max);
+            let clip_max = clip.max.clamp(Vec2::ZERO, max);
+
+            // Convert float clip rect to an integer scissor rect.
+            //
+            // We round based on pixel centers (x + 0.5, y + 0.5) to better match how
+            // rasterization works for non-MSAA rendering.
+            let eps = 1e-4;
+            let x0 = (clip_min.x - 0.5 - eps).ceil() as i32;
+            let y0 = (clip_min.y - 0.5 - eps).ceil() as i32;
+            let x1 = (clip_max.x + 0.5 + eps).floor() as i32;
+            let y1 = (clip_max.y + 0.5 + eps).floor() as i32;
+            (x0, y0, x1, y1)
+        } else {
+            (0, 0, view_width as i32, view_height as i32)
+        };
+
+        if x1 <= x0 || y1 <= y0 {
+            return RenderCommandResult::Skip;
+        }
+
+        pass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+        RenderCommandResult::Success
+    }
+}
 
 pub struct SetUiViewBindGroup<const I: usize>;
 impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiViewBindGroup<I> {

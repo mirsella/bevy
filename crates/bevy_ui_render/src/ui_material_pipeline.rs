@@ -220,6 +220,7 @@ pub fn init_ui_material_pipeline<M: UiMaterial>(
 
 pub type DrawUiMaterial<M> = (
     SetItemPipeline,
+    SetUiScissorRect,
     SetMatUiViewBindGroup<M, 0>,
     SetUiMaterialBindGroup<M, 1>,
     DrawUiMaterialNode<M>,
@@ -409,6 +410,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
         for ui_phase in phases.values_mut() {
             let mut batch_item_index = 0;
             let mut batch_shader_handle = AssetId::invalid();
+            let mut batch_clip: Option<Rect> = None;
 
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
@@ -417,13 +419,15 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
                     .get(item.index)
                     .filter(|n| item.entity() == n.render_entity)
                 {
-                    let mut existing_batch = batches
-                        .last_mut()
-                        .filter(|_| batch_shader_handle == extracted_uinode.material);
+                    let mut existing_batch = batches.last_mut().filter(|_| {
+                        batch_shader_handle == extracted_uinode.material
+                            && batch_clip == extracted_uinode.clip
+                    });
 
                     if existing_batch.is_none() {
                         batch_item_index = item_index;
                         batch_shader_handle = extracted_uinode.material;
+                        batch_clip = extracted_uinode.clip;
 
                         let new_batch = UiMaterialBatch {
                             range: index..index,
@@ -446,76 +450,30 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
                             .extend(1.0)
                     });
 
-                    let positions_diff = if let Some(clip) = extracted_uinode.clip {
-                        [
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[0].x, 0.),
-                                f32::max(clip.min.y - positions[0].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[1].x, 0.),
-                                f32::max(clip.min.y - positions[1].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[2].x, 0.),
-                                f32::min(clip.max.y - positions[2].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[3].x, 0.),
-                                f32::min(clip.max.y - positions[3].y, 0.),
-                            ),
-                        ]
-                    } else {
-                        [Vec2::ZERO; 4]
-                    };
+                    // Cull nodes that are completely outside the clip.
+                    if let Some(clip) = extracted_uinode.clip {
+                        let mut aabb_min = positions[0].truncate();
+                        let mut aabb_max = aabb_min;
+                        for position in &positions[1..] {
+                            let position = position.truncate();
+                            aabb_min = aabb_min.min(position);
+                            aabb_max = aabb_max.max(position);
+                        }
 
-                    let positions_clipped = [
-                        positions[0] + positions_diff[0].extend(0.),
-                        positions[1] + positions_diff[1].extend(0.),
-                        positions[2] + positions_diff[2].extend(0.),
-                        positions[3] + positions_diff[3].extend(0.),
-                    ];
-
-                    let transformed_rect_size =
-                        extracted_uinode.transform.transform_vector2(rect_size);
-
-                    // Don't try to cull nodes that have a rotation
-                    // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                    // In those two cases, the culling check can proceed normally as corners will be on
-                    // horizontal / vertical lines
-                    // For all other angles, bypass the culling check
-                    // This does not properly handles all rotations on all axis
-                    if extracted_uinode.transform.x_axis[1] == 0.0 {
-                        // Cull nodes that are completely clipped
-                        if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                            || positions_diff[1].y - positions_diff[2].y >= transformed_rect_size.y
+                        if aabb_max.x <= clip.min.x
+                            || clip.max.x <= aabb_min.x
+                            || aabb_max.y <= clip.min.y
+                            || clip.max.y <= aabb_min.y
                         {
                             continue;
                         }
                     }
-                    let uvs = [
-                        Vec2::new(
-                            uinode_rect.min.x + positions_diff[0].x,
-                            uinode_rect.min.y + positions_diff[0].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.max.x + positions_diff[1].x,
-                            uinode_rect.min.y + positions_diff[1].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.max.x + positions_diff[2].x,
-                            uinode_rect.max.y + positions_diff[2].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.min.x + positions_diff[3].x,
-                            uinode_rect.max.y + positions_diff[3].y,
-                        ),
-                    ]
-                    .map(|pos| pos / uinode_rect.max);
+
+                    let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y];
 
                     for i in QUAD_INDICES {
                         ui_meta.vertices.push(UiMaterialVertex {
-                            position: positions_clipped[i].into(),
+                            position: positions[i].into(),
                             uv: uvs[i].into(),
                             size: extracted_uinode.rect.size().into(),
                             radius: extracted_uinode.border_radius,
@@ -533,6 +491,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
                 } else {
                     batch_shader_handle = AssetId::invalid();
+                    batch_clip = None;
                 }
             }
         }
@@ -632,6 +591,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             extra_index: PhaseItemExtraIndex::None,
             index,
             indexed: false,
+            clip: extracted_uinode.clip,
         });
     }
 }

@@ -1288,6 +1288,7 @@ pub fn queue_uinodes(
             batch_range: 0..0,
             extra_index: PhaseItemExtraIndex::None,
             indexed: true,
+            clip: extracted_uinode.clip,
         });
     }
 }
@@ -1342,6 +1343,7 @@ pub fn prepare_uinodes(
         for ui_phase in phases.values_mut() {
             let mut batch_item_index = 0;
             let mut batch_image_handle = AssetId::invalid();
+            let mut batch_clip: Option<Rect> = None;
 
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
@@ -1351,6 +1353,7 @@ pub fn prepare_uinodes(
                     .filter(|n| item.entity() == n.render_entity)
                 else {
                     batch_image_handle = AssetId::invalid();
+                    batch_clip = None;
                     continue;
                 };
 
@@ -1358,6 +1361,7 @@ pub fn prepare_uinodes(
 
                 if batch_image_handle == AssetId::invalid()
                     || existing_batch.is_none()
+                    || batch_clip != extracted_uinode.clip
                     || (batch_image_handle != AssetId::default()
                         && extracted_uinode.image != AssetId::default()
                         && batch_image_handle != extracted_uinode.image)
@@ -1365,6 +1369,7 @@ pub fn prepare_uinodes(
                     if let Some(gpu_image) = gpu_images.get(extracted_uinode.image) {
                         batch_item_index = item_index;
                         batch_image_handle = extracted_uinode.image;
+                        batch_clip = extracted_uinode.clip;
 
                         let new_batch = UiBatch {
                             range: vertices_index..vertices_index,
@@ -1445,58 +1450,20 @@ pub fn prepare_uinodes(
                             .map(|pos| transform.transform_point2(pos * rect_size).extend(0.));
                         let points = QUAD_VERTEX_POSITIONS.map(|pos| pos * rect_size);
 
-                        // Calculate the effect of clipping
-                        // Note: this won't work with rotation/scaling, but that's much more complex (may need more that 2 quads)
-                        let mut positions_diff = if let Some(clip) = extracted_uinode.clip {
-                            [
-                                Vec2::new(
-                                    f32::max(clip.min.x - positions[0].x, 0.),
-                                    f32::max(clip.min.y - positions[0].y, 0.),
-                                ),
-                                Vec2::new(
-                                    f32::min(clip.max.x - positions[1].x, 0.),
-                                    f32::max(clip.min.y - positions[1].y, 0.),
-                                ),
-                                Vec2::new(
-                                    f32::min(clip.max.x - positions[2].x, 0.),
-                                    f32::min(clip.max.y - positions[2].y, 0.),
-                                ),
-                                Vec2::new(
-                                    f32::max(clip.min.x - positions[3].x, 0.),
-                                    f32::min(clip.max.y - positions[3].y, 0.),
-                                ),
-                            ]
-                        } else {
-                            [Vec2::ZERO; 4]
-                        };
+                        // Cull nodes that are completely outside the clip.
+                        if let Some(clip) = extracted_uinode.clip {
+                            let mut aabb_min = positions[0].truncate();
+                            let mut aabb_max = aabb_min;
+                            for position in &positions[1..] {
+                                let position = position.truncate();
+                                aabb_min = aabb_min.min(position);
+                                aabb_max = aabb_max.max(position);
+                            }
 
-                        let positions_clipped = [
-                            positions[0] + positions_diff[0].extend(0.),
-                            positions[1] + positions_diff[1].extend(0.),
-                            positions[2] + positions_diff[2].extend(0.),
-                            positions[3] + positions_diff[3].extend(0.),
-                        ];
-
-                        let points = [
-                            points[0] + positions_diff[0],
-                            points[1] + positions_diff[1],
-                            points[2] + positions_diff[2],
-                            points[3] + positions_diff[3],
-                        ];
-
-                        let transformed_rect_size = transform.transform_vector2(rect_size);
-
-                        // Don't try to cull nodes that have a rotation
-                        // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                        // In those two cases, the culling check can proceed normally as corners will be on
-                        // horizontal / vertical lines
-                        // For all other angles, bypass the culling check
-                        // This does not properly handles all rotations on all axis
-                        if transform.x_axis[1] == 0.0 {
-                            // Cull nodes that are completely clipped
-                            if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                                || positions_diff[1].y - positions_diff[2].y
-                                    >= transformed_rect_size.y
+                            if aabb_max.x <= clip.min.x
+                                || clip.max.x <= aabb_min.x
+                                || aabb_max.y <= clip.min.y
+                                || clip.max.y <= aabb_min.y
                             {
                                 continue;
                             }
@@ -1513,35 +1480,15 @@ pub fn prepare_uinodes(
                                 .unwrap_or(uinode_rect.max);
                             if *flip_x {
                                 core::mem::swap(&mut uinode_rect.max.x, &mut uinode_rect.min.x);
-                                positions_diff[0].x *= -1.;
-                                positions_diff[1].x *= -1.;
-                                positions_diff[2].x *= -1.;
-                                positions_diff[3].x *= -1.;
                             }
                             if *flip_y {
                                 core::mem::swap(&mut uinode_rect.max.y, &mut uinode_rect.min.y);
-                                positions_diff[0].y *= -1.;
-                                positions_diff[1].y *= -1.;
-                                positions_diff[2].y *= -1.;
-                                positions_diff[3].y *= -1.;
                             }
                             [
-                                Vec2::new(
-                                    uinode_rect.min.x + positions_diff[0].x,
-                                    uinode_rect.min.y + positions_diff[0].y,
-                                ),
-                                Vec2::new(
-                                    uinode_rect.max.x + positions_diff[1].x,
-                                    uinode_rect.min.y + positions_diff[1].y,
-                                ),
-                                Vec2::new(
-                                    uinode_rect.max.x + positions_diff[2].x,
-                                    uinode_rect.max.y + positions_diff[2].y,
-                                ),
-                                Vec2::new(
-                                    uinode_rect.min.x + positions_diff[3].x,
-                                    uinode_rect.max.y + positions_diff[3].y,
-                                ),
+                                Vec2::new(uinode_rect.min.x, uinode_rect.min.y),
+                                Vec2::new(uinode_rect.max.x, uinode_rect.min.y),
+                                Vec2::new(uinode_rect.max.x, uinode_rect.max.y),
+                                Vec2::new(uinode_rect.min.x, uinode_rect.max.y),
                             ]
                             .map(|pos| pos / atlas_extent)
                         };
@@ -1553,7 +1500,7 @@ pub fn prepare_uinodes(
 
                         for i in 0..4 {
                             ui_meta.vertices.push(UiVertex {
-                                position: positions_clipped[i].into(),
+                                position: positions[i].into(),
                                 uv: uvs[i].into(),
                                 color,
                                 flags: flags | shader_flags::CORNERS[i],
@@ -1591,70 +1538,36 @@ pub fn prepare_uinodes(
                                     .extend(0.)
                             });
 
-                            let positions_diff = if let Some(clip) = extracted_uinode.clip {
-                                [
-                                    Vec2::new(
-                                        f32::max(clip.min.x - positions[0].x, 0.),
-                                        f32::max(clip.min.y - positions[0].y, 0.),
-                                    ),
-                                    Vec2::new(
-                                        f32::min(clip.max.x - positions[1].x, 0.),
-                                        f32::max(clip.min.y - positions[1].y, 0.),
-                                    ),
-                                    Vec2::new(
-                                        f32::min(clip.max.x - positions[2].x, 0.),
-                                        f32::min(clip.max.y - positions[2].y, 0.),
-                                    ),
-                                    Vec2::new(
-                                        f32::max(clip.min.x - positions[3].x, 0.),
-                                        f32::min(clip.max.y - positions[3].y, 0.),
-                                    ),
-                                ]
-                            } else {
-                                [Vec2::ZERO; 4]
-                            };
+                            // Cull glyphs that are completely outside the clip.
+                            if let Some(clip) = extracted_uinode.clip {
+                                let mut aabb_min = positions[0].truncate();
+                                let mut aabb_max = aabb_min;
+                                for position in &positions[1..] {
+                                    let position = position.truncate();
+                                    aabb_min = aabb_min.min(position);
+                                    aabb_max = aabb_max.max(position);
+                                }
 
-                            let positions_clipped = [
-                                positions[0] + positions_diff[0].extend(0.),
-                                positions[1] + positions_diff[1].extend(0.),
-                                positions[2] + positions_diff[2].extend(0.),
-                                positions[3] + positions_diff[3].extend(0.),
-                            ];
-
-                            // cull nodes that are completely clipped
-                            let transformed_rect_size =
-                                extracted_uinode.transform.transform_vector2(rect_size);
-                            if positions_diff[0].x - positions_diff[1].x
-                                >= transformed_rect_size.x.abs()
-                                || positions_diff[1].y - positions_diff[2].y
-                                    >= transformed_rect_size.y.abs()
-                            {
-                                continue;
+                                if aabb_max.x <= clip.min.x
+                                    || clip.max.x <= aabb_min.x
+                                    || aabb_max.y <= clip.min.y
+                                    || clip.max.y <= aabb_min.y
+                                {
+                                    continue;
+                                }
                             }
 
                             let uvs = [
-                                Vec2::new(
-                                    glyph.rect.min.x + positions_diff[0].x,
-                                    glyph.rect.min.y + positions_diff[0].y,
-                                ),
-                                Vec2::new(
-                                    glyph.rect.max.x + positions_diff[1].x,
-                                    glyph.rect.min.y + positions_diff[1].y,
-                                ),
-                                Vec2::new(
-                                    glyph.rect.max.x + positions_diff[2].x,
-                                    glyph.rect.max.y + positions_diff[2].y,
-                                ),
-                                Vec2::new(
-                                    glyph.rect.min.x + positions_diff[3].x,
-                                    glyph.rect.max.y + positions_diff[3].y,
-                                ),
+                                Vec2::new(glyph.rect.min.x, glyph.rect.min.y),
+                                Vec2::new(glyph.rect.max.x, glyph.rect.min.y),
+                                Vec2::new(glyph.rect.max.x, glyph.rect.max.y),
+                                Vec2::new(glyph.rect.min.x, glyph.rect.max.y),
                             ]
                             .map(|pos| pos / atlas_extent);
 
                             for i in 0..4 {
                                 ui_meta.vertices.push(UiVertex {
-                                    position: positions_clipped[i].into(),
+                                    position: positions[i].into(),
                                     uv: uvs[i].into(),
                                     color,
                                     flags: shader_flags::TEXTURED | shader_flags::CORNERS[i],
