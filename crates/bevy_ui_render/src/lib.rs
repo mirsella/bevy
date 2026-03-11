@@ -220,6 +220,7 @@ impl Plugin for UiRenderPlugin {
             .init_resource::<ImageNodeBindGroups>()
             .init_resource::<UiMeta>()
             .init_resource::<ExtractedUiNodes>()
+            .init_resource::<ViewportUiTextureImages>()
             .allow_ambiguous_resource::<ExtractedUiNodes>()
             .init_resource::<DrawFunctions<TransparentUi>>()
             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
@@ -406,6 +407,11 @@ pub struct ExtractedGlyph {
 pub struct ExtractedUiNodes {
     pub uinodes: Vec<ExtractedUiNode>,
     pub glyphs: Vec<ExtractedGlyph>,
+}
+
+#[derive(Resource, Default)]
+pub struct ViewportUiTextureImages {
+    pub images: HashSet<AssetId<Image>>,
 }
 
 impl ExtractedUiNodes {
@@ -847,6 +853,7 @@ pub fn extract_ui_camera_view(
 pub fn extract_viewport_nodes(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
+    mut viewport_ui_texture_images: ResMut<ViewportUiTextureImages>,
     camera_query: Extract<Query<&Camera>>,
     uinode_query: Extract<
         Query<(
@@ -862,6 +869,7 @@ pub fn extract_viewport_nodes(
     camera_map: Extract<UiCameraMap>,
 ) {
     let mut camera_mapper = camera_map.get_mapper();
+    viewport_ui_texture_images.images.clear();
     for (entity, uinode, transform, inherited_visibility, clip, camera, viewport_node) in
         &uinode_query
     {
@@ -881,6 +889,11 @@ pub fn extract_viewport_nodes(
         else {
             continue;
         };
+
+        // ViewportNode textures can arrive with alpha-weighted RGB on browser
+        // WebGPU. Tag them so the UI shader can un-premultiply only those
+        // sampled images.
+        viewport_ui_texture_images.images.insert(image.id());
 
         extracted_uinodes.uinodes.push(ExtractedUiNode {
             z_order: uinode.stack_index as f32 + stack_z_offsets::IMAGE,
@@ -1226,6 +1239,7 @@ pub mod shader_flags {
     pub const FILL_START: u32 = 32;
     pub const FILL_END: u32 = 64;
     pub const CONIC: u32 = 128;
+    pub const VIEWPORT_TEXTURE: u32 = 4096;
     pub const BORDER_LEFT: u32 = 256;
     pub const BORDER_TOP: u32 = 512;
     pub const BORDER_RIGHT: u32 = 1024;
@@ -1304,6 +1318,7 @@ pub fn prepare_uinodes(
     render_queue: Res<RenderQueue>,
     mut ui_meta: ResMut<UiMeta>,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
+    viewport_ui_texture_images: Res<ViewportUiTextureImages>,
     view_uniforms: Res<ViewUniforms>,
     ui_pipeline: Res<UiPipeline>,
     mut image_bind_groups: ResMut<ImageNodeBindGroups>,
@@ -1496,6 +1511,12 @@ pub fn prepare_uinodes(
                         let color = color.to_f32_array();
                         if let NodeType::Border(border_flags) = *node_type {
                             flags |= border_flags;
+                        }
+                        if viewport_ui_texture_images
+                            .images
+                            .contains(&extracted_uinode.image)
+                        {
+                            flags |= shader_flags::VIEWPORT_TEXTURE;
                         }
 
                         for i in 0..4 {

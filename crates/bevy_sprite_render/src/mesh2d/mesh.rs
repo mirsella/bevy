@@ -4,7 +4,7 @@ use bevy_camera::{visibility::ViewVisibility, Camera2d};
 use bevy_render::RenderStartup;
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal, ShaderSettings};
 
-use crate::{tonemapping_pipeline_key, Material2dBindGroupId};
+use crate::Material2dBindGroupId;
 use bevy_core_pipeline::{
     core_2d::{AlphaMask2d, Opaque2d},
     tonemapping::{
@@ -131,7 +131,7 @@ pub fn check_views_need_specialization(
     ticks: SystemChangeTick,
 ) {
     for (view_entity, view, msaa, _tonemapping, _dither) in &views {
-        let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
+        let view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_hdr(view.hdr);
 
         if !view_key_cache

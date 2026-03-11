@@ -5,6 +5,7 @@
 const TEXTURED = 1u;
 const RIGHT_VERTEX = 2u;
 const BOTTOM_VERTEX = 4u;
+const VIEWPORT_TEXTURE = 4096u;
 // must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
 const BORDER_LEFT: u32 = 256u;
 const BORDER_TOP: u32 = 512u;
@@ -221,7 +222,13 @@ fn draw_uinode_background(
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
+    var texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
+    if enabled(in.flags, VIEWPORT_TEXTURE) && texture_color.a > 0.0 {
+        // ViewportNode textures can behave like premultiplied-alpha inputs on
+        // browser WebGPU. Convert them back to straight alpha before the
+        // generic textured UI path multiplies them by the node tint.
+        texture_color = vec4(texture_color.rgb / texture_color.a, texture_color.a);
+    }
 
     // Only use the color sampled from the texture if the `TEXTURED` flag is enabled. 
     // This allows us to draw both textured and untextured shapes together in the same batch.
