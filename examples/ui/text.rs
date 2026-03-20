@@ -1,6 +1,6 @@
 //! This example illustrates how to create UI text and update it in a system.
 //!
-//! It displays the current FPS in the top left corner, as well as text that changes color
+//! It displays the current FPS in the top left corner, as well as text that fades in and out
 //! in the bottom right. For text within a scene, please see the text2d example.
 
 use bevy::{
@@ -38,7 +38,15 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             font_size: 67.0,
             ..default()
         },
-        TextShadow::default(),
+        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.55)),
+        TextShadow {
+            offset: Vec2::new(10.0, -10.0),
+            color: Color::srgba(0.0, 0.0, 0.0, 0.9),
+        },
+        TextOutline {
+            color: Color::WHITE,
+            width: 2.0,
+        },
         // Set the justification of the Text
         TextLayout::new_with_justify(Justify::Center),
         // Set the style of the Node itself.
@@ -63,6 +71,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                 ..default()
             },
         ))
+        .insert(TextOutline {
+            color: Color::BLACK,
+            width: 1.5,
+        })
         .with_child((
             TextSpan::default(),
             if cfg!(feature = "default_font") {
@@ -101,6 +113,26 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         },
     ));
 
+    commands.spawn((
+        Text::new("outline only"),
+        TextFont {
+            font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+            font_size: 42.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.95, 0.9, 0.25)),
+        TextOutline {
+            color: Color::BLACK,
+            width: 3.0,
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(15),
+            right: px(20),
+            ..default()
+        },
+    ));
+
     #[cfg(not(feature = "default_font"))]
     commands.spawn((
         Text::new("Default font disabled"),
@@ -121,12 +153,7 @@ fn text_color_system(time: Res<Time>, mut query: Query<&mut TextColor, With<Anim
     for mut text_color in &mut query {
         let seconds = time.elapsed_secs();
 
-        // Update the color of the ColorText span.
-        text_color.0 = Color::srgb(
-            ops::sin(1.25 * seconds) / 2.0 + 0.5,
-            ops::sin(0.75 * seconds) / 2.0 + 0.5,
-            ops::sin(0.50 * seconds) / 2.0 + 0.5,
-        );
+        text_color.0 = Color::WHITE.with_alpha(0.2 + 0.75 * (0.5 + 0.5 * ops::sin(0.85 * seconds)));
     }
 }
 

@@ -6,6 +6,9 @@ use wgpu_types::{TextureDimension, TextureFormat};
 
 use crate::{FontSmoothing, GlyphAtlasLocation, TextError};
 
+#[doc(hidden)]
+pub const TEXT_EFFECT_PADDING: u32 = 16;
+
 /// Rasterized glyphs are cached, stored in, and retrieved from, a `FontAtlas`.
 ///
 /// A `FontAtlas` contains one or more textures, each of which contains one or more glyphs packed into them.
@@ -41,7 +44,7 @@ impl FontAtlas {
             size.to_extents(),
             TextureDimension::D2,
             &[0, 0, 0, 0],
-            TextureFormat::Rgba8UnormSrgb,
+            TextureFormat::Rgba8Unorm,
             // Need to keep this image CPU persistent in order to add additional glyphs later on
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
         );
@@ -86,6 +89,7 @@ impl FontAtlas {
         cache_key: cosmic_text::CacheKey,
         texture: &Image,
         offset: IVec2,
+        text_effect_padding: bool,
     ) -> Result<(), TextError> {
         let atlas_layout = atlas_layouts.get_mut(&self.texture_atlas).unwrap();
         let atlas_texture = textures.get_mut(&self.texture).unwrap();
@@ -94,6 +98,15 @@ impl FontAtlas {
             self.dynamic_texture_atlas_builder
                 .add_texture(atlas_layout, texture, atlas_texture)
         {
+            if text_effect_padding {
+                let glyph_rect = atlas_layout
+                    .textures
+                    .get_mut(glyph_index)
+                    .expect("newly added glyph must have an atlas rect");
+                let padding = UVec2::splat(TEXT_EFFECT_PADDING);
+                glyph_rect.min += padding;
+                glyph_rect.max -= padding;
+            }
             self.glyph_to_atlas_index.insert(
                 cache_key,
                 GlyphAtlasLocation {

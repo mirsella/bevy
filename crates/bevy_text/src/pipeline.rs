@@ -229,6 +229,8 @@ impl TextPipeline {
         scale_factor: f64,
         layout: &TextLayout,
         bounds: TextBounds,
+        text_effect_padding: bool,
+        outline_width: Option<f32>,
         font_atlas_sets: &mut FontAtlasSets,
         texture_atlases: &mut Assets<TextureAtlasLayout>,
         textures: &mut Assets<Image>,
@@ -239,6 +241,8 @@ impl TextPipeline {
         layout_info.glyphs.clear();
         layout_info.section_rects.clear();
         layout_info.size = Default::default();
+        layout_info.uses_text_effect_padding = false;
+        layout_info.outline_atlas_width = None;
 
         // Clear this here at the focal point of text rendering to ensure the field's lifecycle has strong boundaries.
         computed.needs_rerender = false;
@@ -325,9 +329,15 @@ impl TextPipeline {
                     let font_atlas_set = font_atlas_sets.sets.entry(font_id).or_default();
 
                     let physical_glyph = layout_glyph.physical((0., 0.), 1.);
+                    let font_atlas_key = crate::FontAtlasKey::new(
+                        physical_glyph.cache_key.font_size_bits,
+                        font_smoothing,
+                        text_effect_padding,
+                        outline_width,
+                    );
 
                     let atlas_info = font_atlas_set
-                        .get_glyph_atlas_info(physical_glyph.cache_key, font_smoothing)
+                        .get_glyph_atlas_info(physical_glyph.cache_key, &font_atlas_key)
                         .map(Ok)
                         .unwrap_or_else(|| {
                             font_atlas_set.add_glyph_to_atlas(
@@ -337,6 +347,8 @@ impl TextPipeline {
                                 &mut swash_cache.0,
                                 layout_glyph,
                                 font_smoothing,
+                                text_effect_padding,
+                                outline_width,
                             )
                         })?;
 
@@ -383,6 +395,8 @@ impl TextPipeline {
         result?;
 
         layout_info.size = box_size;
+        layout_info.uses_text_effect_padding = text_effect_padding;
+        layout_info.outline_atlas_width = outline_width;
         Ok(())
     }
 
@@ -451,6 +465,10 @@ impl TextPipeline {
 pub struct TextLayoutInfo {
     /// The target scale factor for this text layout
     pub scale_factor: f32,
+    /// Whether the cached glyph rects include effect padding.
+    pub uses_text_effect_padding: bool,
+    /// Physical outline width used to build the cached atlas glyphs.
+    pub outline_atlas_width: Option<f32>,
     /// Scaled and positioned glyphs in screenspace
     pub glyphs: Vec<PositionedGlyph>,
     /// Rects bounding the text block's text sections.

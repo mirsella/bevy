@@ -1,5 +1,6 @@
 use crate::{
     ExtractedSlice, ExtractedSlices, ExtractedSprite, ExtractedSpriteKind, ExtractedSprites,
+    ExtractedTextEffect,
 };
 use bevy_asset::{AssetId, Assets};
 use bevy_camera::visibility::ViewVisibility;
@@ -9,14 +10,17 @@ use bevy_ecs::{
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::prelude::*;
-use bevy_math::Vec2;
+use bevy_math::{Rect, Vec2};
 use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
-use bevy_sprite::{Anchor, Text2dShadow};
+use bevy_sprite::{Anchor, Text2dOutline, Text2dShadow};
 use bevy_text::{
     ComputedTextBlock, PositionedGlyph, TextBackgroundColor, TextBounds, TextColor, TextLayoutInfo,
+    TEXT_EFFECT_PADDING,
 };
 use bevy_transform::prelude::GlobalTransform;
+
+const TEXT2D_BACKGROUND_Z_OFFSET: f32 = -0.0003;
 
 /// This system extracts the sprites from the 2D text components and adds them to the
 /// "render world".
@@ -34,15 +38,13 @@ pub fn extract_text2d_sprite(
             &TextBounds,
             &Anchor,
             Option<&Text2dShadow>,
+            Option<&Text2dOutline>,
             &GlobalTransform,
         )>,
     >,
     text_colors: Extract<Query<&TextColor>>,
     text_background_colors_query: Extract<Query<&TextBackgroundColor>>,
 ) {
-    let mut start = extracted_slices.slices.len();
-    let mut end = start + 1;
-
     for (
         main_entity,
         view_visibility,
@@ -51,12 +53,12 @@ pub fn extract_text2d_sprite(
         text_bounds,
         anchor,
         maybe_shadow,
+        maybe_outline,
         global_transform,
     ) in text2d_query.iter()
     {
-        let scaling = GlobalTransform::from_scale(
-            Vec2::splat(text_layout_info.scale_factor.recip()).extend(1.),
-        );
+        let inverse_scale_factor = text_layout_info.scale_factor.recip();
+        let scaling = GlobalTransform::from_scale(Vec2::splat(inverse_scale_factor).extend(1.));
         if !view_visibility.get() {
             continue;
         }
@@ -67,6 +69,9 @@ pub fn extract_text2d_sprite(
         );
 
         let top_left = (Anchor::TOP_LEFT.0 - anchor.as_vec()) * size;
+        let base_transform =
+            *global_transform * GlobalTransform::from_translation(top_left.extend(0.));
+        let text_transform = base_transform * scaling;
 
         for &(section_entity, rect) in text_layout_info.section_rects.iter() {
             let Ok(text_background_color) = text_background_colors_query.get(section_entity) else {
@@ -74,10 +79,8 @@ pub fn extract_text2d_sprite(
             };
             let render_entity = commands.spawn(TemporaryRenderEntity).id();
             let offset = Vec2::new(rect.center().x, -rect.center().y);
-            let transform = *global_transform
-                * GlobalTransform::from_translation(top_left.extend(0.))
-                * scaling
-                * GlobalTransform::from_translation(offset.extend(0.));
+            let transform = text_transform
+                * GlobalTransform::from_translation(offset.extend(TEXT2D_BACKGROUND_Z_OFFSET));
             extracted_sprites.sprites.push(ExtractedSprite {
                 main_entity,
                 render_entity,
@@ -86,6 +89,7 @@ pub fn extract_text2d_sprite(
                 image_handle_id: AssetId::default(),
                 flip_x: false,
                 flip_y: false,
+                text_effect: ExtractedTextEffect::default(),
                 kind: ExtractedSpriteKind::Single {
                     anchor: Vec2::ZERO,
                     rect: None,
@@ -95,61 +99,29 @@ pub fn extract_text2d_sprite(
             });
         }
 
-        if let Some(shadow) = maybe_shadow {
-            let shadow_transform = *global_transform
-                * GlobalTransform::from_translation((top_left + shadow.offset).extend(0.))
-                * scaling;
-            let color = shadow.color.into();
+        let shadow_effect = maybe_shadow.map(|shadow| {
+            (
+                LinearRgba::from(shadow.color),
+                clamp_text2d_shadow_offset(shadow.offset, text_layout_info.scale_factor),
+            )
+        });
+        let outline_effect = maybe_outline.and_then(|outline| {
+            let width = clamp_outline_width(outline.width * text_layout_info.scale_factor)?;
+            Some((LinearRgba::from(outline.color), width))
+        });
+        let glyph_text_effect = ExtractedTextEffect::text(
+            shadow_effect.map(|(color, offset)| (color, Vec2::new(offset.x, -offset.y))),
+            outline_effect.map(|(color, _)| color),
+        );
+        let glyph_padding = combined_text_effect_padding(
+            shadow_effect.map(|(_, offset)| offset),
+            outline_effect.map(|(_, width)| width),
+        );
 
-            for (
-                i,
-                PositionedGlyph {
-                    position,
-                    atlas_info,
-                    ..
-                },
-            ) in text_layout_info.glyphs.iter().enumerate()
-            {
-                let rect = texture_atlases
-                    .get(atlas_info.texture_atlas)
-                    .unwrap()
-                    .textures[atlas_info.location.glyph_index]
-                    .as_rect();
-                extracted_slices.slices.push(ExtractedSlice {
-                    offset: Vec2::new(position.x, -position.y),
-                    rect,
-                    size: rect.size(),
-                });
-
-                if text_layout_info
-                    .glyphs
-                    .get(i + 1)
-                    .is_none_or(|info| info.atlas_info.texture != atlas_info.texture)
-                {
-                    let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                    extracted_sprites.sprites.push(ExtractedSprite {
-                        main_entity,
-                        render_entity,
-                        transform: shadow_transform,
-                        color,
-                        image_handle_id: atlas_info.texture,
-                        flip_x: false,
-                        flip_y: false,
-                        kind: ExtractedSpriteKind::Slices {
-                            indices: start..end,
-                        },
-                    });
-                    start = end;
-                }
-
-                end += 1;
-            }
-        }
-
-        let transform =
-            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
+        let transform = text_transform;
         let mut color = LinearRgba::WHITE;
         let mut current_span = usize::MAX;
+        let mut start = extracted_slices.slices.len();
 
         for (
             i,
@@ -181,8 +153,10 @@ pub fn extract_text2d_sprite(
                 .as_rect();
             extracted_slices.slices.push(ExtractedSlice {
                 offset: Vec2::new(position.x, -position.y),
-                rect,
-                size: rect.size(),
+                rect: glyph_padding
+                    .map(|padding| expanded_effect_rect(rect, padding))
+                    .unwrap_or(rect),
+                size: rect.size() + glyph_padding.unwrap_or(Vec2::ZERO) * 2.0,
             });
 
             if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
@@ -197,14 +171,54 @@ pub fn extract_text2d_sprite(
                     image_handle_id: atlas_info.texture,
                     flip_x: false,
                     flip_y: false,
+                    text_effect: glyph_text_effect,
                     kind: ExtractedSpriteKind::Slices {
-                        indices: start..end,
+                        indices: start..extracted_slices.slices.len(),
                     },
                 });
-                start = end;
+                start = extracted_slices.slices.len();
             }
-
-            end += 1;
         }
+    }
+}
+
+fn expanded_effect_rect(fill_rect: Rect, padding: Vec2) -> Rect {
+    Rect::from_corners(fill_rect.min - padding, fill_rect.max + padding)
+}
+
+fn clamp_text2d_shadow_offset(offset: Vec2, scale_factor: f32) -> Vec2 {
+    let sampled_offset = offset * scale_factor;
+    let limit = TEXT_EFFECT_PADDING as f32;
+    if sampled_offset.x.abs() <= limit && sampled_offset.y.abs() <= limit {
+        return sampled_offset;
+    }
+
+    sampled_offset.clamp(Vec2::splat(-limit), Vec2::splat(limit))
+}
+
+fn clamp_outline_width(width: f32) -> Option<f32> {
+    if width <= 0.0 {
+        return None;
+    }
+
+    let limit = TEXT_EFFECT_PADDING as f32;
+    Some(width.min(limit))
+}
+
+fn combined_text_effect_padding(
+    shadow_offset: Option<Vec2>,
+    outline_width: Option<f32>,
+) -> Option<Vec2> {
+    let shadow_padding =
+        shadow_offset.map_or(Vec2::ZERO, |shadow_offset| shadow_offset.abs().ceil());
+    let outline_padding = outline_width.map_or(Vec2::ZERO, |outline_width| {
+        Vec2::splat(outline_width.ceil().max(1.0))
+    });
+    let padding = shadow_padding.max(outline_padding);
+
+    if padding == Vec2::ZERO {
+        None
+    } else {
+        Some(padding)
     }
 }

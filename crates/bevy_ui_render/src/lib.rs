@@ -23,8 +23,8 @@ use bevy_camera::{Camera, Camera2d, Camera3d};
 use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_shader::load_shader_library;
-use bevy_sprite_render::SpriteAssetEvents;
-use bevy_ui::widget::{ImageNode, TextShadow, ViewportNode};
+use bevy_sprite_render::{ExtractedTextEffect, ExtractedTextEffectFlags, SpriteAssetEvents};
+use bevy_ui::widget::{ImageNode, TextOutline, TextShadow, ViewportNode};
 use bevy_ui::{
     BackgroundColor, BorderColor, CalculatedClip, ComputedNode, ComputedUiTargetCamera, Display,
     Node, Outline, ResolvedBorderRadius, UiGlobalTransform,
@@ -38,7 +38,7 @@ use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
-use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2};
+use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2, Vec4};
 use bevy_render::{
     render_asset::RenderAssets,
     render_graph::{Node as RenderGraphNode, NodeRunError, RenderGraph, RenderGraphContext},
@@ -49,7 +49,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity, TemporaryRenderEntity},
-    texture::{CachedTexture, GpuImage, TextureCache},
+    texture::GpuImage,
     view::{ExtractedView, Hdr, RetainedViewEntity, ViewUniforms},
     Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -61,6 +61,7 @@ use gradient::GradientPlugin;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
     ComputedTextBlock, PositionedGlyph, TextBackgroundColor, TextColor, TextLayoutInfo,
+    TEXT_EFFECT_PADDING,
 };
 use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
@@ -119,7 +120,10 @@ pub mod stack_z_offsets {
     pub const BORDER_GRADIENT: f32 = 0.03;
     pub const IMAGE: f32 = 0.04;
     pub const MATERIAL: f32 = 0.05;
-    pub const TEXT: f32 = 0.06;
+    pub const TEXT_BACKGROUND: f32 = 0.059;
+    pub const TEXT_SHADOW: f32 = 0.06;
+    pub const TEXT_OUTLINE: f32 = 0.061;
+    pub const TEXT: f32 = 0.062;
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
@@ -132,7 +136,6 @@ pub enum RenderUiSystems {
     ExtractBorders,
     ExtractViewportNodes,
     ExtractTextBackgrounds,
-    ExtractTextShadows,
     ExtractText,
     ExtractDebug,
     ExtractGradient,
@@ -235,7 +238,6 @@ impl Plugin for UiRenderPlugin {
                     RenderUiSystems::ExtractTextureSlice,
                     RenderUiSystems::ExtractBorders,
                     RenderUiSystems::ExtractTextBackgrounds,
-                    RenderUiSystems::ExtractTextShadows,
                     RenderUiSystems::ExtractText,
                     RenderUiSystems::ExtractDebug,
                 )
@@ -251,7 +253,6 @@ impl Plugin for UiRenderPlugin {
                     extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
                     extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
                     extract_text_background_colors.in_set(RenderUiSystems::ExtractTextBackgrounds),
-                    extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
                     extract_text_sections.in_set(RenderUiSystems::ExtractText),
                     #[cfg(feature = "bevy_ui_debug")]
                     debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
@@ -401,6 +402,7 @@ pub struct ExtractedGlyph {
     pub color: LinearRgba,
     pub translation: Vec2,
     pub rect: Rect,
+    pub effect: ExtractedTextEffect,
 }
 
 #[derive(Resource, Default)]
@@ -935,6 +937,8 @@ pub fn extract_text_sections(
             &ComputedTextBlock,
             &TextColor,
             &TextLayoutInfo,
+            Option<&TextShadow>,
+            Option<&TextOutline>,
         )>,
     >,
     text_styles: Extract<Query<&TextColor>>,
@@ -954,6 +958,8 @@ pub fn extract_text_sections(
         computed_block,
         text_color,
         text_layout_info,
+        maybe_shadow,
+        maybe_outline,
     ) in &uinode_query
     {
         // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
@@ -966,6 +972,21 @@ pub fn extract_text_sections(
         };
 
         let transform = Affine2::from(*transform) * Affine2::from_translation(-0.5 * uinode.size());
+        let shadow = maybe_shadow.map(|shadow| {
+            (
+                shadow.color.into(),
+                clamp_ui_shadow_offset(shadow.offset, text_layout_info.scale_factor),
+            )
+        });
+        let outline = maybe_outline.and_then(|outline| {
+            clamp_ui_outline_width(outline.width * text_layout_info.scale_factor)
+                .map(|width| (outline.color.into(), width))
+        });
+        let glyph_effect = ExtractedTextEffect::text(shadow, outline.map(|(color, _)| color));
+        let glyph_padding = combined_text_effect_padding(
+            shadow.map(|(_, offset)| offset),
+            outline.map(|(_, width)| width),
+        );
 
         let mut color = text_color.0.to_linear();
 
@@ -1000,7 +1021,10 @@ pub fn extract_text_sections(
             extracted_uinodes.glyphs.push(ExtractedGlyph {
                 color,
                 translation: *position,
-                rect,
+                rect: glyph_padding
+                    .map(|padding| expanded_effect_rect(rect, padding))
+                    .unwrap_or(rect),
+                effect: glyph_effect,
             });
 
             if text_layout_info
@@ -1026,84 +1050,44 @@ pub fn extract_text_sections(
     }
 }
 
-pub fn extract_text_shadows(
-    mut commands: Commands,
-    mut extracted_uinodes: ResMut<ExtractedUiNodes>,
-    texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
-    uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &UiGlobalTransform,
-            &ComputedUiTargetCamera,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &TextLayoutInfo,
-            &TextShadow,
-        )>,
-    >,
-    camera_map: Extract<UiCameraMap>,
-) {
-    let mut start = extracted_uinodes.glyphs.len();
-    let mut end = start + 1;
+fn expanded_effect_rect(fill_rect: Rect, padding: Vec2) -> Rect {
+    Rect::from_corners(fill_rect.min - padding, fill_rect.max + padding)
+}
 
-    let mut camera_mapper = camera_map.get_mapper();
-    for (entity, uinode, transform, target, inherited_visibility, clip, text_layout_info, shadow) in
-        &uinode_query
-    {
-        // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
-        if !inherited_visibility.get() || uinode.is_empty() {
-            continue;
-        }
+fn clamp_ui_shadow_offset(offset: Vec2, scale_factor: f32) -> Vec2 {
+    let sampled_offset = offset * scale_factor;
+    let limit = TEXT_EFFECT_PADDING as f32;
+    if sampled_offset.x.abs() <= limit && sampled_offset.y.abs() <= limit {
+        return sampled_offset;
+    }
 
-        let Some(extracted_camera_entity) = camera_mapper.map(target) else {
-            continue;
-        };
+    sampled_offset.clamp(Vec2::splat(-limit), Vec2::splat(limit))
+}
 
-        let node_transform = Affine2::from(*transform)
-            * Affine2::from_translation(
-                -0.5 * uinode.size() + shadow.offset / uinode.inverse_scale_factor(),
-            );
+fn clamp_ui_outline_width(width: f32) -> Option<f32> {
+    if width <= 0.0 {
+        return None;
+    }
 
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                span_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            let rect = texture_atlases
-                .get(atlas_info.texture_atlas)
-                .unwrap()
-                .textures[atlas_info.location.glyph_index]
-                .as_rect();
-            extracted_uinodes.glyphs.push(ExtractedGlyph {
-                color: shadow.color.into(),
-                translation: *position,
-                rect,
-            });
+    let limit = TEXT_EFFECT_PADDING as f32;
+    Some(width.min(limit))
+}
 
-            if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
-                info.span_index != *span_index || info.atlas_info.texture != atlas_info.texture
-            }) {
-                extracted_uinodes.uinodes.push(ExtractedUiNode {
-                    transform: node_transform,
-                    z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
-                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    image: atlas_info.texture,
-                    clip: clip.map(|clip| clip.clip),
-                    extracted_camera_entity,
-                    item: ExtractedUiItem::Glyphs { range: start..end },
-                    main_entity: entity.into(),
-                });
-                start = end;
-            }
+fn combined_text_effect_padding(
+    shadow_offset: Option<Vec2>,
+    outline_width: Option<f32>,
+) -> Option<Vec2> {
+    let shadow_padding =
+        shadow_offset.map_or(Vec2::ZERO, |shadow_offset| shadow_offset.abs().ceil());
+    let outline_padding = outline_width.map_or(Vec2::ZERO, |outline_width| {
+        Vec2::splat(outline_width.ceil().max(1.0))
+    });
+    let padding = shadow_padding.max(outline_padding);
 
-            end += 1;
-        }
+    if padding == Vec2::ZERO {
+        None
+    } else {
+        Some(padding)
     }
 }
 
@@ -1146,7 +1130,7 @@ pub fn extract_text_background_colors(
             };
 
             extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT,
+                z_order: uinode.stack_index as f32 + stack_z_offsets::TEXT_BACKGROUND,
                 render_entity: commands.spawn(TemporaryRenderEntity).id(),
                 clip: clip.map(|clip| clip.clip),
                 image: AssetId::default(),
@@ -1193,6 +1177,9 @@ struct UiVertex {
     pub size: [f32; 2],
     /// Position relative to the center of the UI node.
     pub point: [f32; 2],
+    pub shadow_color: [f32; 4],
+    pub outline_color: [f32; 4],
+    pub effect_params: [f32; 4],
 }
 
 #[derive(Resource)]
@@ -1240,6 +1227,9 @@ pub mod shader_flags {
     pub const FILL_END: u32 = 64;
     pub const CONIC: u32 = 128;
     pub const VIEWPORT_TEXTURE: u32 = 4096;
+    pub const TEXT_GLYPH: u32 = 8192;
+    pub const TEXT_EFFECT_SHADOW: u32 = 16384;
+    pub const TEXT_EFFECT_OUTLINE: u32 = 32768;
     pub const BORDER_LEFT: u32 = 256;
     pub const BORDER_TOP: u32 = 512;
     pub const BORDER_RIGHT: u32 = 1024;
@@ -1529,6 +1519,9 @@ pub fn prepare_uinodes(
                                 border: [border.left, border.top, border.right, border.bottom],
                                 size: rect_size.into(),
                                 point: points[i].into(),
+                                shadow_color: [0.0; 4],
+                                outline_color: [0.0; 4],
+                                effect_params: [0.0; 4],
                             });
                         }
 
@@ -1548,8 +1541,38 @@ pub fn prepare_uinodes(
 
                         for glyph in &extracted_uinodes.glyphs[range.clone()] {
                             let color = glyph.color.to_f32_array();
+                            if !glyph.effect.flags.contains(ExtractedTextEffectFlags::TEXT) {
+                                continue;
+                            }
+
+                            let shadow_color = glyph.effect.shadow_color.to_f32_array();
+                            let outline_color = glyph.effect.outline_color.to_f32_array();
                             let glyph_rect = glyph.rect;
                             let rect_size = glyph_rect.size();
+
+                            let mut effect_params = Vec4::new(
+                                glyph.effect.shadow_offset.x,
+                                glyph.effect.shadow_offset.y,
+                                0.0,
+                                0.0,
+                            );
+                            effect_params.x /= atlas_extent.x;
+                            effect_params.y /= atlas_extent.y;
+                            let mut effect_flags = shader_flags::TEXT_GLYPH;
+                            if glyph
+                                .effect
+                                .flags
+                                .contains(ExtractedTextEffectFlags::SHADOW)
+                            {
+                                effect_flags |= shader_flags::TEXT_EFFECT_SHADOW;
+                            }
+                            if glyph
+                                .effect
+                                .flags
+                                .contains(ExtractedTextEffectFlags::OUTLINE)
+                            {
+                                effect_flags |= shader_flags::TEXT_EFFECT_OUTLINE;
+                            }
 
                             // Specify the corners of the glyph
                             let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
@@ -1559,43 +1582,83 @@ pub fn prepare_uinodes(
                                     .extend(0.)
                             });
 
-                            // Cull glyphs that are completely outside the clip.
-                            if let Some(clip) = extracted_uinode.clip {
-                                let mut aabb_min = positions[0].truncate();
-                                let mut aabb_max = aabb_min;
-                                for position in &positions[1..] {
-                                    let position = position.truncate();
-                                    aabb_min = aabb_min.min(position);
-                                    aabb_max = aabb_max.max(position);
-                                }
+                            let positions_diff = if let Some(clip) = extracted_uinode.clip {
+                                [
+                                    Vec2::new(
+                                        f32::max(clip.min.x - positions[0].x, 0.),
+                                        f32::max(clip.min.y - positions[0].y, 0.),
+                                    ),
+                                    Vec2::new(
+                                        f32::min(clip.max.x - positions[1].x, 0.),
+                                        f32::max(clip.min.y - positions[1].y, 0.),
+                                    ),
+                                    Vec2::new(
+                                        f32::min(clip.max.x - positions[2].x, 0.),
+                                        f32::min(clip.max.y - positions[2].y, 0.),
+                                    ),
+                                    Vec2::new(
+                                        f32::max(clip.min.x - positions[3].x, 0.),
+                                        f32::min(clip.max.y - positions[3].y, 0.),
+                                    ),
+                                ]
+                            } else {
+                                [Vec2::ZERO; 4]
+                            };
 
-                                if aabb_max.x <= clip.min.x
-                                    || clip.max.x <= aabb_min.x
-                                    || aabb_max.y <= clip.min.y
-                                    || clip.max.y <= aabb_min.y
-                                {
-                                    continue;
-                                }
+                            let positions_clipped = [
+                                positions[0] + positions_diff[0].extend(0.),
+                                positions[1] + positions_diff[1].extend(0.),
+                                positions[2] + positions_diff[2].extend(0.),
+                                positions[3] + positions_diff[3].extend(0.),
+                            ];
+
+                            let transformed_rect_size = extracted_uinode
+                                .transform
+                                .transform_vector2(rect_size)
+                                .abs();
+                            if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
+                                || positions_diff[1].y - positions_diff[2].y
+                                    >= transformed_rect_size.y
+                            {
+                                continue;
                             }
 
                             let uvs = [
-                                Vec2::new(glyph.rect.min.x, glyph.rect.min.y),
-                                Vec2::new(glyph.rect.max.x, glyph.rect.min.y),
-                                Vec2::new(glyph.rect.max.x, glyph.rect.max.y),
-                                Vec2::new(glyph.rect.min.x, glyph.rect.max.y),
+                                Vec2::new(
+                                    glyph.rect.min.x + positions_diff[0].x,
+                                    glyph.rect.min.y + positions_diff[0].y,
+                                ),
+                                Vec2::new(
+                                    glyph.rect.max.x + positions_diff[1].x,
+                                    glyph.rect.min.y + positions_diff[1].y,
+                                ),
+                                Vec2::new(
+                                    glyph.rect.max.x + positions_diff[2].x,
+                                    glyph.rect.max.y + positions_diff[2].y,
+                                ),
+                                Vec2::new(
+                                    glyph.rect.min.x + positions_diff[3].x,
+                                    glyph.rect.max.y + positions_diff[3].y,
+                                ),
                             ]
                             .map(|pos| pos / atlas_extent);
 
                             for i in 0..4 {
                                 ui_meta.vertices.push(UiVertex {
-                                    position: positions[i].into(),
+                                    position: positions_clipped[i].into(),
                                     uv: uvs[i].into(),
                                     color,
-                                    flags: shader_flags::TEXTURED | shader_flags::CORNERS[i],
+                                    flags: shader_flags::TEXTURED
+                                        | shader_flags::CORNERS[i]
+                                        | shader_flags::TEXT_GLYPH
+                                        | effect_flags,
                                     radius: [0.0; 4],
                                     border: [0.0; 4],
                                     size: rect_size.into(),
                                     point: [0.0; 2],
+                                    shadow_color,
+                                    outline_color,
+                                    effect_params: effect_params.to_array(),
                                 });
                             }
 

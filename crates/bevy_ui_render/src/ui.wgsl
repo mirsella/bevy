@@ -6,6 +6,9 @@ const TEXTURED = 1u;
 const RIGHT_VERTEX = 2u;
 const BOTTOM_VERTEX = 4u;
 const VIEWPORT_TEXTURE = 4096u;
+const TEXT_GLYPH = 8192u;
+const TEXT_EFFECT_SHADOW = 16384u;
+const TEXT_EFFECT_OUTLINE = 32768u;
 // must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
 const BORDER_LEFT: u32 = 256u;
 const BORDER_TOP: u32 = 512u;
@@ -25,11 +28,14 @@ struct VertexOutput {
 
     @location(2) @interpolate(flat) size: vec2<f32>,
     @location(3) @interpolate(flat) flags: u32,
-    @location(4) @interpolate(flat) radius: vec4<f32>,    
-    @location(5) @interpolate(flat) border: vec4<f32>,    
+    @location(4) @interpolate(flat) radius: vec4<f32>,
+    @location(5) @interpolate(flat) border: vec4<f32>,
 
     // Position relative to the center of the rectangle.
     @location(6) point: vec2<f32>,
+    @location(7) @interpolate(flat) shadow_color: vec4<f32>,
+    @location(8) @interpolate(flat) outline_color: vec4<f32>,
+    @location(9) @interpolate(flat) effect_params: vec4<f32>,
     @builtin(position) position: vec4<f32>,
 };
 
@@ -47,6 +53,9 @@ fn vertex(
     @location(5) border: vec4<f32>,
     @location(6) size: vec2<f32>,
     @location(7) point: vec2<f32>,
+    @location(8) shadow_color: vec4<f32>,
+    @location(9) outline_color: vec4<f32>,
+    @location(10) effect_params: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     out.uv = vertex_uv;
@@ -57,6 +66,9 @@ fn vertex(
     out.size = size;
     out.border = border;
     out.point = point;
+    out.shadow_color = shadow_color;
+    out.outline_color = outline_color;
+    out.effect_params = effect_params;
 
     return out;
 }
@@ -149,6 +161,33 @@ fn antialias(distance: f32) -> f32 {
     return saturate(0.5 - distance);
 }
 
+fn composite_text_layers(
+    fill_color: vec4<f32>,
+    outline_color: vec4<f32>,
+    shadow_color: vec4<f32>,
+    fill_cov: f32,
+    outline_cov: f32,
+    shadow_cov: f32,
+) -> vec4<f32> {
+    let fill_alpha = fill_color.a * fill_cov;
+    let outline_alpha = outline_color.a * outline_cov;
+    let shadow_alpha = shadow_color.a * shadow_cov;
+    let outline_weight = outline_alpha * (1.0 - fill_alpha);
+    let shadow_weight = shadow_alpha * (1.0 - fill_alpha) * (1.0 - outline_alpha);
+    let alpha = fill_alpha + outline_weight + shadow_weight;
+
+    if alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+
+    let rgb = (
+        fill_color.rgb * fill_alpha
+        + outline_color.rgb * outline_weight
+        + shadow_color.rgb * shadow_weight
+    ) / alpha;
+    return vec4<f32>(rgb, alpha);
+}
+
 fn draw_uinode_border(
     color: vec4<f32>,
     point: vec2<f32>,
@@ -222,17 +261,38 @@ fn draw_uinode_background(
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    var texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
-    if enabled(in.flags, VIEWPORT_TEXTURE) && texture_color.a > 0.0 {
-        // ViewportNode textures can behave like premultiplied-alpha inputs on
-        // browser WebGPU. Convert them back to straight alpha before the
-        // generic textured UI path multiplies them by the node tint.
-        texture_color = vec4(texture_color.rgb / texture_color.a, texture_color.a);
-    }
+    var color = in.color;
+    let base_sample = textureSample(sprite_texture, sprite_sampler, in.uv);
 
-    // Only use the color sampled from the texture if the `TEXTURED` flag is enabled. 
-    // This allows us to draw both textured and untextured shapes together in the same batch.
-    let color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
+    if enabled(in.flags, TEXT_GLYPH) {
+        let fill_cov = base_sample.a;
+        let outline_cov = select(0.0, base_sample.r, enabled(in.flags, TEXT_EFFECT_OUTLINE));
+        var shadow_cov = 0.0;
+        if enabled(in.flags, TEXT_EFFECT_SHADOW) {
+            let shadow_uv = in.uv - in.effect_params.xy;
+            shadow_cov = textureSampleLevel(sprite_texture, sprite_sampler, shadow_uv, 0.0).a
+                * (1.0 - max(fill_cov, outline_cov));
+        }
+
+        color = composite_text_layers(
+            in.color,
+            in.outline_color,
+            in.shadow_color,
+            fill_cov,
+            outline_cov,
+            shadow_cov,
+        );
+    } else if enabled(in.flags, TEXTURED) {
+        var sampled_color = base_sample;
+        if enabled(in.flags, VIEWPORT_TEXTURE) && sampled_color.a > 0.0 {
+            // ViewportNode textures can behave like premultiplied-alpha inputs on
+            // browser WebGPU. Convert them back to straight alpha before the
+            // generic textured UI path multiplies them by the node tint.
+            sampled_color = vec4(sampled_color.rgb / sampled_color.a, sampled_color.a);
+        }
+
+        color = in.color * sampled_color;
+    }
 
     if enabled(in.flags, BORDER_ANY) {
         return draw_uinode_border(color, in.point, in.size, in.radius, in.border, in.flags);

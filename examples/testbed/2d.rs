@@ -141,7 +141,7 @@ mod bloom {
 mod text {
     use bevy::color::palettes;
     use bevy::prelude::*;
-    use bevy::sprite::Anchor;
+    use bevy::sprite::{Anchor, Text2dOutline, Text2dShadow};
     use bevy::text::TextBounds;
 
     pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -186,6 +186,42 @@ mod text {
         commands.spawn((
             Text2d::new("This text is invisible."),
             Visibility::Hidden,
+            DespawnOnExit(super::Scene::Text),
+        ));
+
+        commands.spawn((
+            Text2d::new("outside-only shadow + outline"),
+            TextFont {
+                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                font_size: 48.0,
+                ..default()
+            },
+            Transform::from_xyz(0.0, -260.0, 1.0),
+            TextColor(Color::srgba(1.0, 1.0, 1.0, 0.55)),
+            Text2dShadow {
+                offset: Vec2::new(12.0, -12.0),
+                color: Color::BLACK.with_alpha(0.9),
+            },
+            Text2dOutline {
+                color: Color::WHITE,
+                width: 2.5,
+            },
+            DespawnOnExit(super::Scene::Text),
+        ));
+
+        commands.spawn((
+            Text2d::new("outline only"),
+            TextFont {
+                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                font_size: 40.0,
+                ..default()
+            },
+            Transform::from_xyz(0.0, -320.0, 1.0),
+            TextColor(Color::srgb(0.95, 0.85, 0.2)),
+            Text2dOutline {
+                color: Color::BLACK,
+                width: 3.0,
+            },
             DespawnOnExit(super::Scene::Text),
         ));
     }

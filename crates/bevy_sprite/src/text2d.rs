@@ -13,7 +13,7 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     prelude::ReflectComponent,
-    query::{Changed, Without},
+    query::{Changed, Has, Without},
     system::{Commands, Local, Query, Res, ResMut},
 };
 use bevy_image::prelude::*;
@@ -22,7 +22,7 @@ use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_text::{
     ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSets, LineBreak, SwashCache, TextBounds,
     TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline, TextReader, TextRoot,
-    TextSpanAccess, TextWriter,
+    TextSpanAccess, TextWriter, TEXT_EFFECT_PADDING,
 };
 use bevy_transform::components::Transform;
 use core::any::TypeId;
@@ -150,6 +150,27 @@ impl Default for Text2dShadow {
     }
 }
 
+/// Adds an outline around `Text2d` text.
+///
+/// Use `TextOutline` for text drawn with `bevy_ui`.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct Text2dOutline {
+    /// Outline color.
+    pub color: Color,
+    /// Outline width in logical pixels.
+    pub width: f32,
+}
+
+impl Default for Text2dOutline {
+    fn default() -> Self {
+        Self {
+            color: Color::BLACK,
+            width: 1.,
+        }
+    }
+}
+
 /// Updates the layout and size information whenever the text or style is changed.
 /// This information is computed by the [`TextPipeline`] on insertion, then stored.
 ///
@@ -174,6 +195,8 @@ pub fn update_text2d_layout(
         Ref<TextBounds>,
         &mut TextLayoutInfo,
         &mut ComputedTextBlock,
+        Has<Text2dShadow>,
+        Option<Ref<Text2dOutline>>,
     )>,
     mut text_reader: Text2dReader,
     mut font_system: ResMut<CosmicFontSystem>,
@@ -196,8 +219,16 @@ pub fn update_text2d_layout(
     let mut previous_scale_factor = 0.;
     let mut previous_mask = &RenderLayers::none();
 
-    for (entity, maybe_entity_mask, block, bounds, text_layout_info, mut computed) in
-        &mut text_query
+    for (
+        entity,
+        maybe_entity_mask,
+        block,
+        bounds,
+        text_layout_info,
+        mut computed,
+        has_shadow,
+        maybe_outline,
+    ) in &mut text_query
     {
         let entity_mask = maybe_entity_mask.unwrap_or_default();
 
@@ -218,9 +249,17 @@ pub fn update_text2d_layout(
             *scale_factor
         };
 
+        let outline_width = maybe_outline.and_then(|outline| {
+            (outline.width > 0.0)
+                .then_some((outline.width * scale_factor).min(TEXT_EFFECT_PADDING as f32))
+        });
+        let text_effect_padding = has_shadow || outline_width.is_some();
+
         if scale_factor != text_layout_info.scale_factor
             || computed.needs_rerender()
             || bounds.is_changed()
+            || text_layout_info.uses_text_effect_padding != text_effect_padding
+            || text_layout_info.outline_atlas_width != outline_width
             || (!queue.is_empty() && queue.remove(&entity))
         {
             let text_bounds = TextBounds {
@@ -240,6 +279,8 @@ pub fn update_text2d_layout(
                 scale_factor as f64,
                 &block,
                 text_bounds,
+                text_effect_padding,
+                outline_width,
                 &mut font_atlas_sets,
                 &mut texture_atlases,
                 &mut textures,
@@ -257,6 +298,8 @@ pub fn update_text2d_layout(
                 }
                 Ok(()) => {
                     text_layout_info.scale_factor = scale_factor;
+                    text_layout_info.uses_text_effect_padding = text_effect_padding;
+                    text_layout_info.outline_atlas_width = outline_width;
                     text_layout_info.size *= scale_factor.recip();
                 }
             }

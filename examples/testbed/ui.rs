@@ -100,6 +100,15 @@ mod text {
                 font_size: 200.,
                 ..default()
             },
+            TextColor(Color::srgba(1.0, 1.0, 1.0, 0.55)),
+            TextShadow {
+                offset: Vec2::new(14.0, 14.0),
+                color: Color::BLACK.with_alpha(0.9),
+            },
+            TextOutline {
+                color: Color::WHITE,
+                width: 3.0,
+            },
             DespawnOnExit(super::Scene::Text),
         ));
 
@@ -113,6 +122,10 @@ mod text {
             TextFont {
                 font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                 ..default()
+            },
+            TextOutline {
+                color: Color::BLACK,
+                width: 2.0,
             },
             DespawnOnExit(super::Scene::Text),
             children![
@@ -141,6 +154,10 @@ mod text {
             TextFont {
                 font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                 ..default()
+            },
+            TextShadow {
+                offset: Vec2::new(10.0, 10.0),
+                color: Color::BLACK.with_alpha(0.85),
             },
             DespawnOnExit(super::Scene::Text),
             children![
@@ -176,6 +193,10 @@ mod text {
             TextFont {
                 font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                 ..default()
+            },
+            TextOutline {
+                color: Color::WHITE,
+                width: 2.0,
             },
             DespawnOnExit(super::Scene::Text),
             children![

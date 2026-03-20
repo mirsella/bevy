@@ -9,7 +9,7 @@ use bevy_ecs::{
     change_detection::DetectChanges,
     component::Component,
     entity::Entity,
-    query::With,
+    query::{Has, With},
     reflect::ReflectComponent,
     system::{Query, Res, ResMut},
     world::{Mut, Ref},
@@ -20,7 +20,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_text::{
     ComputedTextBlock, CosmicFontSystem, Font, FontAtlasSets, LineBreak, SwashCache, TextBounds,
     TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo, TextPipeline,
-    TextReader, TextRoot, TextSpanAccess, TextWriter,
+    TextReader, TextRoot, TextSpanAccess, TextWriter, TEXT_EFFECT_PADDING,
 };
 use taffy::style::AvailableSpace;
 use tracing::error;
@@ -146,6 +146,27 @@ impl Default for TextShadow {
         Self {
             offset: Vec2::splat(4.),
             color: Color::linear_rgba(0., 0., 0., 0.75),
+        }
+    }
+}
+
+/// Adds an outline around text.
+///
+/// Use the `Text2dOutline` component for `Text2d` outlines.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct TextOutline {
+    /// Outline color.
+    pub color: Color,
+    /// Outline width in logical pixels.
+    pub width: f32,
+}
+
+impl Default for TextOutline {
+    fn default() -> Self {
+        Self {
+            color: Color::BLACK,
+            width: 1.,
         }
     }
 }
@@ -325,6 +346,8 @@ fn queue_text(
     inverse_scale_factor: f32,
     block: &TextLayout,
     node: Ref<ComputedNode>,
+    has_shadow: bool,
+    outline_width: Option<f32>,
     mut text_flags: Mut<TextNodeFlags>,
     text_layout_info: Mut<TextLayoutInfo>,
     computed: &mut ComputedTextBlock,
@@ -345,6 +368,8 @@ fn queue_text(
         TextBounds::new(node.unrounded_size.x, node.unrounded_size.y)
     };
 
+    let text_effect_padding = has_shadow || outline_width.is_some();
+
     let text_layout_info = text_layout_info.into_inner();
     match text_pipeline.queue_text(
         text_layout_info,
@@ -353,6 +378,8 @@ fn queue_text(
         scale_factor.into(),
         block,
         physical_node_size,
+        text_effect_padding,
+        outline_width,
         font_atlas_sets,
         texture_atlases,
         textures,
@@ -369,6 +396,8 @@ fn queue_text(
         }
         Ok(()) => {
             text_layout_info.scale_factor = scale_factor;
+            text_layout_info.uses_text_effect_padding = text_effect_padding;
+            text_layout_info.outline_atlas_width = outline_width;
             text_layout_info.size *= inverse_scale_factor;
             text_flags.needs_recompute = false;
         }
@@ -396,13 +425,36 @@ pub fn text_system(
         &mut TextLayoutInfo,
         &mut TextNodeFlags,
         &mut ComputedTextBlock,
+        Has<TextShadow>,
+        Option<Ref<TextOutline>>,
     )>,
     mut text_reader: TextUiReader,
     mut font_system: ResMut<CosmicFontSystem>,
     mut swash_cache: ResMut<SwashCache>,
 ) {
-    for (entity, node, block, text_layout_info, text_flags, mut computed) in &mut text_query {
-        if node.is_changed() || text_flags.needs_recompute {
+    for (
+        entity,
+        node,
+        block,
+        text_layout_info,
+        text_flags,
+        mut computed,
+        has_shadow,
+        maybe_outline,
+    ) in &mut text_query
+    {
+        let node_scale_factor = node.inverse_scale_factor.recip();
+        let outline_width = maybe_outline.and_then(|outline| {
+            (outline.width > 0.0)
+                .then_some((outline.width * node_scale_factor).min(TEXT_EFFECT_PADDING as f32))
+        });
+        let text_effect_padding = has_shadow || outline_width.is_some();
+
+        if node.is_changed()
+            || text_flags.needs_recompute
+            || text_layout_info.uses_text_effect_padding != text_effect_padding
+            || text_layout_info.outline_atlas_width != outline_width
+        {
             queue_text(
                 entity,
                 &fonts,
@@ -410,10 +462,12 @@ pub fn text_system(
                 &mut font_atlas_sets,
                 &mut texture_atlases,
                 &mut textures,
-                node.inverse_scale_factor.recip(),
+                node_scale_factor,
                 node.inverse_scale_factor,
                 block,
                 node,
+                has_shadow,
+                outline_width,
                 text_flags,
                 text_layout_info,
                 computed.as_mut(),
