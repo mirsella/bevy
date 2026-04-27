@@ -367,13 +367,17 @@ pub fn allocate_and_free_meshes(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    // Process removed or modified meshes.
-    mesh_allocator.free_meshes(&extracted_meshes);
+    let reusable_modified_meshes =
+        mesh_allocator.reusable_modified_meshes(&extracted_meshes, &mut mesh_vertex_buffer_layouts);
+
+    // Process removed meshes and modified meshes that cannot reuse their existing allocation.
+    mesh_allocator.free_meshes(&extracted_meshes, &reusable_modified_meshes);
 
     // Process newly-added or modified meshes.
     mesh_allocator.allocate_meshes(
         &mesh_allocator_settings,
         &extracted_meshes,
+        &reusable_modified_meshes,
         &mut mesh_vertex_buffer_layouts,
         &render_device,
         &render_queue,
@@ -445,6 +449,7 @@ impl MeshAllocator {
         &mut self,
         mesh_allocator_settings: &MeshAllocatorSettings,
         extracted_meshes: &ExtractedAssets<RenderMesh>,
+        reusable_modified_meshes: &HashSet<AssetId<Mesh>>,
         mesh_vertex_buffer_layouts: &mut MeshVertexBufferLayouts,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
@@ -453,6 +458,10 @@ impl MeshAllocator {
 
         // Allocate.
         for (mesh_id, mesh) in &extracted_meshes.extracted {
+            if reusable_modified_meshes.contains(mesh_id) {
+                continue;
+            }
+
             let vertex_buffer_size = mesh.get_vertex_buffer_size() as u64;
             if vertex_buffer_size == 0 {
                 continue;
@@ -568,10 +577,14 @@ impl MeshAllocator {
 
         match *slab {
             Slab::General(ref mut general_slab) => {
-                let (Some(buffer), Some(allocated_range)) = (
-                    &general_slab.buffer,
-                    general_slab.pending_allocations.remove(mesh_id),
-                ) else {
+                let Some(buffer) = &general_slab.buffer else {
+                    return;
+                };
+                let Some(allocated_range) = general_slab
+                    .pending_allocations
+                    .remove(mesh_id)
+                    .or_else(|| general_slab.resident_allocations.get(mesh_id).cloned())
+                else {
                     return;
                 };
 
@@ -620,23 +633,117 @@ impl MeshAllocator {
         }
     }
 
+    /// Finds modified meshes whose existing allocation can be reused for this frame's data.
+    fn reusable_modified_meshes(
+        &self,
+        extracted_meshes: &ExtractedAssets<RenderMesh>,
+        mesh_vertex_buffer_layouts: &mut MeshVertexBufferLayouts,
+    ) -> HashSet<AssetId<Mesh>> {
+        extracted_meshes
+            .extracted
+            .iter()
+            .filter(|(mesh_id, mesh)| {
+                extracted_meshes.modified.contains(mesh_id)
+                    && self.can_reuse_mesh_allocation(mesh_id, mesh, mesh_vertex_buffer_layouts)
+            })
+            .map(|(mesh_id, _)| *mesh_id)
+            .collect()
+    }
+
+    /// Returns true if all allocations needed by a modified mesh can be reused in-place.
+    fn can_reuse_mesh_allocation(
+        &self,
+        mesh_id: &AssetId<Mesh>,
+        mesh: &Mesh,
+        mesh_vertex_buffer_layouts: &mut MeshVertexBufferLayouts,
+    ) -> bool {
+        let vertex_buffer_size = mesh.get_vertex_buffer_size() as u64;
+        if vertex_buffer_size == 0 {
+            return false;
+        }
+
+        let new_index = mesh
+            .get_index_buffer_bytes()
+            .zip(ElementLayout::index(mesh));
+        let indexed = new_index.is_some();
+
+        let Some(&vertex_slab_id) = self.mesh_id_to_vertex_slab.get(mesh_id) else {
+            return false;
+        };
+        let vertex_element_layout = ElementLayout::vertex(mesh_vertex_buffer_layouts, mesh);
+        if !self.can_reuse_allocation_in_slab(
+            mesh_id,
+            vertex_slab_id,
+            vertex_buffer_size,
+            vertex_element_layout,
+            indexed,
+        ) {
+            return false;
+        }
+
+        match (new_index, self.mesh_id_to_index_slab.get(mesh_id).copied()) {
+            (None, None) => true,
+            (Some((index_buffer_data, index_element_layout)), Some(index_slab_id)) => self
+                .can_reuse_allocation_in_slab(
+                    mesh_id,
+                    index_slab_id,
+                    index_buffer_data.len() as u64,
+                    index_element_layout,
+                    true,
+                ),
+            _ => false,
+        }
+    }
+
+    /// Returns true if a mesh's existing allocation can hold new data with the given layout.
+    fn can_reuse_allocation_in_slab(
+        &self,
+        mesh_id: &AssetId<Mesh>,
+        slab_id: SlabId,
+        data_byte_len: u64,
+        layout: ElementLayout,
+        allow_larger_allocation: bool,
+    ) -> bool {
+        let Some(slab) = self.slabs.get(&slab_id) else {
+            return false;
+        };
+
+        let Slab::General(general_slab) = slab else {
+            return false;
+        };
+        if general_slab.element_layout != layout {
+            return false;
+        }
+
+        let data_slot_count = layout.slots_for_bytes(data_byte_len);
+
+        let Some(slab_allocation) = general_slab
+            .resident_allocations
+            .get(mesh_id)
+            .or_else(|| general_slab.pending_allocations.get(mesh_id))
+        else {
+            return false;
+        };
+
+        slab_allocation.slot_count == data_slot_count
+            || allow_larger_allocation && slab_allocation.slot_count > data_slot_count
+    }
+
     /// Frees allocations for meshes that were removed or modified this frame.
-    fn free_meshes(&mut self, extracted_meshes: &ExtractedAssets<RenderMesh>) {
+    fn free_meshes(
+        &mut self,
+        extracted_meshes: &ExtractedAssets<RenderMesh>,
+        reusable_modified_meshes: &HashSet<AssetId<Mesh>>,
+    ) {
         let mut empty_slabs = <HashSet<_>>::default();
 
-        // TODO: Consider explicitly reusing allocations for changed meshes of the same size
-        let meshes_to_free = extracted_meshes
-            .removed
-            .iter()
-            .chain(extracted_meshes.modified.iter());
-
-        for mesh_id in meshes_to_free {
-            if let Some(slab_id) = self.mesh_id_to_vertex_slab.remove(mesh_id) {
-                self.free_allocation_in_slab(mesh_id, slab_id, &mut empty_slabs);
-            }
-            if let Some(slab_id) = self.mesh_id_to_index_slab.remove(mesh_id) {
-                self.free_allocation_in_slab(mesh_id, slab_id, &mut empty_slabs);
-            }
+        for mesh_id in extracted_meshes.removed.iter().chain(
+            extracted_meshes
+                .modified
+                .iter()
+                .filter(|mesh_id| !reusable_modified_meshes.contains(*mesh_id)),
+        ) {
+            self.free_mesh_allocations(mesh_id, &mut empty_slabs);
         }
 
         for empty_slab in empty_slabs {
@@ -647,6 +754,19 @@ impl MeshAllocator {
                 }
             });
             self.slabs.remove(&empty_slab);
+        }
+    }
+
+    fn free_mesh_allocations(
+        &mut self,
+        mesh_id: &AssetId<Mesh>,
+        empty_slabs: &mut HashSet<SlabId>,
+    ) {
+        if let Some(slab_id) = self.mesh_id_to_vertex_slab.remove(mesh_id) {
+            self.free_allocation_in_slab(mesh_id, slab_id, empty_slabs);
+        }
+        if let Some(slab_id) = self.mesh_id_to_index_slab.remove(mesh_id) {
+            self.free_allocation_in_slab(mesh_id, slab_id, empty_slabs);
         }
     }
 
@@ -697,8 +817,7 @@ impl MeshAllocator {
         slabs_to_grow: &mut SlabsToReallocate,
         settings: &MeshAllocatorSettings,
     ) {
-        let data_element_count = data_byte_len.div_ceil(layout.size) as u32;
-        let data_slot_count = data_element_count.div_ceil(layout.elements_per_slot);
+        let data_slot_count = layout.slots_for_bytes(data_byte_len);
 
         // If the mesh data is too large for a slab, give it a slab of its own.
         if data_slot_count as u64 * layout.slot_size()
@@ -987,6 +1106,10 @@ impl ElementLayout {
 
     fn slot_size(&self) -> u64 {
         self.size * self.elements_per_slot as u64
+    }
+
+    fn slots_for_bytes(&self, byte_len: u64) -> u32 {
+        (byte_len.div_ceil(self.size) as u32).div_ceil(self.elements_per_slot)
     }
 
     /// Creates the appropriate [`ElementLayout`] for the given mesh's vertex
