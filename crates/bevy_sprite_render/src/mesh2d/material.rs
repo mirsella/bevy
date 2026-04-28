@@ -41,7 +41,6 @@ use bevy_render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal, ShaderRef};
-use bevy_utils::Parallel;
 use core::{hash::Hash, marker::PhantomData};
 use derive_more::derive::From;
 use tracing::error;
@@ -666,18 +665,12 @@ pub fn check_entities_needing_specialization<M>(
             With<MeshMaterial2d<M>>,
         ),
     >,
-    mut par_local: Local<Parallel<Vec<Entity>>>,
     mut entities_needing_specialization: ResMut<EntitiesNeedingSpecialization<M>>,
 ) where
     M: Material2d,
 {
     entities_needing_specialization.clear();
-
-    needs_specialization
-        .par_iter()
-        .for_each(|entity| par_local.borrow_local_mut().push(entity));
-
-    par_local.drain_into(&mut entities_needing_specialization);
+    entities_needing_specialization.extend(needs_specialization.iter());
 }
 
 pub fn specialize_material2d_meshes<M: Material2d>(
