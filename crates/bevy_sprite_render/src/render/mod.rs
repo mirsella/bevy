@@ -885,24 +885,18 @@ pub fn queue_sprites(
     pipeline_cache: Res<PipelineCache>,
     extracted_sprites: Res<ExtractedSprites>,
     mut srgb_render_phases: ResMut<ViewSortedRenderPhases<SrgbTransparent2d>>,
-    views: Query<(
-        &RenderVisibleEntities,
-        &ExtractedView,
-        &Msaa,
-        Option<&Tonemapping>,
-    )>,
+    views: Query<(&RenderVisibleEntities, &ExtractedView, &Msaa)>,
 ) {
     let draw_sprite_function = draw_functions.read().id::<DrawSprite>();
 
-    for (visible_entities, view, msaa, tonemapping) in &views {
+    for (visible_entities, view, msaa) in &views {
         let Some(srgb_phase) = srgb_render_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
 
-        let hdr = tonemapping.is_some_and(|t| *t != Tonemapping::None);
         let key = SrgbSpritePipelineKey {
             msaa_samples: msaa.samples(),
-            hdr,
+            hdr: view.hdr,
         };
         let pipeline = pipelines.specialize(&pipeline_cache, &srgb_sprite_pipeline, key);
 
