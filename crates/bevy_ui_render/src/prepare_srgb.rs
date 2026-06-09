@@ -1,10 +1,11 @@
-use crate::{SrgbUiCompositePipeline, SrgbUiCompositePipelineKey};
+use crate::{
+    pipeline::ui_render_target_format, SrgbUiCompositePipeline, SrgbUiCompositePipelineKey,
+};
 use bevy_ecs::prelude::*;
 use bevy_image::BevyDefault;
 use bevy_render::render_resource::{
-    BindGroup, BindGroupEntries, CachedRenderPipelineId, Extent3d, FilterMode, PipelineCache,
-    SamplerDescriptor, SpecializedRenderPipeline, SpecializedRenderPipelines, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages,
+    BindGroup, BindGroupEntries, CachedRenderPipelineId, Extent3d, PipelineCache,
+    SpecializedRenderPipelines, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy_render::renderer::RenderDevice;
 use bevy_render::texture::{CachedTexture, TextureCache};
@@ -46,13 +47,7 @@ pub fn prepare_srgb_ui_textures(
 
         let sample_count = msaa.map(|m| m.samples()).unwrap_or(1);
 
-        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
-        // Use Rgba8Unorm for SDR
-        let format = if view.hdr {
-            TextureFormat::Rgba16Float
-        } else {
-            TextureFormat::Rgba8Unorm
-        };
+        let format = ui_render_target_format(view.hdr);
 
         let texture = texture_cache.get(
             &render_device,
@@ -125,7 +120,7 @@ pub fn queue_srgb_ui_composite_pipelines(
 pub fn prepare_srgb_ui_composite_bind_groups(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
-    composite_pipeline: Res<crate::SrgbUiCompositePipeline>,
+    composite_pipeline: Res<SrgbUiCompositePipeline>,
     views: Query<(Entity, &SrgbUiTexture)>,
 ) {
     for (entity, srgb_texture) in &views {

@@ -14,7 +14,6 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_image::BevyDefault as _;
 use bevy_math::{vec2, Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
@@ -34,7 +33,10 @@ use bevy_ui::{
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
 
-use crate::{BoxShadowSamples, RenderUiSystems, SetUiScissorRect, TransparentUi, UiCameraMap};
+use crate::{
+    pipeline::{ui_color_target_state, MANUAL_SRGB_SHADER_DEF},
+    BoxShadowSamples, RenderUiSystems, SetUiScissorRect, TransparentUi, UiCameraMap,
+};
 
 use super::{stack_z_offsets, UiCameraView, QUAD_INDICES, QUAD_VERTEX_POSITIONS};
 
@@ -160,16 +162,8 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
         );
         let shader_defs = vec![
             ShaderDefVal::UInt("SHADOW_SAMPLES".to_string(), key.samples),
-            "MANUAL_SRGB".into(),
+            MANUAL_SRGB_SHADER_DEF.into(),
         ];
-
-        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
-        // Use Rgba8Unorm for SDR
-        let format = if key.hdr {
-            TextureFormat::Rgba16Float
-        } else {
-            TextureFormat::Rgba8Unorm
-        };
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -181,11 +175,7 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.hdr))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone()],

@@ -5,7 +5,10 @@ use core::{
 };
 
 use super::shader_flags::BORDER_ALL;
-use crate::*;
+use crate::{
+    pipeline::{ui_color_target_state, MANUAL_SRGB_SHADER_DEF},
+    *,
+};
 use bevy_asset::*;
 use bevy_color::{ColorToComponents, Hsla, Hsva, LinearRgba, Oklaba, Oklcha, Srgba};
 use bevy_ecs::{
@@ -15,7 +18,6 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_image::prelude::*;
 use bevy_math::{
     ops::{cos, sin},
     FloatOrd, Rect, Vec2,
@@ -194,11 +196,13 @@ impl SpecializedRenderPipeline for GradientPipeline {
             InterpolationColorSpace::HsvaLong => "IN_HSV_LONG",
         };
 
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec![color_space.into(), "ANTI_ALIAS".into()]
         } else {
             vec![color_space.into()]
         };
+
+        shader_defs.push(MANUAL_SRGB_SHADER_DEF.into());
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -210,15 +214,7 @@ impl SpecializedRenderPipeline for GradientPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format: if key.hdr {
-                        ViewTarget::TEXTURE_FORMAT_HDR
-                    } else {
-                        TextureFormat::bevy_default()
-                    },
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.hdr))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone()],

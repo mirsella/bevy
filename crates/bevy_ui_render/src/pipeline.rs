@@ -1,7 +1,6 @@
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::FullscreenShader;
 use bevy_ecs::prelude::*;
-use bevy_image::BevyDefault as _;
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
     render_resource::{
@@ -9,10 +8,29 @@ use bevy_render::{
         *,
     },
     renderer::RenderDevice,
-    view::{ViewTarget, ViewUniform},
+    view::ViewUniform,
 };
 use bevy_shader::Shader;
 use bevy_utils::default;
+
+pub(crate) const MANUAL_SRGB_SHADER_DEF: &str = "MANUAL_SRGB";
+
+/// Format used by the UI render pass intermediate texture.
+pub(crate) fn ui_render_target_format(hdr: bool) -> TextureFormat {
+    if hdr {
+        TextureFormat::Rgba16Float
+    } else {
+        TextureFormat::Rgba8Unorm
+    }
+}
+
+pub(crate) fn ui_color_target_state(hdr: bool) -> ColorTargetState {
+    ColorTargetState {
+        format: ui_render_target_format(hdr),
+        blend: Some(BlendState::ALPHA_BLENDING),
+        write_mask: ColorWrites::ALL,
+    }
+}
 
 #[derive(Resource)]
 pub struct UiPipeline {
@@ -129,17 +147,7 @@ impl SpecializedRenderPipeline for UiPipeline {
             Vec::new()
         };
 
-        // UI is always rendered to an sRGB intermediate texture
-        // The shader needs to manually encode to sRGB (gamma correction)
-        shader_defs.push("MANUAL_SRGB".into());
-
-        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
-        // Use Rgba8Unorm for SDR
-        let format = if key.hdr {
-            TextureFormat::Rgba16Float
-        } else {
-            TextureFormat::Rgba8Unorm
-        };
+        shader_defs.push(MANUAL_SRGB_SHADER_DEF.into());
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -151,11 +159,7 @@ impl SpecializedRenderPipeline for UiPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.hdr))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],

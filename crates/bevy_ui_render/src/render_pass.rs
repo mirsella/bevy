@@ -16,7 +16,7 @@ use bevy_render::{
     render_phase::*,
     render_resource::{
         CachedRenderPipelineId, LoadOp, Operations, PipelineCache, RenderPassColorAttachment,
-        RenderPassDescriptor, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp,
+        RenderPassDescriptor, StoreOp,
     },
     renderer::*,
     sync_world::MainEntity,

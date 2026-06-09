@@ -1,6 +1,9 @@
 use core::{hash::Hash, ops::Range};
 
-use crate::*;
+use crate::{
+    pipeline::{ui_color_target_state, MANUAL_SRGB_SHADER_DEF},
+    *,
+};
 use bevy_asset::*;
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::{
@@ -167,15 +170,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = vec!["MANUAL_SRGB".into()];
-
-        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
-        // Use Rgba8Unorm for SDR
-        let format = if key.hdr {
-            TextureFormat::Rgba16Float
-        } else {
-            TextureFormat::Rgba8Unorm
-        };
+        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -187,11 +182,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.hdr))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],

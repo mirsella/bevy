@@ -1,5 +1,8 @@
 use crate::ui_material::{MaterialNode, UiMaterial, UiMaterialKey};
-use crate::*;
+use crate::{
+    pipeline::{ui_color_target_state, MANUAL_SRGB_SHADER_DEF},
+    *,
+};
 use bevy_asset::*;
 use bevy_ecs::{
     prelude::{Component, With},
@@ -9,7 +12,6 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_image::BevyDefault as _;
 use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
@@ -142,15 +144,7 @@ where
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = vec!["MANUAL_SRGB".into()];
-
-        // Use Rgba16Float for HDR (preserves values > 1.0 for bloom)
-        // Use Rgba8Unorm for SDR
-        let format = if key.hdr {
-            TextureFormat::Rgba16Float
-        } else {
-            TextureFormat::Rgba8Unorm
-        };
+        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
 
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
@@ -162,11 +156,7 @@ where
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.hdr))],
                 ..default()
             }),
             label: Some("ui_material_pipeline".into()),
