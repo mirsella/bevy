@@ -67,6 +67,8 @@ pub(crate) struct WinitAppRunnerState<T: Message> {
     ran_update_since_last_redraw: bool,
     /// Is `true` if enough time has elapsed since `last_update` to run another update.
     wait_elapsed: bool,
+    /// Time at which the next tick is scheduled to run when `update_mode` is [`UpdateMode::Reactive`].
+    scheduled_tick_start: Option<Instant>,
     /// Number of "forced" updates to trigger on application start
     startup_forced_updates: u32,
 
@@ -119,6 +121,7 @@ impl<M: Message> WinitAppRunnerState<M> {
             redraw_requested: false,
             ran_update_since_last_redraw: false,
             wait_elapsed: false,
+            scheduled_tick_start: None,
             // 3 seems to be enough, 5 is a safe margin
             startup_forced_updates: 5,
             bevy_window_events: Vec::new(),
@@ -165,12 +168,13 @@ impl<M: Message> ApplicationHandler<M> for WinitAppRunnerState<M> {
 
         self.wait_elapsed = match cause {
             StartCause::WaitCancelled {
-                requested_resume: Some(resume),
-                ..
+                requested_resume, ..
             } => {
                 // If the resume time is not after now, it means that at least the wait timeout
-                // has elapsed.
-                resume <= Instant::now()
+                // has elapsed. If the resume time is unset, the wait never elapses.
+                requested_resume
+                    .map(|resume| resume <= Instant::now())
+                    .unwrap_or_default()
             }
             _ => true,
         };
@@ -649,6 +653,7 @@ impl<M: Message> WinitAppRunnerState<M> {
             self.redraw_requested = true;
             // Consider the wait as elapsed since it could have been cancelled by a user event
             self.wait_elapsed = true;
+            self.scheduled_tick_start = None;
 
             self.update_mode = update_mode;
         }
@@ -689,11 +694,23 @@ impl<M: Message> WinitAppRunnerState<M> {
                 }
             }
             UpdateMode::Reactive { wait, .. } => {
-                // Set the next timeout, starting from the instant before running app.update() to avoid frame delays
-                if let Some(next) = begin_frame_time.checked_add(wait)
-                    && self.wait_elapsed
-                {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                // Set the next timeout, starting from the instant we were scheduled to begin.
+                if self.wait_elapsed {
+                    self.redraw_requested = true;
+
+                    let begin_instant = self.scheduled_tick_start.unwrap_or(begin_frame_time);
+                    if let Some(next) = begin_instant.checked_add(wait) {
+                        let now = Instant::now();
+                        if next < now {
+                            // Request the next redraw as soon as possible if we are already past the
+                            // next scheduled frame start time.
+                            event_loop.set_control_flow(ControlFlow::Poll);
+                            self.scheduled_tick_start = Some(now);
+                        } else {
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                            self.scheduled_tick_start = Some(next);
+                        }
+                    }
                 }
             }
         }
