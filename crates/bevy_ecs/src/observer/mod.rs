@@ -1261,6 +1261,53 @@ mod tests {
     }
 
     #[test]
+    fn commands_add_observer_with_run_condition() {
+        let mut world = World::new();
+        world.insert_resource(RunConditionFlag(true));
+        world.init_resource::<Order>();
+
+        world.commands().add_observer(
+            (|_: On<EventA>, mut order: ResMut<Order>| {
+                order.observed("event");
+            })
+            .run_if(|flag: Res<RunConditionFlag>| flag.0),
+        );
+        world.flush();
+
+        world.trigger(EventA);
+        assert_eq!(vec!["event"], world.resource::<Order>().0);
+
+        world.resource_mut::<Order>().0.clear();
+        world.resource_mut::<RunConditionFlag>().0 = false;
+        world.trigger(EventA);
+        assert!(world.resource::<Order>().0.is_empty());
+    }
+
+    #[test]
+    fn entity_commands_observe_with_run_condition() {
+        let mut world = World::new();
+        world.insert_resource(RunConditionFlag(true));
+        world.init_resource::<Order>();
+
+        let entity = world.spawn_empty().id();
+        world.commands().entity(entity).observe(
+            (|_: On<EntityEventA>, mut order: ResMut<Order>| {
+                order.observed("entity_event");
+            })
+            .run_if(|flag: Res<RunConditionFlag>| flag.0),
+        );
+        world.flush();
+
+        world.trigger(EntityEventA(entity));
+        assert_eq!(vec!["entity_event"], world.resource::<Order>().0);
+
+        world.resource_mut::<Order>().0.clear();
+        world.resource_mut::<RunConditionFlag>().0 = false;
+        world.trigger(EntityEventA(entity));
+        assert!(world.resource::<Order>().0.is_empty());
+    }
+
+    #[test]
     fn observer_builder_run_if() {
         let mut world = World::new();
         world.insert_resource(RunConditionFlag(true));

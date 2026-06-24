@@ -23,12 +23,11 @@ use crate::{
     error::{warn, BevyError, CommandWithEntity, ErrorContext, HandleError},
     event::{EntityEvent, Event},
     message::Message,
-    observer::Observer,
+    observer::{IntoEntityObserver, IntoObserver},
     resource::Resource,
     schedule::ScheduleLabel,
     system::{
-        Deferred, IntoObserverSystem, IntoSystem, RegisteredSystem, SystemId, SystemInput,
-        SystemParamValidationError,
+        Deferred, IntoSystem, RegisteredSystem, SystemId, SystemInput, SystemParamValidationError,
     },
     world::{
         command_queue::RawCommandQueue, unsafe_world_cell::UnsafeWorldCell, CommandQueue,
@@ -1086,7 +1085,7 @@ impl<'w, 's> Commands<'w, 's> {
         self.queue(command::run_system_cached_with(system, input).handle_error_with(warn));
     }
 
-    /// Triggers the given [`Event`], which will run any [`Observer`]s watching for it.
+    /// Triggers the given [`Event`], which will run any [`Observer`](crate::observer::Observer)s watching for it.
     ///
     /// [`Observer`]: crate::observer::Observer
     #[track_caller]
@@ -1104,7 +1103,7 @@ impl<'w, 's> Commands<'w, 's> {
         self.trigger(event);
     }
 
-    /// Triggers the given [`Event`] using the given [`Trigger`], which will run any [`Observer`]s watching for it.
+    /// Triggers the given [`Event`] using the given [`Trigger`], which will run any [`Observer`](crate::observer::Observer)s watching for it.
     ///
     /// [`Trigger`]: crate::event::Trigger
     /// [`Observer`]: crate::observer::Observer
@@ -1117,10 +1116,11 @@ impl<'w, 's> Commands<'w, 's> {
         self.queue(command::trigger_with(event, trigger));
     }
 
-    /// Spawns an [`Observer`] and returns the [`EntityCommands`] associated
+    /// Spawns an [`Observer`](crate::observer::Observer) and returns the [`EntityCommands`] associated
     /// with the entity that stores the observer.
     ///
-    /// `observer` can be any system whose first parameter is [`On`].
+    /// `observer` can be any type that implements [`IntoObserver`], typically a system whose
+    /// first parameter is [`On`], optionally with run conditions attached via [`ObserverSystemExt::run_if`].
     ///
     /// **Calling [`observe`](EntityCommands::observe) on the returned
     /// [`EntityCommands`] will observe the observer itself, which you very
@@ -1130,12 +1130,10 @@ impl<'w, 's> Commands<'w, 's> {
     ///
     /// Panics if the given system is an exclusive system.
     ///
+    /// [`ObserverSystemExt::run_if`]: crate::observer::ObserverSystemExt::run_if
     /// [`On`]: crate::observer::On
-    pub fn add_observer<E: Event, B: Bundle, M>(
-        &mut self,
-        observer: impl IntoObserverSystem<E, B, M>,
-    ) -> EntityCommands<'_> {
-        self.spawn(Observer::new(observer))
+    pub fn add_observer<M>(&mut self, observer: impl IntoObserver<M>) -> EntityCommands<'_> {
+        self.spawn(observer.into_observer())
     }
 
     /// Writes an arbitrary [`Message`].
@@ -2005,12 +2003,9 @@ impl<'a> EntityCommands<'a> {
         &mut self.commands
     }
 
-    /// Creates an [`Observer`] watching for an [`EntityEvent`] of type `E` whose [`EntityEvent::event_target`]
+    /// Creates an [`Observer`](crate::observer::Observer) watching for an [`EntityEvent`] of type `E` whose [`EntityEvent::event_target`]
     /// targets this entity.
-    pub fn observe<E: EntityEvent, B: Bundle, M>(
-        &mut self,
-        observer: impl IntoObserverSystem<E, B, M>,
-    ) -> &mut Self {
+    pub fn observe<M>(&mut self, observer: impl IntoEntityObserver<M>) -> &mut Self {
         self.queue(entity_command::observe(observer))
     }
 
