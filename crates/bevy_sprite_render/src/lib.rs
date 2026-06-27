@@ -35,14 +35,20 @@ pub use tilemap_chunk::*;
 
 use bevy_app::prelude::*;
 use bevy_asset::{embedded_asset, AssetEventSystems};
-use bevy_core_pipeline::core_2d::{AlphaMask2d, Opaque2d, Transparent2d};
+use bevy_core_pipeline::{
+    core_2d::{main_opaque_pass_2d, main_transparent_pass_2d, AlphaMask2d, Opaque2d},
+    schedule::{Core2d, Core2dSystems},
+};
 use bevy_ecs::prelude::*;
 use bevy_image::{prelude::*, TextureAtlasPlugin};
 use bevy_mesh::Mesh2d;
 use bevy_render::{
-    batching::sort_binned_render_phase, render_phase::AddRenderCommand,
-    render_resource::SpecializedRenderPipelines, sync_world::SyncToRenderWorld, ExtractSchedule,
-    GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
+    batching::sort_binned_render_phase,
+    render_phase::AddRenderCommand,
+    render_phase::{sort_phase_system, DrawFunctions, ViewSortedRenderPhases},
+    render_resource::SpecializedRenderPipelines,
+    sync_world::SyncToRenderWorld,
+    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_sprite::Sprite;
 
@@ -65,9 +71,17 @@ impl Plugin for SpriteRenderPlugin {
         load_shader_library!(app, "render/sprite_view_bindings.wgsl");
 
         embedded_asset!(app, "render/sprite.wgsl");
+        embedded_asset!(app, "render/srgb_composite.wgsl");
 
         if !app.is_plugin_added::<TextureAtlasPlugin>() {
             app.add_plugins(TextureAtlasPlugin);
+        }
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .init_resource::<DrawFunctions<SrgbTransparent2d>>()
+                .init_resource::<ViewSortedRenderPhases<SrgbTransparent2d>>()
+                .allow_ambiguous_resource::<ViewSortedRenderPhases<SrgbTransparent2d>>();
         }
 
         app.add_plugins((
@@ -92,18 +106,21 @@ impl Plugin for SpriteRenderPlugin {
             render_app
                 .init_resource::<ImageBindGroups>()
                 .init_gpu_resource::<SpecializedRenderPipelines<SpritePipeline>>()
+                .init_gpu_resource::<SpecializedRenderPipelines<SrgbCompositePipeline>>()
                 .init_resource::<SpriteMeta>()
                 .init_resource::<ExtractedSprites>()
                 .init_resource::<ExtractedSlices>()
                 .init_resource::<SpriteAssetEvents>()
                 .init_resource::<SpriteBatches>()
-                .add_render_command::<Transparent2d, DrawSprite>()
+                .add_render_command::<SrgbTransparent2d, DrawSprite>()
                 .add_systems(RenderStartup, init_sprite_pipeline)
+                .add_systems(RenderStartup, init_srgb_composite_pipeline)
                 .add_systems(
                     ExtractSchedule,
                     (
                         extract_sprites.in_set(SpriteSystems::ExtractSprites),
                         extract_sprite_events,
+                        extract_srgb_sprite_camera_phases,
                         #[cfg(feature = "bevy_text")]
                         extract_text2d_sprite.after(SpriteSystems::ExtractSprites),
                     ),
@@ -114,11 +131,23 @@ impl Plugin for SpriteRenderPlugin {
                         queue_sprites
                             .in_set(RenderSystems::Queue)
                             .ambiguous_with(queue_material2d_meshes::<ColorMaterial>),
+                        queue_srgb_composite_pipelines.in_set(RenderSystems::Queue),
                         prepare_sprite_image_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         prepare_sprite_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                        prepare_srgb_sprite_textures.in_set(RenderSystems::PrepareResources),
+                        prepare_srgb_composite_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         sort_binned_render_phase::<Opaque2d>.in_set(RenderSystems::PhaseSort),
                         sort_binned_render_phase::<AlphaMask2d>.in_set(RenderSystems::PhaseSort),
+                        sort_phase_system::<SrgbTransparent2d>.in_set(RenderSystems::PhaseSort),
                     ),
+                )
+                .add_systems(
+                    Core2d,
+                    (srgb_sprite_pass, srgb_composite_pass)
+                        .chain()
+                        .after(main_opaque_pass_2d)
+                        .before(main_transparent_pass_2d)
+                        .in_set(Core2dSystems::MainPass),
                 );
         };
     }

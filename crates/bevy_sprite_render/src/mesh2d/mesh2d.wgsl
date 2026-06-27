@@ -7,11 +7,14 @@
 #ifdef TONEMAP_IN_SHADER
 #import bevy_core_pipeline::tonemapping
 #endif
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
 #ifdef OKLAB_OUTPUT
 #import bevy_render::color_operations::linear_rgb_to_oklab
+#endif
+
+#ifdef SRGB_OUTPUT
+fn linear_to_gamma_2_2(color: vec3<f32>) -> vec3<f32> {
+    return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
 #endif
 
 struct Vertex {
@@ -76,7 +79,7 @@ fn fragment(
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
 #ifdef SRGB_OUTPUT
-    color = vec4(linear_to_srgb(color.rgb), color.a);
+    color = vec4(linear_to_gamma_2_2(color.rgb), color.a);
 #endif
 #ifdef OKLAB_OUTPUT
     color = vec4(linear_rgb_to_oklab(color.rgb), color.a);

@@ -19,6 +19,7 @@
 //! - Optional select-all on focus via the `SelectAllOnFocus` component
 //! - Per-character input filtering via the [`EditableTextFilter`] component
 //! - Max character limits via [`EditableText::max_characters`]
+//! - Placeholder text via the [`EditableTextPlaceholder`] component
 //! - Cursor blinking
 //! - Newline support for multi-line input
 //! - Soft-wrapping of long lines
@@ -56,7 +57,6 @@
 //!
 //! However, the following features are planned but currently not implemented:
 //!
-//! - Placeholder text (displayed when the input is empty)
 //! - Undo/redo functionality
 //! - Text validation (e.g., email format, numeric input)
 //! - Password-style character masking
@@ -78,6 +78,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use bevy_clipboard::ClipboardRead;
+use bevy_color::{palettes::tailwind::SLATE_400, Color};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::prelude::*;
 use core::time::Duration;
@@ -144,6 +145,31 @@ pub struct EditableText {
     pub visible_width: Option<f32>,
     /// Allow new lines
     pub allow_newlines: bool,
+}
+
+/// Placeholder text displayed while an [`EditableText`] input is empty.
+///
+/// The placeholder is rendered using the input's [`TextFont`], [`LineHeight`], and [`TextLayout`]
+/// without changing [`EditableText::value`] or its cursor/selection state.
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq, Deref, DerefMut)]
+#[require(EditableTextPlaceholderColor)]
+pub struct EditableTextPlaceholder(pub String);
+
+impl EditableTextPlaceholder {
+    /// Creates placeholder text for an [`EditableText`] input.
+    pub fn new(placeholder: impl Into<String>) -> Self {
+        Self(placeholder.into())
+    }
+}
+
+/// Text color used for an [`EditableTextPlaceholder`].
+#[derive(Component, Clone, Copy, Debug, PartialEq, Deref, DerefMut)]
+pub struct EditableTextPlaceholderColor(pub Color);
+
+impl Default for EditableTextPlaceholderColor {
+    fn default() -> Self {
+        Self(Color::from(SLATE_400))
+    }
 }
 
 impl Default for EditableText {

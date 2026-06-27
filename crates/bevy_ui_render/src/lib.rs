@@ -27,7 +27,7 @@ use bevy_render::camera::{extract_cameras, CameraMainPassTextureFormats};
 use bevy_shader::load_shader_library;
 use bevy_sprite_render::SpriteAssetEvents;
 use bevy_ui::widget::{
-    ImageNode, ImageNodeSize, NodeImageMode, TextScroll, TextShadow, ViewportNode,
+    ImageNode, ImageNodeSize, NodeImageMode, TextOutline, TextScroll, TextShadow, ViewportNode,
 };
 use bevy_ui::{
     BackgroundColor, BorderColor, CalculatedClip, ComputedNode, ComputedStackIndex,
@@ -36,7 +36,7 @@ use bevy_ui::{
 };
 
 use bevy_app::prelude::*;
-use bevy_asset::{AssetEvent, AssetId, Assets};
+use bevy_asset::{embedded_asset, AssetEvent, AssetId, Assets};
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
 use bevy_core_pipeline::schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
 use bevy_core_pipeline::upscaling::upscaling;
@@ -66,8 +66,10 @@ use gradient::GradientPlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
-    ComputedTextBlock, PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextColor, TextCursorStyle, TextLayoutInfo, Underline, UnderlineColor,
+    combined_text_effect_padding, expanded_text_effect_rect, text_effect_outline_width,
+    text_effect_shadow_offset, ComputedTextBlock, EditableTextPlaceholderColor, PositionedGlyph,
+    Strikethrough, StrikethroughColor, TextBackgroundColor, TextColor, TextCursorStyle,
+    TextLayoutInfo, Underline, UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
@@ -114,6 +116,7 @@ pub mod stack_z_offsets {
     pub const IMAGE: f32 = 0.04;
     pub const MATERIAL: f32 = 0.05;
     pub const TEXT_SELECTION: f32 = 0.055;
+    pub const TEXT_OUTLINE: f32 = 0.059;
     pub const TEXT: f32 = 0.06;
     pub const TEXT_STRIKETHROUGH: f32 = 0.07;
     pub const TEXT_CURSOR: f32 = 0.08;
@@ -199,6 +202,7 @@ pub struct UiRenderPlugin;
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui.wgsl");
+        embedded_asset!(app, "srgb_ui_composite.wgsl");
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<GlobalUiDebugOptions>();
@@ -209,6 +213,7 @@ impl Plugin for UiRenderPlugin {
 
         render_app
             .init_gpu_resource::<SpecializedRenderPipelines<UiPipeline>>()
+            .init_gpu_resource::<SpecializedRenderPipelines<SrgbUiCompositePipeline>>()
             .init_gpu_resource::<ImageNodeBindGroups>()
             .init_gpu_resource::<UiMeta>()
             .init_resource::<ExtractedUiNodes>()
@@ -258,17 +263,26 @@ impl Plugin for UiRenderPlugin {
                 Render,
                 (
                     queue_uinodes.in_set(RenderSystems::Queue),
+                    queue_srgb_ui_composite_pipelines.in_set(RenderSystems::Queue),
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
+                    prepare_srgb_ui_textures.in_set(RenderSystems::PrepareResources),
                     prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_srgb_ui_composite_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(
                 Core2d,
-                ui_pass.after(Core2dSystems::PostProcess).before(upscaling),
+                (ui_pass, srgb_ui_composite_pass)
+                    .chain()
+                    .after(Core2dSystems::PostProcess)
+                    .before(upscaling),
             )
             .add_systems(
                 Core3d,
-                ui_pass.after(Core3dSystems::PostProcess).before(upscaling),
+                (ui_pass, srgb_ui_composite_pass)
+                    .chain()
+                    .after(Core3dSystems::PostProcess)
+                    .before(upscaling),
             );
 
         app.add_plugins(UiTextureSlicerPlugin);
@@ -341,6 +355,7 @@ pub struct ExtractedUiNode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NodeType {
     Rect,
+    Viewport,
     Inverted,
     Border(u32), // shader flags
 }
@@ -369,8 +384,12 @@ pub enum ExtractedUiItem {
 
 pub struct ExtractedGlyph {
     pub color: LinearRgba,
+    pub shadow_color: LinearRgba,
+    pub shadow_offset: Vec2,
+    pub outline_color: LinearRgba,
     pub translation: Vec2,
     pub rect: Rect,
+    pub is_alpha_mask: bool,
 }
 
 #[derive(Resource, Default)]
@@ -945,7 +964,7 @@ pub fn extract_viewport_nodes(
                 flip_y: false,
                 border: uinode.border(),
                 border_radius: uinode.border_radius(),
-                node_type: NodeType::Rect,
+                node_type: NodeType::Viewport,
             },
             main_entity: entity.into(),
         });
@@ -967,16 +986,16 @@ pub fn extract_text_sections(
             &ComputedTextBlock,
             &TextColor,
             &TextLayoutInfo,
+            Option<&TextShadow>,
+            Option<&TextOutline>,
             Option<&TextScroll>,
             Option<&TextCursorStyle>,
+            Option<&EditableTextPlaceholderColor>,
         )>,
     >,
     text_styles: Extract<Query<&TextColor>>,
     camera_map: Extract<UiCameraMap>,
 ) {
-    let mut start = extracted_uinodes.glyphs.len();
-    let mut end = start + 1;
-
     let mut camera_mapper = camera_map.get_mapper();
     for (
         entity,
@@ -989,8 +1008,11 @@ pub fn extract_text_sections(
         computed_block,
         text_color,
         text_layout_info,
+        maybe_shadow,
+        maybe_outline,
         text_scroll,
         cursor_style,
+        placeholder_color,
     ) in &uinode_query
     {
         // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
@@ -1026,73 +1048,226 @@ pub fn extract_text_sections(
 
         let mut current_section_index = 0;
 
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                section_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            if current_section_index != *section_index
-                && let Some(section_entity) = computed_block
-                    .entities()
-                    .get(*section_index)
-                    .map(|t| t.entity)
-            {
-                color = text_styles
-                    .get(section_entity)
-                    .map(|text_color| LinearRgba::from(text_color.0))
-                    .unwrap_or_default();
-                current_section_index = *section_index;
-            }
-
-            let color = if !atlas_info.is_alpha_mask {
-                LinearRgba::WHITE
-            } else if let Some(selected_text_color) = selected_text_color
-                && text_layout_info
-                    .selection_rects
-                    .iter()
-                    .any(|selection_rect| {
-                        let glyph_rect = Rect::from_center_size(*position, atlas_info.rect.size());
-                        selection_rect.contains(glyph_rect.min)
-                            && selection_rect.contains(glyph_rect.max)
-                    })
-            {
-                selected_text_color
-            } else {
-                color
-            };
-
-            extracted_uinodes.glyphs.push(ExtractedGlyph {
-                color,
-                translation: *position,
-                rect: atlas_info.rect,
+        let outline = maybe_outline
+            .filter(|outline| !outline.color.is_fully_transparent())
+            .and_then(|outline| {
+                text_effect_outline_width(
+                    outline.width,
+                    text_layout_info.scale_factor,
+                    entity,
+                    "TextOutline",
+                )
+                .map(|width| (outline.color.to_linear(), width))
             });
+        let shadow = maybe_shadow
+            .filter(|shadow| !shadow.color.is_fully_transparent())
+            .and_then(|shadow| {
+                text_effect_shadow_offset(
+                    shadow.offset,
+                    text_layout_info.scale_factor,
+                    entity,
+                    "TextShadow",
+                )
+                .map(|offset| (shadow.color.to_linear(), offset))
+            });
+        let glyph_padding = combined_text_effect_padding(
+            shadow.map(|(_, offset)| offset),
+            outline.map(|(_, width)| width),
+        );
 
-            if text_layout_info
-                .glyphs
-                .get(i + 1)
-                .is_none_or(|info| info.atlas_info.texture != atlas_info.texture)
-            {
-                extracted_uinodes.uinodes.push(ExtractedUiNode {
-                    z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    image: atlas_info.texture,
-                    clip,
-                    extracted_camera_entity,
-                    item: ExtractedUiItem::Glyphs { range: start..end },
-                    main_entity: entity.into(),
-                    transform,
-                });
-                start = end;
-            }
+        extract_glyphs(
+            &mut commands,
+            &mut extracted_uinodes,
+            text_layout_info.glyphs.iter(),
+            |PositionedGlyph {
+                 position,
+                 atlas_info,
+                 section_index,
+                 ..
+             }| {
+                if current_section_index != *section_index {
+                    let Some(section_entity) = computed_block
+                        .entities()
+                        .get(*section_index)
+                        .map(|text_entity| text_entity.entity)
+                    else {
+                        tracing::warn!(
+                        "Skipping UI text glyph for {entity:?}: missing text section {section_index}"
+                    );
+                        return None;
+                    };
 
-            end += 1;
+                    let Ok(text_color) = text_styles.get(section_entity) else {
+                        tracing::warn!(
+                        "Skipping UI text glyph for {entity:?}: missing TextColor on section entity {section_entity:?}"
+                    );
+                        return None;
+                    };
+
+                    color = LinearRgba::from(text_color.0);
+                    current_section_index = *section_index;
+                }
+
+                if let Some(selected_text_color) = selected_text_color
+                    && text_layout_info
+                        .selection_rects
+                        .iter()
+                        .any(|selection_rect| {
+                            let glyph_rect =
+                                Rect::from_center_size(*position, atlas_info.rect.size());
+                            selection_rect.contains(glyph_rect.min)
+                                && selection_rect.contains(glyph_rect.max)
+                        })
+                {
+                    Some(selected_text_color)
+                } else {
+                    Some(color)
+                }
+            },
+            shadow,
+            outline,
+            glyph_padding,
+            stack_index.0 as f32 + stack_z_offsets::TEXT,
+            clip,
+            extracted_camera_entity,
+            entity.into(),
+            transform,
+        );
+
+        if !text_layout_info.placeholder_glyphs.is_empty() {
+            let placeholder_color = placeholder_color
+                .map(|placeholder_color| placeholder_color.0)
+                .unwrap_or(text_color.0)
+                .to_linear();
+
+            extract_glyphs(
+                &mut commands,
+                &mut extracted_uinodes,
+                text_layout_info.placeholder_glyphs.iter(),
+                |_| Some(placeholder_color),
+                shadow,
+                outline,
+                glyph_padding,
+                stack_index.0 as f32 + stack_z_offsets::TEXT,
+                clip,
+                extracted_camera_entity,
+                entity.into(),
+                transform,
+            );
         }
     }
+}
+
+fn extract_glyphs<'a>(
+    commands: &mut Commands,
+    extracted_uinodes: &mut ExtractedUiNodes,
+    glyphs: impl IntoIterator<Item = &'a PositionedGlyph>,
+    mut color: impl FnMut(&'a PositionedGlyph) -> Option<LinearRgba>,
+    shadow: Option<(LinearRgba, Vec2)>,
+    outline: Option<(LinearRgba, f32)>,
+    glyph_padding: Option<Vec2>,
+    z_order: f32,
+    clip: Option<Rect>,
+    extracted_camera_entity: Entity,
+    main_entity: MainEntity,
+    transform: Affine2,
+) {
+    let mut start = extracted_uinodes.glyphs.len();
+    let mut texture = None;
+
+    for glyph in glyphs {
+        let Some(color) = color(glyph) else {
+            continue;
+        };
+
+        if let Some(previous_texture) = texture
+            && previous_texture != glyph.atlas_info.texture
+        {
+            push_glyph_batch(
+                commands,
+                extracted_uinodes,
+                previous_texture,
+                start,
+                z_order,
+                clip,
+                extracted_camera_entity,
+                main_entity,
+                transform,
+            );
+            start = extracted_uinodes.glyphs.len();
+        }
+
+        texture = Some(glyph.atlas_info.texture);
+
+        let atlas_info = &glyph.atlas_info;
+        let rect = if atlas_info.is_alpha_mask || shadow.is_some() {
+            glyph_padding
+                .map(|padding| expanded_text_effect_rect(atlas_info.rect, padding))
+                .unwrap_or(atlas_info.rect)
+        } else {
+            atlas_info.rect
+        };
+
+        extracted_uinodes.glyphs.push(ExtractedGlyph {
+            color: if atlas_info.is_alpha_mask {
+                color
+            } else {
+                LinearRgba::WHITE
+            },
+            shadow_color: shadow.map(|(color, _)| color).unwrap_or(LinearRgba::NONE),
+            shadow_offset: shadow.map(|(_, offset)| offset).unwrap_or(Vec2::ZERO),
+            outline_color: if atlas_info.is_alpha_mask {
+                outline.map(|(color, _)| color).unwrap_or(LinearRgba::NONE)
+            } else {
+                LinearRgba::NONE
+            },
+            translation: glyph.position,
+            rect,
+            is_alpha_mask: atlas_info.is_alpha_mask,
+        });
+    }
+
+    if let Some(texture) = texture {
+        push_glyph_batch(
+            commands,
+            extracted_uinodes,
+            texture,
+            start,
+            z_order,
+            clip,
+            extracted_camera_entity,
+            main_entity,
+            transform,
+        );
+    }
+}
+
+fn push_glyph_batch(
+    commands: &mut Commands,
+    extracted_uinodes: &mut ExtractedUiNodes,
+    texture: AssetId<Image>,
+    start: usize,
+    z_order: f32,
+    clip: Option<Rect>,
+    extracted_camera_entity: Entity,
+    main_entity: MainEntity,
+    transform: Affine2,
+) {
+    let end = extracted_uinodes.glyphs.len();
+    if start == end {
+        return;
+    }
+
+    extracted_uinodes.uinodes.push(ExtractedUiNode {
+        z_order,
+        render_entity: commands.spawn(TemporaryRenderEntity).id(),
+        image: texture,
+        clip,
+        extracted_camera_entity,
+        item: ExtractedUiItem::Glyphs { range: start..end },
+        main_entity,
+        transform,
+    });
 }
 
 pub fn extract_text_shadows(
@@ -1116,9 +1291,6 @@ pub fn extract_text_shadows(
     text_decoration_query: Extract<Query<(Has<Strikethrough>, Has<Underline>)>>,
     camera_map: Extract<UiCameraMap>,
 ) {
-    let mut start = extracted_uinodes.glyphs.len();
-    let mut end = start + 1;
-
     let mut camera_mapper = camera_map.get_mapper();
     for (
         entity,
@@ -1139,14 +1311,26 @@ pub fn extract_text_shadows(
             continue;
         }
 
+        if shadow.color.is_fully_transparent() {
+            continue;
+        }
+
+        let Some(shadow_offset) = text_effect_shadow_offset(
+            shadow.offset,
+            text_layout_info.scale_factor,
+            entity,
+            "TextShadow",
+        ) else {
+            continue;
+        };
+
         let Some(extracted_camera_entity) = camera_mapper.map(target) else {
             continue;
         };
 
         let node_transform = Affine2::from(*global_transform)
             * Affine2::from_translation(
-                uinode.content_box().min + shadow.offset / uinode.inverse_scale_factor()
-                    - text_scroll.map_or(Vec2::ZERO, |s| s.0),
+                uinode.content_box().min + shadow_offset - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
         let clip = if text_scroll.is_some() {
@@ -1159,42 +1343,6 @@ pub fn extract_text_shadows(
         } else {
             maybe_clip.map(|clip| clip.clip)
         };
-
-        for (
-            i,
-            PositionedGlyph {
-                position,
-                atlas_info,
-                section_index,
-                ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            extracted_uinodes.glyphs.push(ExtractedGlyph {
-                color: shadow.color.into(),
-                translation: *position,
-                rect: atlas_info.rect,
-            });
-
-            if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
-                info.section_index != *section_index
-                    || info.atlas_info.texture != atlas_info.texture
-            }) {
-                extracted_uinodes.uinodes.push(ExtractedUiNode {
-                    transform: node_transform,
-                    z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
-                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    image: atlas_info.texture,
-                    clip,
-                    extracted_camera_entity,
-                    item: ExtractedUiItem::Glyphs { range: start..end },
-                    main_entity: entity.into(),
-                });
-                start = end;
-            }
-
-            end += 1;
-        }
 
         for run in text_layout_info.run_geometry.iter() {
             let Some(section_entity) = computed_block
@@ -1454,6 +1602,9 @@ struct UiVertex {
     pub size: [f32; 2],
     /// Position relative to the center of the UI node.
     pub point: [f32; 2],
+    pub shadow_color: [f32; 4],
+    pub outline_color: [f32; 4],
+    pub effect_params: [f32; 4],
 }
 
 #[derive(Resource)]
@@ -1506,6 +1657,10 @@ pub mod shader_flags {
     pub const BORDER_BOTTOM: u32 = 2048;
     pub const BORDER_ALL: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
     pub const INVERT: u32 = 4096;
+    pub const VIEWPORT_TEXTURE: u32 = 8192;
+    pub const TEXT_GLYPH: u32 = 16384;
+    pub const TEXT_EFFECT_OUTLINE: u32 = 32768;
+    pub const TEXT_EFFECT_SHADOW: u32 = 65536;
 }
 
 pub fn queue_uinodes(
@@ -1548,7 +1703,7 @@ pub fn queue_uinodes(
             &pipeline_cache,
             &ui_pipeline,
             UiPipelineKey {
-                target_format: view.target_format,
+                target_format: ui_render_target_format(view.target_format),
                 anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
             },
         );
@@ -1782,9 +1937,14 @@ pub fn prepare_uinodes(
                         let uvs = if flags == shader_flags::UNTEXTURED {
                             [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]
                         } else {
-                            let image = gpu_images
-                                .get(extracted_uinode.image)
-                                .expect("Image was checked during batching and should still exist");
+                            let Some(image) = gpu_images.get(extracted_uinode.image) else {
+                                tracing::error!(
+                                    "Skipping UI node draw: missing GPU image {:?}",
+                                    extracted_uinode.image
+                                );
+                                batch_image_handle = None;
+                                continue;
+                            };
                             // Rescale atlases. This is done here because we need texture data that might not be available in Extract.
                             let atlas_extent = atlas_scaling
                                 .map(|scaling| image.size_2d().as_vec2() * scaling)
@@ -1832,6 +1992,9 @@ pub fn prepare_uinodes(
                             NodeType::Inverted => {
                                 flags |= INVERT;
                             }
+                            NodeType::Viewport => {
+                                flags |= shader_flags::VIEWPORT_TEXTURE;
+                            }
                             _ => {}
                         }
 
@@ -1850,6 +2013,9 @@ pub fn prepare_uinodes(
                                 ],
                                 size: rect_size.into(),
                                 point: points[i].into(),
+                                shadow_color: [0.0; 4],
+                                outline_color: [0.0; 4],
+                                effect_params: [0.0; 4],
                             });
                         }
 
@@ -1861,16 +2027,43 @@ pub fn prepare_uinodes(
                         indices_index += 4;
                     }
                     ExtractedUiItem::Glyphs { range } => {
-                        let image = gpu_images
-                            .get(extracted_uinode.image)
-                            .expect("Image was checked during batching and should still exist");
+                        let Some(image) = gpu_images.get(extracted_uinode.image) else {
+                            tracing::error!(
+                                "Skipping UI glyph draw: missing GPU image {:?}",
+                                extracted_uinode.image
+                            );
+                            batch_image_handle = None;
+                            continue;
+                        };
 
                         let atlas_extent = image.size_2d().as_vec2();
 
                         for glyph in &extracted_uinodes.glyphs[range.clone()] {
                             let color = glyph.color.to_f32_array();
+                            let shadow_color = glyph.shadow_color.to_f32_array();
+                            let outline_color = glyph.outline_color.to_f32_array();
                             let glyph_rect = glyph.rect;
                             let rect_size = glyph_rect.size();
+                            let mut flags = shader_flags::TEXTURED;
+                            let has_shadow = !glyph.shadow_color.is_fully_transparent();
+                            let effect_params = [
+                                glyph.shadow_offset.x / atlas_extent.x,
+                                glyph.shadow_offset.y / atlas_extent.y,
+                                0.0,
+                                0.0,
+                            ];
+
+                            if glyph.is_alpha_mask {
+                                flags |= shader_flags::TEXT_GLYPH;
+                                if has_shadow {
+                                    flags |= shader_flags::TEXT_EFFECT_SHADOW;
+                                }
+                                if !glyph.outline_color.is_fully_transparent() {
+                                    flags |= shader_flags::TEXT_EFFECT_OUTLINE;
+                                }
+                            } else if has_shadow {
+                                flags |= shader_flags::TEXT_EFFECT_SHADOW;
+                            }
 
                             // Specify the corners of the glyph
                             let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
@@ -1947,11 +2140,14 @@ pub fn prepare_uinodes(
                                     position: positions_clipped[i].into(),
                                     uv: uvs[i].into(),
                                     color,
-                                    flags: shader_flags::TEXTURED | shader_flags::CORNERS[i],
+                                    flags: flags | shader_flags::CORNERS[i],
                                     radius: [0.0; 4],
                                     border: [0.0; 4],
                                     size: rect_size.into(),
                                     point: [0.0; 2],
+                                    shadow_color,
+                                    outline_color,
+                                    effect_params,
                                 });
                             }
 
@@ -1964,7 +2160,15 @@ pub fn prepare_uinodes(
                         }
                     }
                 }
-                existing_batch.unwrap().1.range.end = vertices_index;
+                let Some(existing_batch) = existing_batch else {
+                    tracing::error!(
+                        "Skipping UI draw: missing batch for image {:?}",
+                        extracted_uinode.image
+                    );
+                    batch_image_handle = None;
+                    continue;
+                };
+                existing_batch.1.range.end = vertices_index;
                 ui_phase.items[batch_item_index].batch_range_mut().end += 1;
             }
         }

@@ -142,7 +142,7 @@ where
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
+        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
 
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
@@ -154,11 +154,7 @@ where
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format: key.target_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.target_format))],
                 ..default()
             }),
             label: Some("ui_material_pipeline".into()),
@@ -230,11 +226,11 @@ impl<P: PhaseItem, M: UiMaterial, const I: usize> RenderCommand<P> for SetMatUiV
         ui_meta: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        pass.set_bind_group(
-            I,
-            ui_meta.into_inner().view_bind_group.as_ref().unwrap(),
-            &[view_uniform.offset],
-        );
+        let Some(view_bind_group) = ui_meta.into_inner().view_bind_group.as_ref() else {
+            return RenderCommandResult::Failure("view_bind_group not available");
+        };
+
+        pass.set_bind_group(I, view_bind_group, &[view_uniform.offset]);
         RenderCommandResult::Success
     }
 }
@@ -283,7 +279,12 @@ impl<P: PhaseItem, M: UiMaterial> RenderCommand<P> for DrawUiMaterialNode<M> {
             return RenderCommandResult::Skip;
         };
 
-        pass.set_vertex_buffer(0, ui_meta.into_inner().vertices.buffer().unwrap().slice(..));
+        let ui_meta = ui_meta.into_inner();
+        let Some(vertices) = ui_meta.vertices.buffer() else {
+            return RenderCommandResult::Failure("missing vertices to draw ui material");
+        };
+
+        pass.set_vertex_buffer(0, vertices.slice(..));
         pass.draw(batch.range.clone(), 0..1);
         RenderCommandResult::Success
     }
@@ -533,7 +534,15 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
                     }
 
                     index += QUAD_INDICES.len() as u32;
-                    existing_batch.unwrap().1.range.end = index;
+                    let Some(existing_batch) = existing_batch else {
+                        tracing::error!(
+                            "Skipping UI material draw: missing batch for material {:?}",
+                            extracted_uinode.material
+                        );
+                        batch_shader_handle = None;
+                        continue;
+                    };
+                    existing_batch.1.range.end = index;
                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
                 } else {
                     batch_shader_handle = None;
@@ -630,7 +639,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             &pipeline_cache,
             &ui_material_pipeline,
             UiMaterialKey {
-                target_format: view.target_format,
+                target_format: ui_render_target_format(view.target_format),
                 bind_group_data: material.key.clone(),
             },
         );

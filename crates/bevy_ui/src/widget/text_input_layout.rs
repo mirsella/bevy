@@ -20,9 +20,9 @@ use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_text::{
     add_glyph_to_atlas, get_glyph_atlas_info, resolve_font_source, EditableText,
-    EditableTextGeneration, Font, FontAtlasKey, FontAtlasSet, FontCx, FontHinting, FontSize,
-    GlyphCacheKey, LayoutCx, LineBreak, LineHeight, PositionedGlyph, RemSize, RunGeometry, ScaleCx,
-    TextBrush, TextFont, TextLayout, TextLayoutInfo,
+    EditableTextGeneration, EditableTextPlaceholder, Font, FontAtlasKey, FontAtlasSet, FontCx,
+    FontHinting, FontSize, GlyphCacheKey, LayoutCx, LineBreak, LineHeight, PositionedGlyph,
+    RemSize, RunGeometry, ScaleCx, TextBrush, TextFont, TextLayout, TextLayoutInfo,
 };
 use bevy_time::{Real, Time};
 use parley::{BoundingBox, PositionedLayoutItem, StyleProperty};
@@ -271,6 +271,7 @@ pub fn update_editable_text_layout(
         &mut TextLayoutInfo,
         Ref<ComputedNode>,
         &mut EditableTextGeneration,
+        Option<Ref<EditableTextPlaceholder>>,
     )>,
     rem_size: Res<RemSize>,
     input_focus: Option<Res<InputFocus>>,
@@ -288,10 +289,12 @@ pub fn update_editable_text_layout(
         mut info,
         computed_node,
         mut generation,
+        placeholder,
     ) in input_field_query.iter_mut()
     {
         let cursor_width = editable_text.cursor_width;
         let cursor_blink_period = editable_text.cursor_blink_period;
+        let placeholder_changed = placeholder.as_ref().is_some_and(DetectChanges::is_changed);
 
         if computed_node.is_changed() {
             editable_text
@@ -299,189 +302,321 @@ pub fn update_editable_text_layout(
                 .set_width(Some(computed_node.content_box().width()));
         }
 
-        let mut driver = editable_text
-            .editor
-            .driver(font_cx.as_mut(), layout_cx.as_mut());
+        let layout_changed;
+        let placeholder_visible;
+        {
+            let mut driver = editable_text
+                .editor
+                .driver(font_cx.as_mut(), layout_cx.as_mut());
 
-        driver.refresh_layout();
+            driver.refresh_layout();
 
-        let compose_range = driver.editor.raw_compose().clone();
+            let compose_range = driver.editor.raw_compose().clone();
 
-        let layout_changed = driver.editor.generation() != **generation;
-        if layout_changed {
-            **generation = driver.editor.generation();
-        }
+            layout_changed = driver.editor.generation() != **generation;
+            if layout_changed {
+                **generation = driver.editor.generation();
+            }
 
-        if layout_changed || hinting.is_changed() {
-            let layout = driver.layout();
+            placeholder_visible = placeholder.as_ref().is_some_and(|placeholder| {
+                !placeholder.is_empty()
+                    && !driver.editor.is_composing()
+                    && driver.editor.text().into_iter().all(str::is_empty)
+            });
 
-            info.scale_factor = layout.scale();
-            info.size = (layout.full_width(), layout.height()).into();
+            if layout_changed || hinting.is_changed() {
+                let layout = driver.layout();
 
-            info.preedit_underline_rects.clear();
-            info.glyphs.clear();
-            info.run_geometry.clear();
+                info.scale_factor = layout.scale();
+                info.size = (layout.full_width(), layout.height()).into();
 
-            for (line_index, line) in layout.lines().enumerate() {
-                for item in line.items() {
-                    match item {
-                        PositionedLayoutItem::GlyphRun(glyph_run) => {
-                            let brush = glyph_run.style().brush;
+                info.preedit_underline_rects.clear();
+                info.glyphs.clear();
+                info.run_geometry.clear();
+                info.uses_text_effect_padding = false;
+                info.outline_atlas_width = None;
 
-                            let run = glyph_run.run();
+                for (line_index, line) in layout.lines().enumerate() {
+                    for item in line.items() {
+                        match item {
+                            PositionedLayoutItem::GlyphRun(glyph_run) => {
+                                let brush = glyph_run.style().brush;
 
-                            let font_data = run.font();
-                            let font_size = run.font_size();
-                            let coords = run.normalized_coords();
+                                let run = glyph_run.run();
 
-                            let font_atlas_key = FontAtlasKey {
-                                id: font_data.data.id() as u32,
-                                index: font_data.index,
-                                font_size_bits: font_size.to_bits(),
-                                variations_hash: FixedHasher.hash_one(coords),
-                                hinting: *hinting,
-                                font_smoothing: brush.font_smoothing,
-                            };
+                                let font_data = run.font();
+                                let font_size = run.font_size();
+                                let coords = run.normalized_coords();
 
-                            for glyph in glyph_run.positioned_glyphs() {
-                                let font_atlases =
-                                    font_atlas_set.entry(font_atlas_key).or_default();
-                                let Ok(atlas_info) = get_glyph_atlas_info(
-                                    font_atlases,
-                                    GlyphCacheKey {
-                                        glyph_id: glyph.id as u16,
-                                    },
-                                )
-                                .map(Ok)
-                                .unwrap_or_else(|| {
-                                    let font_ref = FontRef::from_index(
-                                        font_data.data.as_ref(),
-                                        font_data.index as usize,
-                                    )
-                                    .unwrap();
-                                    let mut scaler = scale_cx
-                                        .builder(font_ref)
-                                        .size(font_size)
-                                        .hint(matches!(*hinting, FontHinting::Enabled))
-                                        .normalized_coords(coords)
-                                        .build();
-                                    add_glyph_to_atlas(
-                                        font_atlases,
-                                        textures.as_mut(),
-                                        &mut scaler,
-                                        text_font.font_smoothing,
-                                        glyph.id as u16,
-                                    )
-                                }) else {
-                                    continue;
+                                let font_atlas_key = FontAtlasKey {
+                                    id: font_data.data.id() as u32,
+                                    index: font_data.index,
+                                    font_size_bits: font_size.to_bits(),
+                                    variations_hash: FixedHasher.hash_one(coords),
+                                    hinting: *hinting,
+                                    font_smoothing: brush.font_smoothing,
+                                    text_effect_padding: false,
+                                    outline_width_bits: None,
                                 };
 
-                                info.glyphs.push(PositionedGlyph {
-                                    position: Vec2::new(glyph.x, glyph.y)
-                                        + atlas_info.rect.size() / 2.
-                                        + atlas_info.offset,
-                                    atlas_info,
-                                    section_index: brush.section_index as usize,
-                                    line_index,
-                                });
-                            }
+                                for glyph in glyph_run.positioned_glyphs() {
+                                    let font_atlases =
+                                        font_atlas_set.entry(font_atlas_key).or_default();
+                                    let Ok(atlas_info) = get_glyph_atlas_info(
+                                        font_atlases,
+                                        GlyphCacheKey {
+                                            glyph_id: glyph.id as u16,
+                                        },
+                                    )
+                                    .map(Ok)
+                                    .unwrap_or_else(|| {
+                                        let font_ref = FontRef::from_index(
+                                            font_data.data.as_ref(),
+                                            font_data.index as usize,
+                                        )
+                                        .unwrap();
+                                        let mut scaler = scale_cx
+                                            .builder(font_ref)
+                                            .size(font_size)
+                                            .hint(matches!(*hinting, FontHinting::Enabled))
+                                            .normalized_coords(coords)
+                                            .build();
+                                        add_glyph_to_atlas(
+                                            font_atlases,
+                                            textures.as_mut(),
+                                            &mut scaler,
+                                            text_font.font_smoothing,
+                                            glyph.id as u16,
+                                            false,
+                                            None,
+                                        )
+                                    }) else {
+                                        continue;
+                                    };
 
-                            let metrics = run.metrics();
-                            let underline_y = glyph_run.baseline() - metrics.underline_offset;
-                            let underline_thickness = metrics.underline_size;
-
-                            let run_text_range = run.text_range();
-                            if let Some(cr) = &compose_range
-                                && run_text_range.start < cr.end
-                                && run_text_range.end > cr.start
-                            {
-                                let mut x = glyph_run.offset();
-                                let mut underline_start_x = None;
-                                let mut underline_end_x = x;
-
-                                for cluster in run.visual_clusters() {
-                                    let ct = cluster.text_range();
-                                    if ct.start < cr.end && ct.end > cr.start {
-                                        underline_start_x.get_or_insert(x);
-                                        underline_end_x = x + cluster.advance();
-                                    }
-                                    x += cluster.advance();
-                                }
-
-                                if let Some(start_x) = underline_start_x {
-                                    info.preedit_underline_rects.push(Rect {
-                                        min: Vec2::new(start_x, underline_y),
-                                        max: Vec2::new(
-                                            underline_end_x,
-                                            underline_y + underline_thickness,
-                                        ),
+                                    info.glyphs.push(PositionedGlyph {
+                                        position: Vec2::new(glyph.x, glyph.y)
+                                            + atlas_info.rect.size() / 2.
+                                            + atlas_info.offset,
+                                        atlas_info,
+                                        section_index: brush.section_index as usize,
+                                        line_index,
                                     });
                                 }
-                            }
 
-                            info.run_geometry.push(RunGeometry {
-                                section_index: brush.section_index as usize,
-                                bounds: Rect {
-                                    min: Vec2::new(
-                                        glyph_run.offset(),
-                                        line.metrics().block_min_coord,
-                                    ),
-                                    max: Vec2::new(
-                                        glyph_run.offset() + glyph_run.advance(),
-                                        line.metrics().block_max_coord,
-                                    ),
-                                },
-                                strikethrough_y: glyph_run.baseline()
-                                    - metrics.strikethrough_offset,
-                                strikethrough_thickness: metrics.strikethrough_size,
-                                underline_y,
-                                underline_thickness,
-                            });
+                                let metrics = run.metrics();
+                                let underline_y = glyph_run.baseline() - metrics.underline_offset;
+                                let underline_thickness = metrics.underline_size;
+
+                                let run_text_range = run.text_range();
+                                if let Some(cr) = &compose_range
+                                    && run_text_range.start < cr.end
+                                    && run_text_range.end > cr.start
+                                {
+                                    let mut x = glyph_run.offset();
+                                    let mut underline_start_x = None;
+                                    let mut underline_end_x = x;
+
+                                    for cluster in run.visual_clusters() {
+                                        let ct = cluster.text_range();
+                                        if ct.start < cr.end && ct.end > cr.start {
+                                            underline_start_x.get_or_insert(x);
+                                            underline_end_x = x + cluster.advance();
+                                        }
+                                        x += cluster.advance();
+                                    }
+
+                                    if let Some(start_x) = underline_start_x {
+                                        info.preedit_underline_rects.push(Rect {
+                                            min: Vec2::new(start_x, underline_y),
+                                            max: Vec2::new(
+                                                underline_end_x,
+                                                underline_y + underline_thickness,
+                                            ),
+                                        });
+                                    }
+                                }
+
+                                info.run_geometry.push(RunGeometry {
+                                    section_index: brush.section_index as usize,
+                                    bounds: Rect {
+                                        min: Vec2::new(
+                                            glyph_run.offset(),
+                                            line.metrics().block_min_coord,
+                                        ),
+                                        max: Vec2::new(
+                                            glyph_run.offset() + glyph_run.advance(),
+                                            line.metrics().block_max_coord,
+                                        ),
+                                    },
+                                    strikethrough_y: glyph_run.baseline()
+                                        - metrics.strikethrough_offset,
+                                    strikethrough_thickness: metrics.strikethrough_size,
+                                    underline_y,
+                                    underline_thickness,
+                                });
+                            }
+                            PositionedLayoutItem::InlineBox(_inline) => {
+                                // TODO: handle inline boxes
+                            }
                         }
-                        PositionedLayoutItem::InlineBox(_inline) => {
-                            // TODO: handle inline boxes
-                        }
+                    }
+                }
+
+                info.selection_rects = driver
+                    .editor
+                    .selection_geometry()
+                    .iter()
+                    .map(|&b| bounding_box_to_rect(b.0))
+                    .collect();
+
+                for i in 0..info.selection_rects.len().saturating_sub(1) {
+                    let [a, b] = &mut info.selection_rects[i..i + 2] else {
+                        unreachable!();
+                    };
+                    if a.max.y < b.min.y {
+                        a.max.y = b.min.y;
                     }
                 }
             }
 
-            info.selection_rects = driver
-                .editor
-                .selection_geometry()
-                .iter()
-                .map(|&b| bounding_box_to_rect(b.0))
-                .collect();
-
-            for i in 0..info.selection_rects.len().saturating_sub(1) {
-                let [a, b] = &mut info.selection_rects[i..i + 2] else {
-                    unreachable!();
-                };
-                if a.max.y < b.min.y {
-                    a.max.y = b.min.y;
+            if let Some(input_focus) = input_focus.as_ref()
+                && Some(entity) == input_focus.get()
+            {
+                if input_focus.is_changed()
+                    || layout_changed
+                    || *cursor_timer >= cursor_blink_period
+                {
+                    *cursor_timer = Duration::ZERO;
                 }
+
+                info.cursor = driver
+                    .editor
+                    .cursor_geometry(
+                        cursor_width * text_font.font_size.eval(target.logical_size(), rem_size.0),
+                    )
+                    .map(bounding_box_to_rect)
+                    .map(|rect| (*cursor_timer < cursor_blink_period / 2, rect));
+            } else {
+                info.cursor = driver
+                    .editor
+                    .cursor_geometry(0.)
+                    .map(bounding_box_to_rect)
+                    .map(|rect| (false, rect));
             }
         }
 
-        if let Some(input_focus) = input_focus.as_ref()
-            && Some(entity) == input_focus.get()
-        {
-            if input_focus.is_changed() || layout_changed || *cursor_timer >= cursor_blink_period {
-                *cursor_timer = Duration::ZERO;
+        if placeholder_visible {
+            if layout_changed
+                || hinting.is_changed()
+                || placeholder_changed
+                || info.placeholder_glyphs.is_empty()
+            {
+                let placeholder = placeholder.as_deref().expect("placeholder is visible");
+                update_editable_text_placeholder_layout(
+                    placeholder,
+                    &editable_text,
+                    text_font,
+                    *hinting,
+                    &mut font_cx,
+                    &mut layout_cx,
+                    &mut scale_cx,
+                    &mut font_atlas_set,
+                    &mut textures,
+                    &mut info,
+                );
             }
+        } else if !info.placeholder_glyphs.is_empty() {
+            info.placeholder_glyphs.clear();
+        }
+    }
+}
 
-            info.cursor = driver
-                .editor
-                .cursor_geometry(
-                    cursor_width * text_font.font_size.eval(target.logical_size(), rem_size.0),
-                )
-                .map(bounding_box_to_rect)
-                .map(|rect| (*cursor_timer < cursor_blink_period / 2, rect));
-        } else {
-            info.cursor = driver
-                .editor
-                .cursor_geometry(0.)
-                .map(bounding_box_to_rect)
-                .map(|rect| (false, rect));
+fn update_editable_text_placeholder_layout(
+    placeholder: &EditableTextPlaceholder,
+    editable_text: &EditableText,
+    text_font: &TextFont,
+    hinting: FontHinting,
+    font_cx: &mut FontCx,
+    layout_cx: &mut LayoutCx,
+    scale_cx: &mut ScaleCx,
+    font_atlas_set: &mut FontAtlasSet,
+    textures: &mut Assets<Image>,
+    info: &mut TextLayoutInfo,
+) {
+    info.placeholder_glyphs.clear();
+
+    let mut placeholder_editor = editable_text.editor.clone();
+    placeholder_editor.set_text(placeholder.as_str());
+
+    let mut driver = placeholder_editor.driver(font_cx, &mut layout_cx.0);
+    driver.refresh_layout();
+
+    for (line_index, line) in driver.layout().lines().enumerate() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+
+            let brush = glyph_run.style().brush;
+            let run = glyph_run.run();
+            let font_data = run.font();
+            let font_size = run.font_size();
+            let coords = run.normalized_coords();
+            let font_atlas_key = FontAtlasKey {
+                id: font_data.data.id() as u32,
+                index: font_data.index,
+                font_size_bits: font_size.to_bits(),
+                variations_hash: FixedHasher.hash_one(coords),
+                hinting,
+                font_smoothing: brush.font_smoothing,
+                text_effect_padding: false,
+                outline_width_bits: None,
+            };
+
+            for glyph in glyph_run.positioned_glyphs() {
+                let Ok(glyph_id) = u16::try_from(glyph.id) else {
+                    continue;
+                };
+                let Some(font_ref) =
+                    FontRef::from_index(font_data.data.as_ref(), font_data.index as usize)
+                else {
+                    continue;
+                };
+
+                let font_atlases = font_atlas_set.entry(font_atlas_key).or_default();
+                let Ok(atlas_info) = get_glyph_atlas_info(font_atlases, GlyphCacheKey { glyph_id })
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        let mut scaler = scale_cx
+                            .builder(font_ref)
+                            .size(font_size)
+                            .hint(matches!(hinting, FontHinting::Enabled))
+                            .normalized_coords(coords)
+                            .build();
+                        add_glyph_to_atlas(
+                            font_atlases,
+                            textures,
+                            &mut scaler,
+                            text_font.font_smoothing,
+                            glyph_id,
+                            false,
+                            None,
+                        )
+                    })
+                else {
+                    continue;
+                };
+
+                info.placeholder_glyphs.push(PositionedGlyph {
+                    position: Vec2::new(glyph.x, glyph.y)
+                        + atlas_info.rect.size() / 2.
+                        + atlas_info.offset,
+                    atlas_info,
+                    section_index: brush.section_index as usize,
+                    line_index,
+                });
+            }
         }
     }
 }

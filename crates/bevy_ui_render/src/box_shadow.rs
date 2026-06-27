@@ -33,7 +33,10 @@ use bevy_ui::{
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
 
-use crate::{BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap};
+use crate::{
+    pipeline::{ui_color_target_state, ui_render_target_format, MANUAL_SRGB_SHADER_DEF},
+    BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap,
+};
 
 use super::{stack_z_offsets, UiCameraView, QUAD_INDICES, QUAD_VERTEX_POSITIONS};
 
@@ -153,10 +156,10 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = vec![ShaderDefVal::UInt(
-            "SHADOW_SAMPLES".to_string(),
-            key.samples,
-        )];
+        let shader_defs = vec![
+            ShaderDefVal::UInt("SHADOW_SAMPLES".to_string(), key.samples),
+            MANUAL_SRGB_SHADER_DEF.into(),
+        ];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -168,11 +171,7 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format: key.target_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.target_format))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone()],
@@ -329,7 +328,7 @@ pub fn queue_shadows(
             &pipeline_cache,
             &box_shadow_pipeline,
             BoxShadowPipelineKey {
-                target_format: view.target_format,
+                target_format: ui_render_target_format(view.target_format),
                 samples: shadow_samples.copied().unwrap_or_default().0,
             },
         );

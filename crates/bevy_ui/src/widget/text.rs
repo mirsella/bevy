@@ -3,7 +3,7 @@ use crate::{
     Node, NodeMeasure,
 };
 use bevy_asset::Assets;
-use bevy_color::Color;
+use bevy_color::{Alpha, Color};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     change_detection::DetectChanges,
@@ -19,9 +19,10 @@ use bevy_log::warn_once;
 use bevy_math::Vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_text::{
-    ComputedTextBlock, Font, FontAtlasSet, FontCx, FontHinting, LayoutCx, LetterSpacing, LineBreak,
-    LineHeight, RemSize, ScaleCx, TextBounds, TextColor, TextError, TextFont, TextLayout,
-    TextLayoutInfo, TextMeasureInfo, TextPipeline, TextReader, TextSection, TextWriter,
+    text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock, Font, FontAtlasSet,
+    FontCx, FontHinting, LayoutCx, LetterSpacing, LineBreak, LineHeight, RemSize, ScaleCx,
+    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo,
+    TextPipeline, TextReader, TextSection, TextWriter,
 };
 use taffy::{style::AvailableSpace, MaybeMath};
 use tracing::error;
@@ -156,6 +157,25 @@ impl Default for TextShadow {
         Self {
             offset: Vec2::splat(4.),
             color: Color::linear_rgba(0., 0., 0., 0.75),
+        }
+    }
+}
+
+/// Adds an outline around UI text.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct TextOutline {
+    /// Outline width in logical pixels.
+    pub width: f32,
+    /// Outline color.
+    pub color: Color,
+}
+
+impl Default for TextOutline {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            color: Color::BLACK,
         }
     }
 }
@@ -342,19 +362,57 @@ pub fn text_system(
     mut font_atlas_set: ResMut<FontAtlasSet>,
     mut text_pipeline: ResMut<TextPipeline>,
     mut text_query: Query<(
+        Entity,
         Ref<ComputedNode>,
         &TextLayout,
         &mut TextLayoutInfo,
         &mut TextNodeFlags,
         &mut ComputedTextBlock,
         Ref<FontHinting>,
+        Option<Ref<TextShadow>>,
+        Option<Ref<TextOutline>>,
     )>,
     mut scale_cx: ResMut<ScaleCx>,
 ) {
-    for (node, block, mut text_layout_info, mut text_flags, mut computed, hinting) in
-        &mut text_query
+    for (
+        entity,
+        node,
+        block,
+        mut text_layout_info,
+        mut text_flags,
+        mut computed,
+        hinting,
+        maybe_shadow,
+        maybe_outline,
+    ) in &mut text_query
     {
-        if node.is_changed() || text_flags.needs_recompute || hinting.is_changed() {
+        let scale_factor = node.inverse_scale_factor().recip();
+        let shadow_offset = maybe_shadow
+            .as_deref()
+            .filter(|shadow| !shadow.color.is_fully_transparent())
+            .and_then(|shadow| {
+                text_effect_shadow_offset(shadow.offset, scale_factor, entity, "TextShadow")
+            });
+        let outline_width = maybe_outline
+            .as_deref()
+            .filter(|outline| !outline.color.is_fully_transparent())
+            .and_then(|outline| {
+                text_effect_outline_width(outline.width, scale_factor, entity, "TextOutline")
+            });
+        let text_effect_padding = shadow_offset.is_some() || outline_width.is_some();
+        let outline_changed = maybe_outline
+            .as_ref()
+            .is_some_and(DetectChanges::is_changed);
+        let text_effect_changed = text_layout_info.uses_text_effect_padding != text_effect_padding
+            || text_layout_info.outline_atlas_width.map(f32::to_bits)
+                != outline_width.map(f32::to_bits);
+
+        if node.is_changed()
+            || text_flags.needs_recompute
+            || hinting.is_changed()
+            || outline_changed
+            || text_effect_changed
+        {
             // Skip the text node if it is waiting for a new measure func
             if text_flags.needs_measure_fn {
                 continue;
@@ -377,6 +435,8 @@ pub fn text_system(
                 physical_node_size,
                 block.justify,
                 *hinting,
+                text_effect_padding,
+                outline_width,
             ) {
                 Err(
                     TextError::NoSuchFont
@@ -400,7 +460,7 @@ pub fn text_system(
                     panic!("Fatal error when processing text: {e}.");
                 }
                 Ok(()) => {
-                    text_layout_info.scale_factor = node.inverse_scale_factor().recip();
+                    text_layout_info.scale_factor = scale_factor;
                     text_layout_info.size *= node.inverse_scale_factor();
                     text_flags.needs_recompute = false;
                 }
