@@ -1,6 +1,12 @@
 #import bevy_render::view::View;
 #import bevy_render::globals::Globals;
 
+#ifdef MANUAL_SRGB
+fn linear_to_gamma_2_2(color: vec3<f32>) -> vec3<f32> {
+    return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+#endif
+
 @group(0) @binding(0)
 var<uniform> view: View;
 @group(0) @binding(1)
@@ -123,5 +129,10 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     // map the slice coords to texture coords
     let atlas_uv = in.atlas_rect.xy + uv * (in.atlas_rect.zw - in.atlas_rect.xy);
 
-    return in.color * textureSample(sprite_texture, sprite_sampler, atlas_uv);
+    let color = in.color * textureSample(sprite_texture, sprite_sampler, atlas_uv);
+#ifdef MANUAL_SRGB
+    return vec4(linear_to_gamma_2_2(color.rgb), color.a);
+#else
+    return color;
+#endif
 }

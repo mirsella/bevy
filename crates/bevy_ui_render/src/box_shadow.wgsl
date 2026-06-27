@@ -1,6 +1,12 @@
 #import bevy_render::view::View;
 #import bevy_render::globals::Globals;
 
+#ifdef MANUAL_SRGB
+fn linear_to_gamma_2_2(color: vec3<f32>) -> vec3<f32> {
+    return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+#endif
+
 const PI: f32 = 3.14159265358979323846;
 const SAMPLES: i32 = #SHADOW_SAMPLES;
 
@@ -91,8 +97,10 @@ fn fragment(
     in: BoxShadowVertexOutput,
 ) -> @location(0) vec4<f32> {
     let g = in.color.a * roundedBoxShadow(-0.5 * in.size, 0.5 * in.size, in.point, max(in.blur, 0.01), in.radius);
+#ifdef MANUAL_SRGB
+    return vec4(linear_to_gamma_2_2(in.color.rgb), g);
+#else
     return vec4(in.color.rgb, g);
+#endif
 }
-
-
 

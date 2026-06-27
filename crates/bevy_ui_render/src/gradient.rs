@@ -190,11 +190,12 @@ impl SpecializedRenderPipeline for GradientPipeline {
             InterpolationColorSpace::HsvaLong => "IN_HSV_LONG",
         };
 
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec![color_space.into(), "ANTI_ALIAS".into()]
         } else {
             vec![color_space.into()]
         };
+        shader_defs.push(MANUAL_SRGB_SHADER_DEF.into());
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -206,11 +207,7 @@ impl SpecializedRenderPipeline for GradientPipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format: key.target_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.target_format))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone()],
@@ -395,7 +392,9 @@ pub fn extract_gradients(
                     extracted_uinodes.uinodes.push(ExtractedUiNode {
                         z_order: stack_index.0 as f32
                             + match node_type {
-                                NodeType::Rect | NodeType::Inverted => stack_z_offsets::GRADIENT,
+                                NodeType::Rect | NodeType::Viewport | NodeType::Inverted => {
+                                    stack_z_offsets::GRADIENT
+                                }
                                 NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
                             },
                         image: AssetId::default(),
@@ -610,7 +609,7 @@ pub fn queue_gradient(
             UiGradientPipelineKey {
                 anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
                 color_space: gradient.color_space,
-                target_format: view.target_format,
+                target_format: ui_render_target_format(view.target_format),
             },
         );
 
@@ -621,7 +620,9 @@ pub fn queue_gradient(
             sort_key: FloatOrd(
                 gradient.stack_index as f32
                     + match gradient.node_type {
-                        NodeType::Rect | NodeType::Inverted => stack_z_offsets::GRADIENT,
+                        NodeType::Rect | NodeType::Viewport | NodeType::Inverted => {
+                            stack_z_offsets::GRADIENT
+                        }
                         NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
                     },
             ),

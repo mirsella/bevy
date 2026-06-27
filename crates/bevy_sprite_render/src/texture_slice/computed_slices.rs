@@ -39,6 +39,7 @@ impl ComputedTextureSlices {
             offset: slice.offset * flip - anchor,
             rect: slice.texture_rect,
             size: slice.draw_size,
+            text_effect: Default::default(),
         })
     }
 }

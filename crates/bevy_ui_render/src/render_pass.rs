@@ -2,7 +2,8 @@ use core::ops::Range;
 
 use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
 
-use crate::UiCameraView;
+use crate::{SrgbUiCompositeBindGroup, SrgbUiCompositePipelineId, SrgbUiTexture, UiCameraView};
+use bevy_color::LinearRgba;
 use bevy_ecs::{
     entity::EntityHash,
     prelude::*,
@@ -13,30 +14,28 @@ use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
     render_phase::*,
-    render_resource::{CachedRenderPipelineId, RenderPassDescriptor},
+    render_resource::{
+        CachedRenderPipelineId, LoadOp, Operations, PipelineCache, RenderPassColorAttachment,
+        RenderPassDescriptor, StoreOp,
+    },
     renderer::{RenderContext, ViewQuery},
     sync_world::MainEntity,
     view::*,
 };
 use indexmap::IndexMap;
-use tracing::error;
+use tracing::{error, warn};
 
 pub fn ui_pass(
     world: &World,
-    view: ViewQuery<&UiCameraView>,
-    ui_view_query: Query<(&ExtractedView, &UiViewTarget)>,
-    ui_view_target_query: Query<(&ViewTarget, &ExtractedCamera)>,
+    view: ViewQuery<(&UiCameraView, &ExtractedCamera), With<ViewTarget>>,
+    ui_view_query: Query<(&ExtractedView, Option<&SrgbUiTexture>), With<UiViewTarget>>,
     transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
     mut ctx: RenderContext,
 ) {
-    let ui_camera_view = view.into_inner();
+    let (ui_camera_view, camera) = view.into_inner();
     let ui_view_entity = ui_camera_view.0;
 
-    let Ok((extracted_view, ui_view_target)) = ui_view_query.get(ui_view_entity) else {
-        return;
-    };
-
-    let Ok((target, camera)) = ui_view_target_query.get(ui_view_target.0) else {
+    let Ok((extracted_view, srgb_texture)) = ui_view_query.get(ui_view_entity) else {
         return;
     };
 
@@ -50,12 +49,25 @@ pub fn ui_pass(
         return;
     }
 
+    let Some(srgb_texture) = srgb_texture else {
+        warn!("Skipping UI pass for {ui_view_entity:?}: missing sRGB UI texture");
+        return;
+    };
+
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("ui"),
-        color_attachments: &[Some(target.get_unsampled_color_attachment())],
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: &srgb_texture.texture.default_view,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Clear(LinearRgba::NONE.into()),
+                store: StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
@@ -72,6 +84,66 @@ pub fn ui_pass(
     }
 
     pass_span.end(&mut render_pass);
+}
+
+pub fn srgb_ui_composite_pass(
+    view: ViewQuery<(&UiCameraView, &ViewTarget)>,
+    ui_view_query: Query<
+        (
+            &ExtractedView,
+            Option<&SrgbUiCompositeBindGroup>,
+            Option<&SrgbUiCompositePipelineId>,
+        ),
+        With<UiViewTarget>,
+    >,
+    transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
+    pipeline_cache: Res<PipelineCache>,
+    mut ctx: RenderContext,
+) {
+    let (ui_camera_view, target) = view.into_inner();
+    let ui_view_entity = ui_camera_view.0;
+
+    let Ok((extracted_view, composite_bind_group, pipeline_id)) = ui_view_query.get(ui_view_entity)
+    else {
+        return;
+    };
+
+    let Some(transparent_phase) =
+        transparent_render_phases.get(&extracted_view.retained_view_entity)
+    else {
+        return;
+    };
+    if transparent_phase.items.is_empty() {
+        return;
+    }
+
+    let Some(composite_bind_group) = composite_bind_group else {
+        warn!(
+            "Skipping sRGB UI composite pass for {ui_view_entity:?}: missing composite bind group"
+        );
+        return;
+    };
+    let Some(pipeline_id) = pipeline_id else {
+        warn!("Skipping sRGB UI composite pass for {ui_view_entity:?}: missing composite pipeline");
+        return;
+    };
+
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
+        return;
+    };
+
+    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("srgb_ui_composite_pass"),
+        color_attachments: &[Some(target.get_color_attachment())],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    render_pass.set_render_pipeline(pipeline);
+    render_pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
+    render_pass.draw(0..3, 0..1);
 }
 
 pub struct TransparentUi {
@@ -200,7 +272,15 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<I>
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(I, image_bind_groups.values.get(&batch.image).unwrap(), &[]);
+        let Some(bind_group) = image_bind_groups.values.get(&batch.image) else {
+            error!(
+                "Skipping UI draw: missing bind group for image {:?}",
+                batch.image
+            );
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_bind_group(I, bind_group, &[]);
         RenderCommandResult::Success
     }
 }

@@ -311,6 +311,8 @@ impl TextPipeline {
         bounds: TextBounds,
         justify: Justify,
         hinting: FontHinting,
+        text_effect_padding: bool,
+        outline_width: Option<f32>,
     ) -> Result<(), TextError> {
         computed.needs_rerender = false;
         layout_info.clear();
@@ -335,6 +337,8 @@ impl TextPipeline {
                         variations_hash,
                         hinting,
                         font_smoothing,
+                        text_effect_padding,
+                        outline_width_bits: outline_width.map(f32::to_bits),
                     };
 
                     let Some(font_ref) =
@@ -351,7 +355,6 @@ impl TextPipeline {
                         };
 
                         let font_atlases = font_atlas_set.entry(font_atlas_key).or_default();
-
                         let atlas_info = match get_glyph_atlas_info(
                             font_atlases,
                             crate::GlyphCacheKey { glyph_id },
@@ -378,6 +381,8 @@ impl TextPipeline {
                                     maybe_scaler.as_mut().unwrap(),
                                     font_smoothing,
                                     glyph_id,
+                                    text_effect_padding,
+                                    outline_width,
                                 )?
                             }
                         };
@@ -417,6 +422,8 @@ impl TextPipeline {
         }
 
         layout_info.size = Vec2::new(layout.full_width(), layout.height()).ceil();
+        layout_info.uses_text_effect_padding = text_effect_padding;
+        layout_info.outline_atlas_width = outline_width;
 
         Ok(())
     }
@@ -474,8 +481,14 @@ pub fn resolve_font_source<'a>(
 pub struct TextLayoutInfo {
     /// The target scale factor for this text layout
     pub scale_factor: f32,
+    /// Whether the cached glyph rects include effect padding.
+    pub uses_text_effect_padding: bool,
+    /// Physical outline width used to build the cached atlas glyphs.
+    pub outline_atlas_width: Option<f32>,
     /// Scaled and positioned glyphs in screenspace
     pub glyphs: Vec<PositionedGlyph>,
+    /// Scaled and positioned placeholder glyphs in screenspace.
+    pub placeholder_glyphs: Vec<PositionedGlyph>,
     /// Geometry of each text run used to render text decorations like background colors, strikethrough, and underline.
     /// A run in `bevy_text` is a contiguous sequence of glyphs on a line that share the same text attributes like font,
     /// font size, and line height. A text entity that extends over multiple lines will have multiple corresponding runs.
@@ -497,7 +510,10 @@ impl TextLayoutInfo {
     /// Clear the layout, retaining capacity
     pub fn clear(&mut self) {
         self.scale_factor = 1.;
+        self.uses_text_effect_padding = false;
+        self.outline_atlas_width = None;
         self.glyphs.clear();
+        self.placeholder_glyphs.clear();
         self.run_geometry.clear();
         self.size = Vec2::ZERO;
         self.cursor = None;

@@ -5,7 +5,7 @@ use bevy_camera::visibility::{
     self, NoFrustumCulling, RenderLayers, Visibility, VisibilityClass, VisibleEntities,
 };
 use bevy_camera::Camera;
-use bevy_color::Color;
+use bevy_color::{Alpha, Color};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::query::With;
@@ -22,9 +22,10 @@ use bevy_image::prelude::*;
 use bevy_math::{FloatOrd, Vec2, Vec3};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_text::{
-    ComputedTextBlock, Font, FontAtlasSet, FontCx, FontHinting, LayoutCx, LetterSpacing, LineBreak,
-    LineHeight, RemSize, ScaleCx, TextBounds, TextColor, TextError, TextFont, TextLayout,
-    TextLayoutInfo, TextPipeline, TextReader, TextSection, TextWriter,
+    text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock, Font, FontAtlasSet,
+    FontCx, FontHinting, LayoutCx, LetterSpacing, LineBreak, LineHeight, RemSize, ScaleCx,
+    TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextPipeline,
+    TextReader, TextSection, TextWriter,
 };
 use bevy_transform::components::Transform;
 use bevy_window::{PrimaryWindow, Window};
@@ -157,6 +158,25 @@ impl Default for Text2dShadow {
     }
 }
 
+/// Adds an outline around `Text2d` text.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct Text2dOutline {
+    /// Outline width in logical pixels.
+    pub width: f32,
+    /// Outline color.
+    pub color: Color,
+}
+
+impl Default for Text2dOutline {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            color: Color::BLACK,
+        }
+    }
+}
+
 /// Updates the layout and size information whenever the text or style is changed.
 /// This information is computed by the [`TextPipeline`] on insertion, then stored.
 ///
@@ -183,6 +203,8 @@ pub fn update_text2d_layout(
         &mut TextLayoutInfo,
         &mut ComputedTextBlock,
         Ref<FontHinting>,
+        Option<Ref<Text2dShadow>>,
+        Option<Ref<Text2dOutline>>,
     )>,
     mut text_reader: Text2dReader,
     mut font_system: ResMut<FontCx>,
@@ -225,6 +247,8 @@ pub fn update_text2d_layout(
         mut text_layout_info,
         mut computed,
         hinting,
+        maybe_shadow,
+        maybe_outline,
     ) in &mut text_query
     {
         let entity_mask = maybe_entity_mask.unwrap_or_default();
@@ -246,10 +270,32 @@ pub fn update_text2d_layout(
             *scale_factor
         };
 
+        let shadow_offset = maybe_shadow
+            .as_deref()
+            .filter(|shadow| !shadow.color.is_fully_transparent())
+            .and_then(|shadow| {
+                text_effect_shadow_offset(shadow.offset, scale_factor, entity, "Text2dShadow")
+            });
+        let outline_width = maybe_outline
+            .as_deref()
+            .filter(|outline| !outline.color.is_fully_transparent())
+            .and_then(|outline| {
+                text_effect_outline_width(outline.width, scale_factor, entity, "Text2dOutline")
+            });
+        let text_effect_padding = shadow_offset.is_some() || outline_width.is_some();
+        let outline_changed = maybe_outline
+            .as_ref()
+            .is_some_and(DetectChanges::is_changed);
+        let text_effect_changed = text_layout_info.uses_text_effect_padding != text_effect_padding
+            || text_layout_info.outline_atlas_width.map(f32::to_bits)
+                != outline_width.map(f32::to_bits);
+
         let text_changed = scale_factor != text_layout_info.scale_factor
             || text2d.is_changed()
             || block.is_changed()
             || computed.needs_rerender(viewport_size_changed, rem_size.is_changed())
+            || outline_changed
+            || text_effect_changed
             || (!reprocess_queue.is_empty() && reprocess_queue.remove(&entity));
 
         if !(text_changed || bounds.is_changed() || hinting.is_changed()) {
@@ -314,6 +360,8 @@ pub fn update_text2d_layout(
             text_bounds,
             block.justify,
             *hinting,
+            text_effect_padding,
+            outline_width,
         ) {
             Err(TextError::NoSuchFont | TextError::NoSuchFontFamily(_)) => {
                 // There was an error processing the text layout.

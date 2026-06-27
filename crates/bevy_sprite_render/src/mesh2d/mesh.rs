@@ -10,6 +10,7 @@ use bevy_shader::{load_shader_library, Shader, ShaderDefVal, ShaderSettings};
 use crate::{
     prepare_pending_mesh_material2d_queues, tonemapping_pipeline_key, Material2dBindGroupId,
     PendingMeshMaterial2dQueues, RenderMaterial2dBindGroupIds, RenderMaterial2dIds,
+    SrgbTransparent2d,
 };
 use bevy_core_pipeline::{
     core_2d::{AlphaMask2d, Opaque2d, Transparent2d, CORE_2D_DEPTH_FORMAT},
@@ -106,6 +107,8 @@ impl Plugin for Mesh2dRenderPlugin {
                         batch_and_prepare_binned_render_phase::<AlphaMask2d, Mesh2dPipeline>
                             .in_set(RenderSystems::PrepareResources),
                         batch_and_prepare_sorted_render_phase::<Transparent2d, Mesh2dPipeline>
+                            .in_set(RenderSystems::PrepareResources),
+                        batch_and_prepare_sorted_render_phase::<SrgbTransparent2d, Mesh2dPipeline>
                             .in_set(RenderSystems::PrepareResources),
                         write_batched_instance_buffer::<Mesh2dPipeline>
                             .in_set(RenderSystems::PrepareResourcesFlush),
@@ -689,6 +692,30 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
             depth_write_enabled = true;
         }
 
+        // Blend materials queued into SrgbTransparent2d must match the depth-free
+        // sRGB sprite pass, otherwise the main 2D depth buffer can reject them.
+        let depth_stencil =
+            if key.contains(Mesh2dPipelineKey::SRGB_COMPOSITING | Mesh2dPipelineKey::BLEND_ALPHA) {
+                None
+            } else {
+                Some(DepthStencilState {
+                    format: CORE_2D_DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write_enabled),
+                    depth_compare: Some(CompareFunction::GreaterEqual),
+                    stencil: StencilState {
+                        front: StencilFaceState::IGNORE,
+                        back: StencilFaceState::IGNORE,
+                        read_mask: 0,
+                        write_mask: 0,
+                    },
+                    bias: DepthBiasState {
+                        constant: 0,
+                        slope_scale: 0.0,
+                        clamp: 0.0,
+                    },
+                })
+            };
+
         Ok(RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.shader.clone(),
@@ -716,22 +743,7 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
                 topology: key.primitive_topology(),
                 strip_index_format: key.strip_index_format(),
             },
-            depth_stencil: Some(DepthStencilState {
-                format: CORE_2D_DEPTH_FORMAT,
-                depth_write_enabled: Some(depth_write_enabled),
-                depth_compare: Some(CompareFunction::GreaterEqual),
-                stencil: StencilState {
-                    front: StencilFaceState::IGNORE,
-                    back: StencilFaceState::IGNORE,
-                    read_mask: 0,
-                    write_mask: 0,
-                },
-                bias: DepthBiasState {
-                    constant: 0,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
-                },
-            }),
+            depth_stencil,
             multisample: MultisampleState {
                 count: key.msaa_samples(),
                 mask: !0,

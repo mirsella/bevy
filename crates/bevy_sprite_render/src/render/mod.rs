@@ -2,17 +2,17 @@ use core::ops::Range;
 
 use crate::ComputedTextureSlices;
 use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, AssetServer, Assets, Handle};
-use bevy_camera::visibility::ViewVisibility;
+use bevy_camera::{visibility::ViewVisibility, Camera, Camera2d};
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_core_pipeline::{
-    core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
     tonemapping::{
-        get_lut_bind_group_layout_entries, get_lut_bindings, DebandDither, Tonemapping,
-        TonemappingLuts,
+        get_lut_bind_group_layout_entries, get_lut_bindings, Tonemapping, TonemappingLuts,
     },
+    FullscreenShader,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
+    entity::EntityHash,
     prelude::*,
     query::ROQueryItem,
     system::{lifetimeless::*, SystemParamItem},
@@ -20,7 +20,7 @@ use bevy_ecs::{
 use bevy_image::{Image, TextureAtlasLayout};
 use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
 use bevy_mesh::VertexBufferLayout;
-use bevy_platform::collections::HashMap;
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     camera::ExtractedCamera,
     view::{RenderVisibleEntities, RetainedViewEntity},
@@ -28,19 +28,20 @@ use bevy_render::{
 use bevy_render::{
     render_asset::RenderAssets,
     render_phase::{
-        DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand, RenderCommandResult,
-        SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
+        CachedRenderPipelinePhaseItem, DrawFunctionId, DrawFunctions, PhaseItem,
+        PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline, SortedPhaseItem,
+        TrackedRenderPass, ViewSortedRenderPhases,
     },
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
-    renderer::{RenderDevice, RenderQueue},
-    sync_world::RenderEntity,
-    texture::{FallbackImage, GpuImage},
+    renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
+    sync_world::{MainEntity, RenderEntity},
+    texture::{CachedTexture, FallbackImage, GpuImage, TextureCache},
     view::{
-        texture_format_from_code, texture_format_to_code, ExtractedView, Msaa, ViewUniform,
-        ViewUniformOffset, ViewUniforms,
+        texture_format_from_code, texture_format_to_code, ExtractedView, Msaa, ViewTarget,
+        ViewUniform, ViewUniformOffset, ViewUniforms,
     },
     Extract,
 };
@@ -213,7 +214,7 @@ impl SpecializedRenderPipeline for SpritePipeline {
         let format = key.target_format();
 
         let instance_rate_vertex_buffer_layout = VertexBufferLayout {
-            array_stride: 80,
+            array_stride: 144,
             step_mode: VertexStepMode::Instance,
             attributes: vec![
                 // @location(0) i_model_transpose_col0: vec4<f32>,
@@ -246,6 +247,30 @@ impl SpecializedRenderPipeline for SpritePipeline {
                     offset: 64,
                     shader_location: 4,
                 },
+                // @location(5) i_effect_params: vec4<f32>,
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 80,
+                    shader_location: 5,
+                },
+                // @location(6) i_shadow_color: vec4<f32>,
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 96,
+                    shader_location: 6,
+                },
+                // @location(7) i_outline_color: vec4<f32>,
+                VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 112,
+                    shader_location: 7,
+                },
+                // @location(8) i_effect_flags: vec4<u32>,
+                VertexAttribute {
+                    format: VertexFormat::Uint32x4,
+                    offset: 128,
+                    shader_location: 8,
+                },
             ],
         };
 
@@ -267,25 +292,9 @@ impl SpecializedRenderPipeline for SpritePipeline {
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.material_layout.clone()],
-            // Sprites are always alpha blended so they never need to write to depth.
-            // They just need to read it in case an opaque mesh2d
-            // that wrote to depth is present.
-            depth_stencil: Some(DepthStencilState {
-                format: CORE_2D_DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(CompareFunction::GreaterEqual),
-                stencil: StencilState {
-                    front: StencilFaceState::IGNORE,
-                    back: StencilFaceState::IGNORE,
-                    read_mask: 0,
-                    write_mask: 0,
-                },
-                bias: DepthBiasState {
-                    constant: 0,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
-                },
-            }),
+            // The sRGB pass is sorted internally and composited later; do not let
+            // the main view depth buffer reject otherwise correctly sorted sprites.
+            depth_stencil: None,
             multisample: MultisampleState {
                 count: key.msaa_samples(),
                 mask: !0,
@@ -297,10 +306,260 @@ impl SpecializedRenderPipeline for SpritePipeline {
     }
 }
 
+pub(crate) fn srgb_intermediate_format(hdr: bool) -> TextureFormat {
+    if hdr {
+        TextureFormat::Rgba16Float
+    } else {
+        TextureFormat::Rgba8Unorm
+    }
+}
+
+#[derive(Resource)]
+pub struct SrgbCompositePipeline {
+    layout: BindGroupLayoutDescriptor,
+    sampler: Sampler,
+    shader: Handle<Shader>,
+    fullscreen_shader: FullscreenShader,
+}
+
+pub fn init_srgb_composite_pipeline(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    asset_server: Res<AssetServer>,
+    fullscreen_shader: Res<FullscreenShader>,
+) {
+    let layout = BindGroupLayoutDescriptor::new(
+        "srgb_composite_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+            ),
+        ),
+    );
+
+    let sampler = render_device.create_sampler(&SamplerDescriptor {
+        label: Some("srgb_composite_sampler"),
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        ..default()
+    });
+
+    commands.insert_resource(SrgbCompositePipeline {
+        layout,
+        sampler,
+        shader: load_embedded_asset!(asset_server.as_ref(), "srgb_composite.wgsl"),
+        fullscreen_shader: fullscreen_shader.clone(),
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SrgbCompositePipelineKey {
+    format: TextureFormat,
+    sample_count: u32,
+}
+
+impl SpecializedRenderPipeline for SrgbCompositePipeline {
+    type Key = SrgbCompositePipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("srgb_composite_pipeline".into()),
+            layout: vec![self.layout.clone()],
+            vertex: self.fullscreen_shader.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs: Vec::new(),
+                entry_point: Some("fragment".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: key.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multisample: MultisampleState {
+                count: key.sample_count,
+                ..default()
+            },
+            ..default()
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct SrgbCompositePipelineId(CachedRenderPipelineId);
+
+pub fn queue_srgb_composite_pipelines(
+    mut commands: Commands,
+    composite_pipeline: Res<SrgbCompositePipeline>,
+    mut pipelines: ResMut<SpecializedRenderPipelines<SrgbCompositePipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    views: Query<(Entity, &ExtractedView, &Msaa), With<ViewTarget>>,
+    srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
+) {
+    for (entity, view, msaa) in &views {
+        if !srgb_phases.contains_key(&view.retained_view_entity) {
+            continue;
+        }
+
+        let pipeline_id = pipelines.specialize(
+            &pipeline_cache,
+            &composite_pipeline,
+            SrgbCompositePipelineKey {
+                format: view.target_format,
+                sample_count: msaa.samples(),
+            },
+        );
+
+        commands
+            .entity(entity)
+            .insert(SrgbCompositePipelineId(pipeline_id));
+    }
+}
+
+/// Phase item for gamma-space sprite rendering.
+pub struct SrgbTransparent2d {
+    pub sort_key: FloatOrd,
+    pub entity: (Entity, MainEntity),
+    pub pipeline: CachedRenderPipelineId,
+    pub draw_function: DrawFunctionId,
+    pub batch_range: Range<u32>,
+    pub extra_index: PhaseItemExtraIndex,
+    pub extracted_index: usize,
+    pub indexed: bool,
+}
+
+impl PhaseItem for SrgbTransparent2d {
+    #[inline]
+    fn entity(&self) -> Entity {
+        self.entity.0
+    }
+
+    #[inline]
+    fn main_entity(&self) -> MainEntity {
+        self.entity.1
+    }
+
+    #[inline]
+    fn draw_function(&self) -> DrawFunctionId {
+        self.draw_function
+    }
+
+    #[inline]
+    fn batch_range(&self) -> &Range<u32> {
+        &self.batch_range
+    }
+
+    #[inline]
+    fn batch_range_mut(&mut self) -> &mut Range<u32> {
+        &mut self.batch_range
+    }
+
+    #[inline]
+    fn extra_index(&self) -> PhaseItemExtraIndex {
+        self.extra_index.clone()
+    }
+
+    #[inline]
+    fn batch_range_and_extra_index_mut(&mut self) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
+        (&mut self.batch_range, &mut self.extra_index)
+    }
+}
+
+impl SortedPhaseItem for SrgbTransparent2d {
+    type SortKey = FloatOrd;
+
+    #[inline]
+    fn sort_key(&self) -> Self::SortKey {
+        self.sort_key
+    }
+
+    #[inline]
+    fn sort(items: &mut indexmap::IndexMap<(Entity, MainEntity), Self, EntityHash>) {
+        items.sort_by_key(|_, value| value.sort_key());
+    }
+
+    fn recalculate_sort_keys(
+        _: &mut indexmap::IndexMap<(Entity, MainEntity), Self, EntityHash>,
+        _: &ExtractedView,
+    ) {
+        // Sort keys are precalculated for this phase.
+    }
+
+    #[inline]
+    fn indexed(&self) -> bool {
+        self.indexed
+    }
+}
+
+impl CachedRenderPipelinePhaseItem for SrgbTransparent2d {
+    #[inline]
+    fn cached_pipeline(&self) -> CachedRenderPipelineId {
+        self.pipeline
+    }
+}
+
 pub struct ExtractedSlice {
     pub offset: Vec2,
     pub rect: Rect,
     pub size: Vec2,
+    pub text_effect: ExtractedTextEffect,
+}
+
+const TEXT_EFFECT_TEXT: u32 = 1 << 0;
+const TEXT_EFFECT_OUTLINE: u32 = 1 << 1;
+const TEXT_EFFECT_SHADOW: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractedTextEffect {
+    flags: u32,
+    shadow_offset: Vec2,
+    shadow_color: LinearRgba,
+    outline_color: LinearRgba,
+}
+
+impl Default for ExtractedTextEffect {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            shadow_offset: Vec2::ZERO,
+            shadow_color: LinearRgba::NONE,
+            outline_color: LinearRgba::NONE,
+        }
+    }
+}
+
+impl ExtractedTextEffect {
+    pub fn text(shadow: Option<(LinearRgba, Vec2)>, outline_color: Option<LinearRgba>) -> Self {
+        let mut text_effect = Self {
+            flags: TEXT_EFFECT_TEXT,
+            ..Default::default()
+        };
+
+        text_effect.set_shadow(shadow);
+
+        if let Some(outline_color) = outline_color {
+            text_effect.flags |= TEXT_EFFECT_OUTLINE;
+            text_effect.outline_color = outline_color;
+        }
+
+        text_effect
+    }
+
+    pub fn shadow(shadow: Option<(LinearRgba, Vec2)>) -> Self {
+        let mut text_effect = Self::default();
+        text_effect.set_shadow(shadow);
+        text_effect
+    }
+
+    fn set_shadow(&mut self, shadow: Option<(LinearRgba, Vec2)>) {
+        if let Some((shadow_color, shadow_offset)) = shadow {
+            self.flags |= TEXT_EFFECT_SHADOW;
+            self.shadow_offset = shadow_offset;
+            self.shadow_color = shadow_color;
+        }
+    }
 }
 
 pub struct ExtractedSprite {
@@ -444,11 +703,20 @@ struct SpriteInstance {
     pub i_model_transpose: [Vec4; 3],
     pub i_color: [f32; 4],
     pub i_uv_offset_scale: [f32; 4],
+    pub i_effect_params: [f32; 4],
+    pub i_shadow_color: [f32; 4],
+    pub i_outline_color: [f32; 4],
+    pub i_effect_flags: [u32; 4],
 }
 
 impl SpriteInstance {
     #[inline]
-    fn from(transform: &Affine3A, color: &LinearRgba, uv_offset_scale: &Vec4) -> Self {
+    fn from(
+        transform: &Affine3A,
+        color: &LinearRgba,
+        uv_offset_scale: &Vec4,
+        text_effect: ExtractedTextEffect,
+    ) -> Self {
         let transpose_model_3x3 = transform.matrix3.transpose();
         Self {
             i_model_transpose: [
@@ -458,6 +726,16 @@ impl SpriteInstance {
             ],
             i_color: color.to_f32_array(),
             i_uv_offset_scale: uv_offset_scale.to_array(),
+            i_effect_params: Vec4::new(
+                text_effect.shadow_offset.x,
+                text_effect.shadow_offset.y,
+                0.0,
+                0.0,
+            )
+            .to_array(),
+            i_shadow_color: text_effect.shadow_color.to_f32_array(),
+            i_outline_color: text_effect.outline_color.to_f32_array(),
+            i_effect_flags: [text_effect.flags, 0, 0, 0],
         }
     }
 }
@@ -498,70 +776,33 @@ pub struct ImageBindGroups {
 
 pub fn queue_sprites(
     mut view_entities: Local<FixedBitSet>,
-    draw_functions: Res<DrawFunctions<Transparent2d>>,
+    draw_functions: Res<DrawFunctions<SrgbTransparent2d>>,
     sprite_pipeline: Res<SpritePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SpritePipeline>>,
     pipeline_cache: Res<PipelineCache>,
     extracted_sprites: Res<ExtractedSprites>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
+    mut srgb_render_phases: ResMut<ViewSortedRenderPhases<SrgbTransparent2d>>,
     mut cameras: Query<(
         &RenderVisibleEntities,
         &ExtractedCamera,
         &ExtractedView,
         &Msaa,
-        Option<&Tonemapping>,
-        Option<&DebandDither>,
     )>,
 ) {
     let draw_sprite_function = draw_functions.read().id::<DrawSprite>();
 
-    for (visible_entities, camera, view, msaa, tonemapping, dither) in &mut cameras {
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
+    for (visible_entities, camera, view, msaa) in &mut cameras {
+        let Some(srgb_phase) = srgb_render_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
 
-        let msaa_key = SpritePipelineKey::from_msaa_samples(msaa.samples());
-        let mut view_key = SpritePipelineKey::from_target_format(view.target_format) | msaa_key;
-
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == bevy_camera::CompositingSpace::Srgb)
-        {
-            view_key |= SpritePipelineKey::SRGB_COMPOSITING;
-        }
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == bevy_camera::CompositingSpace::Oklab)
-        {
-            view_key |= SpritePipelineKey::OKLAB_COMPOSITING;
-        }
-
-        if !camera.hdr {
-            if let Some(tonemapping) = tonemapping {
-                view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
-                view_key |= match tonemapping {
-                    Tonemapping::None => SpritePipelineKey::TONEMAP_METHOD_NONE,
-                    Tonemapping::Reinhard => SpritePipelineKey::TONEMAP_METHOD_REINHARD,
-                    Tonemapping::ReinhardLuminance => {
-                        SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
-                    }
-                    Tonemapping::AcesFitted => SpritePipelineKey::TONEMAP_METHOD_ACES_FITTED,
-                    Tonemapping::AgX => SpritePipelineKey::TONEMAP_METHOD_AGX,
-                    Tonemapping::SomewhatBoringDisplayTransform => {
-                        SpritePipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
-                    }
-                    Tonemapping::TonyMcMapface => SpritePipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
-                    Tonemapping::BlenderFilmic => SpritePipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
-                    Tonemapping::KhronosPbrNeutral => SpritePipelineKey::TONEMAP_METHOD_PBR_NEUTRAL,
-                };
-            }
-            if let Some(DebandDither::Enabled) = dither {
-                view_key |= SpritePipelineKey::DEBAND_DITHER;
-            }
-        }
-
-        let pipeline = pipelines.specialize(&pipeline_cache, &sprite_pipeline, view_key);
+        let pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &sprite_pipeline,
+            SpritePipelineKey::from_msaa_samples(msaa.samples())
+                | SpritePipelineKey::from_target_format(srgb_intermediate_format(camera.hdr))
+                | SpritePipelineKey::SRGB_COMPOSITING,
+        );
 
         view_entities.clear();
         if let Some(visible_entities) = visible_entities.get::<Sprite>() {
@@ -572,9 +813,7 @@ pub fn queue_sprites(
             );
         }
 
-        transparent_phase
-            .items
-            .reserve(extracted_sprites.sprites.len());
+        srgb_phase.items.reserve(extracted_sprites.sprites.len());
 
         for (index, extracted_sprite) in extracted_sprites.sprites.iter().enumerate() {
             let view_index = extracted_sprite.main_entity.index_u32();
@@ -587,7 +826,7 @@ pub fn queue_sprites(
             let sort_key = FloatOrd(extracted_sprite.transform.translation().z);
 
             // Add the item to the render phase
-            transparent_phase.add_transient(Transparent2d {
+            srgb_phase.add_transient(SrgbTransparent2d {
                 draw_function: draw_sprite_function,
                 pipeline,
                 entity: (
@@ -645,7 +884,7 @@ pub fn prepare_sprite_image_bind_groups(
     gpu_images: Res<RenderAssets<GpuImage>>,
     extracted_sprites: Res<ExtractedSprites>,
     extracted_slices: Res<ExtractedSlices>,
-    mut phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
+    mut phases: ResMut<ViewSortedRenderPhases<SrgbTransparent2d>>,
     events: Res<SpriteAssetEvents>,
     mut batches: ResMut<SpriteBatches>,
 ) {
@@ -725,6 +964,15 @@ pub fn prepare_sprite_image_bind_groups(
                     },
                 ));
             }
+            let Some(current_batch) = current_batch.as_mut() else {
+                tracing::error!(
+                    "Skipping sprite draw: missing batch for image {:?}",
+                    extracted_sprite.image_handle_id
+                );
+                batch_image_handle = None;
+                continue;
+            };
+
             match extracted_sprite.kind {
                 ExtractedSpriteKind::Single {
                     anchor,
@@ -795,9 +1043,10 @@ pub fn prepare_sprite_image_bind_groups(
                             &transform,
                             &extracted_sprite.color,
                             &uv_offset_scale,
+                            ExtractedTextEffect::default(),
                         ));
 
-                    current_batch.as_mut().unwrap().get_mut().range.end += 1;
+                    current_batch.get_mut().range.end += 1;
                     index += 1;
                 }
                 ExtractedSpriteKind::Slices { ref indices } => {
@@ -833,6 +1082,12 @@ pub fn prepare_sprite_image_bind_groups(
                                 (slice.size * -Vec2::splat(0.5) + slice.offset).extend(0.0),
                             );
 
+                        let mut text_effect = slice.text_effect;
+                        if text_effect.flags & TEXT_EFFECT_SHADOW != 0 {
+                            text_effect.shadow_offset.x /= batch_image_size.x;
+                            text_effect.shadow_offset.y /= batch_image_size.y;
+                        }
+
                         // Store the vertex data and add the item to the render phase
                         sprite_meta
                             .sprite_instance_buffer
@@ -840,9 +1095,10 @@ pub fn prepare_sprite_image_bind_groups(
                                 &transform,
                                 &extracted_sprite.color,
                                 &uv_offset_scale,
+                                text_effect,
                             ));
 
-                        current_batch.as_mut().unwrap().get_mut().range.end += 1;
+                        current_batch.get_mut().range.end += 1;
                         index += 1;
                     }
                 }
@@ -880,6 +1136,218 @@ pub fn prepare_sprite_image_bind_groups(
         }
     }
 }
+
+pub fn extract_srgb_sprite_camera_phases(
+    mut srgb_phases: ResMut<ViewSortedRenderPhases<SrgbTransparent2d>>,
+    cameras: Extract<Query<(Entity, &Camera), With<Camera2d>>>,
+    mut live_entities: Local<HashSet<RetainedViewEntity>>,
+) {
+    live_entities.clear();
+
+    for (main_entity, camera) in &cameras {
+        if !camera.is_active {
+            continue;
+        }
+
+        let retained_view_entity = RetainedViewEntity::new(main_entity.into(), None, 0);
+        srgb_phases.prepare_for_new_frame(retained_view_entity);
+        live_entities.insert(retained_view_entity);
+    }
+
+    srgb_phases.retain(|entity, _| live_entities.contains(entity));
+}
+
+#[derive(Component)]
+pub struct SrgbSpriteTexture {
+    texture: CachedTexture,
+    resolve_texture: Option<CachedTexture>,
+}
+
+#[derive(Component)]
+pub struct SrgbCompositeBindGroup {
+    bind_group: BindGroup,
+}
+
+pub fn prepare_srgb_sprite_textures(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    mut texture_cache: ResMut<TextureCache>,
+    views: Query<(Entity, &ExtractedCamera, &ExtractedView, &Msaa)>,
+    srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
+) {
+    for (entity, camera, view, msaa) in &views {
+        if !srgb_phases.contains_key(&view.retained_view_entity) {
+            continue;
+        }
+
+        let size = Extent3d {
+            width: view.viewport.z,
+            height: view.viewport.w,
+            depth_or_array_layers: 1,
+        };
+        let sample_count = msaa.samples();
+        let format = srgb_intermediate_format(camera.hdr);
+
+        let texture = texture_cache.get(
+            &render_device,
+            TextureDescriptor {
+                label: Some("srgb_sprite_texture"),
+                size,
+                mip_level_count: 1,
+                sample_count,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        );
+
+        let resolve_texture = if sample_count > 1 {
+            Some(texture_cache.get(
+                &render_device,
+                TextureDescriptor {
+                    label: Some("srgb_sprite_resolve_texture"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            ))
+        } else {
+            None
+        };
+
+        commands.entity(entity).insert(SrgbSpriteTexture {
+            texture,
+            resolve_texture,
+        });
+    }
+}
+
+pub fn prepare_srgb_composite_bind_groups(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
+    composite_pipeline: Res<SrgbCompositePipeline>,
+    views: Query<(Entity, &SrgbSpriteTexture)>,
+) {
+    for (entity, srgb_texture) in &views {
+        let texture_view = srgb_texture
+            .resolve_texture
+            .as_ref()
+            .map(|texture| &texture.default_view)
+            .unwrap_or(&srgb_texture.texture.default_view);
+
+        let bind_group = render_device.create_bind_group(
+            "srgb_composite_bind_group",
+            &pipeline_cache.get_bind_group_layout(&composite_pipeline.layout),
+            &BindGroupEntries::sequential((texture_view, &composite_pipeline.sampler)),
+        );
+
+        commands
+            .entity(entity)
+            .insert(SrgbCompositeBindGroup { bind_group });
+    }
+}
+
+pub fn srgb_sprite_pass(
+    world: &World,
+    view: ViewQuery<(&SrgbSpriteTexture, &ExtractedView)>,
+    srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
+    mut ctx: RenderContext,
+) {
+    let view_entity = view.entity();
+    let (srgb_texture, view) = view.into_inner();
+
+    let Some(phase) = srgb_phases.get(&view.retained_view_entity) else {
+        return;
+    };
+    if phase.items.is_empty() {
+        return;
+    }
+
+    let color_attachment = RenderPassColorAttachment {
+        view: &srgb_texture.texture.default_view,
+        resolve_target: srgb_texture
+            .resolve_texture
+            .as_ref()
+            .map(|texture| &*texture.default_view),
+        ops: Operations {
+            load: LoadOp::Clear(LinearRgba::NONE.into()),
+            store: StoreOp::Store,
+        },
+        depth_slice: None,
+    };
+
+    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("srgb_sprite_pass"),
+        color_attachments: &[Some(color_attachment)],
+        // This pass has its own color target and relies on SrgbTransparent2d sorting.
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    if let Err(err) = phase.render(&mut render_pass, world, view_entity) {
+        tracing::error!("Error rendering sRGB sprite phase: {err:?}");
+    }
+}
+
+pub fn srgb_composite_pass(
+    view: ViewQuery<(
+        &ViewTarget,
+        &SrgbCompositeBindGroup,
+        &SrgbCompositePipelineId,
+        &ExtractedView,
+    )>,
+    srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
+    pipeline_cache: Res<PipelineCache>,
+    mut ctx: RenderContext,
+) {
+    let (view_target, composite_bind_group, composite_pipeline_id, view) = view.into_inner();
+
+    let Some(phase) = srgb_phases.get(&view.retained_view_entity) else {
+        return;
+    };
+    if phase.items.is_empty() {
+        return;
+    }
+
+    let pipeline = match pipeline_cache.get_render_pipeline_state(composite_pipeline_id.0) {
+        CachedPipelineState::Queued | CachedPipelineState::Creating(_) => return,
+        CachedPipelineState::Err(err) => {
+            tracing::error!("Skipping sRGB sprite composite pass: pipeline creation failed: {err}");
+            return;
+        }
+        CachedPipelineState::Ok(Pipeline::RenderPipeline(pipeline)) => pipeline,
+        CachedPipelineState::Ok(Pipeline::ComputePipeline(_)) => {
+            tracing::error!(
+                "Skipping sRGB sprite composite pass: cached pipeline is not a render pipeline"
+            );
+            return;
+        }
+    };
+
+    let color_attachments = [Some(view_target.get_color_attachment())];
+
+    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("srgb_composite_pass"),
+        color_attachments: &color_attachments,
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    render_pass.set_render_pipeline(pipeline);
+    render_pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
+    render_pass.draw(0..3, 0..1);
+}
+
 /// [`RenderCommand`] for sprite rendering.
 pub type DrawSprite = (
     SetItemPipeline,
@@ -923,14 +1391,15 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSpriteTextureBindGrou
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(
-            I,
-            image_bind_groups
-                .values
-                .get(&batch.image_handle_id)
-                .unwrap(),
-            &[],
-        );
+        let Some(bind_group) = image_bind_groups.values.get(&batch.image_handle_id) else {
+            tracing::error!(
+                "Skipping sprite draw: missing bind group for image {:?}",
+                batch.image_handle_id
+            );
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_bind_group(I, bind_group, &[]);
         RenderCommandResult::Success
     }
 }
@@ -953,18 +1422,17 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSpriteBatch {
             return RenderCommandResult::Skip;
         };
 
-        pass.set_index_buffer(
-            sprite_meta.sprite_index_buffer.buffer().unwrap().slice(..),
-            IndexFormat::Uint32,
-        );
-        pass.set_vertex_buffer(
-            0,
-            sprite_meta
-                .sprite_instance_buffer
-                .buffer()
-                .unwrap()
-                .slice(..),
-        );
+        let Some(index_buffer) = sprite_meta.sprite_index_buffer.buffer() else {
+            tracing::error!("Skipping sprite draw: missing sprite index buffer");
+            return RenderCommandResult::Skip;
+        };
+        let Some(instance_buffer) = sprite_meta.sprite_instance_buffer.buffer() else {
+            tracing::error!("Skipping sprite draw: missing sprite instance buffer");
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
         pass.draw_indexed(0..6, 0, batch.range.clone());
         RenderCommandResult::Success
     }

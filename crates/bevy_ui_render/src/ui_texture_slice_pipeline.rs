@@ -164,7 +164,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
+        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -176,11 +176,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs,
-                targets: vec![Some(ColorTargetState {
-                    format: key.target_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets: vec![Some(ui_color_target_state(key.target_format))],
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
@@ -342,7 +338,7 @@ pub fn queue_ui_slices(
             &pipeline_cache,
             &ui_slicer_pipeline,
             UiTextureSlicePipelineKey {
-                target_format: view.target_format,
+                target_format: ui_render_target_format(view.target_format),
             },
         );
 
@@ -621,7 +617,15 @@ pub fn prepare_ui_slices(
                     vertices_index += 6;
                     indices_index += 4;
 
-                    existing_batch.unwrap().1.range.end = vertices_index;
+                    let Some(existing_batch) = existing_batch else {
+                        tracing::error!(
+                            "Skipping UI texture slice draw: missing batch for image {:?}",
+                            texture_slices.image
+                        );
+                        batch_image_handle = None;
+                        continue;
+                    };
+                    existing_batch.1.range.end = vertices_index;
                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
                 } else {
                     batch_image_handle = None;
@@ -682,7 +686,15 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSlicerTextureBindGrou
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(I, image_bind_groups.values.get(&batch.image).unwrap(), &[]);
+        let Some(bind_group) = image_bind_groups.values.get(&batch.image) else {
+            tracing::error!(
+                "Skipping UI texture slice draw: missing bind group for image {:?}",
+                batch.image
+            );
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_bind_group(I, bind_group, &[]);
         RenderCommandResult::Success
     }
 }
