@@ -28,6 +28,7 @@ struct DrawState {
     /// List of vertex buffers by [`BufferId`], offset, and size. See [`DrawState::buffer_slice_key`]
     vertex_buffers: Vec<Option<BufferSliceKey>>,
     index_buffer: Option<(BufferSliceKey, IndexFormat)>,
+    scissor_rect: Option<(u32, u32, u32, u32)>,
 
     /// Stores whether this state is populated or empty for quick state invalidation
     stores_state: bool,
@@ -121,7 +122,19 @@ impl DrawState {
             *val = None;
         });
         self.index_buffer = None;
+        self.scissor_rect = None;
         self.stores_state = false;
+    }
+
+    /// Marks the scissor rect as set.
+    fn set_scissor_rect(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        self.scissor_rect = Some((x, y, width, height));
+        self.stores_state = true;
+    }
+
+    /// Checks whether the scissor rect is already set.
+    fn is_scissor_rect_set(&self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        self.scissor_rect == Some((x, y, width, height))
     }
 }
 
@@ -529,7 +542,11 @@ impl<'a> TrackedRenderPass<'a> {
     pub fn set_scissor_rect(&mut self, x: u32, y: u32, width: u32, height: u32) {
         #[cfg(feature = "detailed_trace")]
         trace!("set_scissor_rect: {} {} {} {}", x, y, width, height);
+        if self.state.is_scissor_rect_set(x, y, width, height) {
+            return;
+        }
         self.pass.set_scissor_rect(x, y, width, height);
+        self.state.set_scissor_rect(x, y, width, height);
     }
 
     /// Set immediates data.
