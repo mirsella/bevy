@@ -54,7 +54,6 @@ use bevy_render::{
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal, ShaderRef};
-use bevy_utils::Parallel;
 use core::{hash::Hash, marker::PhantomData};
 use derive_more::derive::From;
 use tracing::error;
@@ -689,7 +688,6 @@ pub fn check_entities_needing_specialization<M>(
             With<MeshMaterial2d<M>>,
         ),
     >,
-    mut par_local: Local<Parallel<Vec<Entity>>>,
     mut entities_needing_specialization: ResMut<EntitiesNeedingSpecialization<M>>,
     mut removed_mesh_2d_components: RemovedComponents<Mesh2d>,
     mut removed_mesh_material_2d_components: RemovedComponents<MeshMaterial2d<M>>,
@@ -699,11 +697,9 @@ pub fn check_entities_needing_specialization<M>(
     entities_needing_specialization.changed.clear();
     entities_needing_specialization.removed.clear();
 
-    // Gather all entities that need their specializations regenerated.
-    needs_specialization
-        .par_iter()
-        .for_each(|entity| par_local.borrow_local_mut().push(entity));
-    par_local.drain_into(&mut entities_needing_specialization.changed);
+    entities_needing_specialization
+        .changed
+        .extend(needs_specialization.iter());
 
     // All entities that removed their `Mesh2d` or `MeshMaterial2d` components
     // need to have their specializations removed as well.
