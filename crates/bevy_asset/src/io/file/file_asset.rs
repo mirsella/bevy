@@ -16,6 +16,7 @@ use core::marker::PhantomData;
 use core::time::Duration;
 #[cfg(not(target_os = "windows"))]
 use futures_util::{future, pin_mut};
+use std::io::ErrorKind;
 use std::path::Path;
 
 use super::{FileAssetReader, FileAssetWriter};
@@ -80,7 +81,7 @@ impl AssetReader for FileAssetReader {
         File::open(&full_path)
             .await
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     AssetReaderError::NotFound(full_path)
                 } else {
                     e.into()
@@ -104,7 +105,7 @@ impl AssetReader for FileAssetReader {
         File::open(&full_path)
             .await
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     AssetReaderError::NotFound(full_path)
                 } else {
                     e.into()
@@ -153,7 +154,7 @@ impl AssetReader for FileAssetReader {
                 Ok(read_dir)
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     Err(AssetReaderError::NotFound(full_path))
                 } else {
                     Err(e.into())

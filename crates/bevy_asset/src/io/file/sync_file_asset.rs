@@ -10,7 +10,7 @@ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::{pin::Pin, task::Poll};
 use std::{
     fs::{read_dir, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -104,7 +104,7 @@ impl AssetReader for FileAssetReader {
         match File::open(&full_path) {
             Ok(file) => Ok(FileReader(file)),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     Err(AssetReaderError::NotFound(full_path))
                 } else {
                     Err(e.into())
@@ -119,7 +119,7 @@ impl AssetReader for FileAssetReader {
         match File::open(&full_path) {
             Ok(file) => Ok(FileReader(file)),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     Err(AssetReaderError::NotFound(full_path))
                 } else {
                     Err(e.into())
@@ -163,7 +163,7 @@ impl AssetReader for FileAssetReader {
                 Ok(read_dir)
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     Err(AssetReaderError::NotFound(full_path))
                 } else {
                     Err(e.into())

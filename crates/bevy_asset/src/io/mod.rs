@@ -35,7 +35,7 @@ use core::{
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_lite::Stream;
 use std::{
-    io::SeekFrom,
+    io::{ErrorKind, SeekFrom},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -718,7 +718,7 @@ pub(crate) fn slice_seek(
 ) -> std::io::Result<u64> {
     let make_error = || {
         Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+            ErrorKind::InvalidInput,
             "seek position is out of range",
         ))
     };
