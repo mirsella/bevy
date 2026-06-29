@@ -110,6 +110,7 @@ impl FeathersTextInput {
             FeathersTextInput
             EditableText {
                 cursor_width: 0.3,
+                cursor_height: 1.0,
                 visible_width: {props.visible_width},
                 max_characters: {props.max_characters},
             }

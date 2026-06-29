@@ -1,7 +1,7 @@
 use core::hash::BuildHasher;
 use core::time::Duration;
 
-use crate::{ComputedNode, ComputedUiRenderTargetInfo, ContentSize, NodeMeasure};
+use crate::{AlignItems, ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Node, NodeMeasure};
 use bevy_asset::Assets;
 
 use bevy_ecs::{
@@ -269,8 +269,10 @@ pub fn update_editable_text_layout(
         Ref<ComputedUiRenderTargetInfo>,
         &mut EditableText,
         &mut TextLayoutInfo,
+        Ref<Node>,
         Ref<ComputedNode>,
         &mut EditableTextGeneration,
+        Ref<TextLayout>,
         Option<Ref<EditableTextPlaceholder>>,
     )>,
     rem_size: Res<RemSize>,
@@ -287,19 +289,23 @@ pub fn update_editable_text_layout(
         target,
         mut editable_text,
         mut info,
+        node,
         computed_node,
         mut generation,
+        text_layout,
         placeholder,
     ) in input_field_query.iter_mut()
     {
         let cursor_width = editable_text.cursor_width;
+        let cursor_height = editable_text.cursor_height;
         let cursor_blink_period = editable_text.cursor_blink_period;
+        let content_box = computed_node.content_box();
+        let content_height = content_box.height();
+        let center_text_vertically = node.align_items == AlignItems::Center;
         let placeholder_changed = placeholder.as_ref().is_some_and(DetectChanges::is_changed);
 
         if computed_node.is_changed() {
-            editable_text
-                .editor
-                .set_width(Some(computed_node.content_box().width()));
+            editable_text.editor.set_width(Some(content_box.width()));
         }
 
         let layout_changed;
@@ -324,7 +330,7 @@ pub fn update_editable_text_layout(
                     && driver.editor.text().into_iter().all(str::is_empty)
             });
 
-            if layout_changed || hinting.is_changed() {
+            if layout_changed || hinting.is_changed() || node.is_changed() {
                 let layout = driver.layout();
 
                 info.scale_factor = layout.scale();
@@ -480,37 +486,56 @@ pub fn update_editable_text_layout(
                         a.max.y = b.min.y;
                     }
                 }
-            }
 
-            if let Some(input_focus) = input_focus.as_ref()
-                && Some(entity) == input_focus.get()
-            {
-                if input_focus.is_changed()
-                    || layout_changed
-                    || *cursor_timer >= cursor_blink_period
-                {
-                    *cursor_timer = Duration::ZERO;
+                if center_text_vertically {
+                    let y_offset = center_glyphs(&mut info.glyphs, content_height);
+                    offset_rects_y(&mut info.selection_rects, y_offset);
+                    offset_rects_y(&mut info.preedit_underline_rects, y_offset);
+                    offset_run_geometry_y(&mut info.run_geometry, y_offset);
                 }
-
-                info.cursor = driver
-                    .editor
-                    .cursor_geometry(
-                        cursor_width * text_font.font_size.eval(target.logical_size(), rem_size.0),
-                    )
-                    .map(bounding_box_to_rect)
-                    .map(|rect| (*cursor_timer < cursor_blink_period / 2, rect));
-            } else {
-                info.cursor = driver
-                    .editor
-                    .cursor_geometry(0.)
-                    .map(bounding_box_to_rect)
-                    .map(|rect| (false, rect));
             }
+
+            let focused_input = input_focus
+                .as_ref()
+                .filter(|input_focus| input_focus.get() == Some(entity));
+            if focused_input.is_some_and(|input_focus| {
+                input_focus.is_changed() || layout_changed || *cursor_timer >= cursor_blink_period
+            }) {
+                *cursor_timer = Duration::ZERO;
+            }
+
+            let has_focus = focused_input.is_some();
+            let cursor_width = if has_focus {
+                cursor_width * text_font.font_size.eval(target.logical_size(), rem_size.0)
+            } else {
+                0.
+            };
+            let cursor_is_visible = has_focus && *cursor_timer < cursor_blink_period / 2;
+
+            info.cursor = driver
+                .editor
+                .cursor_geometry(cursor_width)
+                .map(bounding_box_to_rect)
+                .map(|rect| {
+                    let rect = apply_cursor_height(
+                        rect,
+                        cursor_height,
+                        find_visual_line_bounds(driver.layout(), rect.center().y),
+                    );
+                    if center_text_vertically {
+                        offset_rect_y(rect, content_height * 0.5 - rect.center().y)
+                    } else {
+                        rect
+                    }
+                })
+                .map(|rect| (cursor_is_visible, rect));
         }
 
         if placeholder_visible {
             if layout_changed
                 || hinting.is_changed()
+                || text_layout.is_changed()
+                || node.is_changed()
                 || placeholder_changed
                 || info.placeholder_glyphs.is_empty()
             {
@@ -518,8 +543,10 @@ pub fn update_editable_text_layout(
                 update_editable_text_placeholder_layout(
                     placeholder,
                     &editable_text,
+                    &text_layout,
                     text_font,
                     *hinting,
+                    center_text_vertically.then_some(content_height),
                     &mut font_cx,
                     &mut layout_cx,
                     &mut scale_cx,
@@ -537,8 +564,10 @@ pub fn update_editable_text_layout(
 fn update_editable_text_placeholder_layout(
     placeholder: &EditableTextPlaceholder,
     editable_text: &EditableText,
+    text_layout: &TextLayout,
     text_font: &TextFont,
     hinting: FontHinting,
+    center_height: Option<f32>,
     font_cx: &mut FontCx,
     layout_cx: &mut LayoutCx,
     scale_cx: &mut ScaleCx,
@@ -550,9 +579,11 @@ fn update_editable_text_placeholder_layout(
 
     let mut placeholder_editor = editable_text.editor.clone();
     placeholder_editor.set_text(placeholder.as_str());
+    placeholder_editor.set_alignment(text_layout.justify.into());
 
     let mut driver = placeholder_editor.driver(font_cx, &mut layout_cx.0);
     driver.refresh_layout();
+    info.size = Vec2::new(driver.layout().full_width(), driver.layout().height()).ceil();
 
     for (line_index, line) in driver.layout().lines().enumerate() {
         for item in line.items() {
@@ -621,6 +652,10 @@ fn update_editable_text_placeholder_layout(
             }
         }
     }
+
+    if let Some(center_height) = center_height {
+        center_glyphs(&mut info.placeholder_glyphs, center_height);
+    }
 }
 
 fn bounding_box_to_rect(geom: BoundingBox) -> Rect {
@@ -633,6 +668,71 @@ fn bounding_box_to_rect(geom: BoundingBox) -> Rect {
             x: geom.x1 as f32,
             y: geom.y1 as f32,
         },
+    }
+}
+
+fn apply_cursor_height(rect: Rect, cursor_height: f32, line_bounds: Option<(f32, f32)>) -> Rect {
+    if !cursor_height.is_finite() {
+        return rect;
+    }
+
+    let Some((line_min, line_max)) = line_bounds else {
+        return rect;
+    };
+
+    let height = (line_max - line_min).max(0.0) * cursor_height.max(0.0);
+    let center_y = (line_min + line_max) * 0.5;
+    Rect {
+        min: Vec2::new(rect.min.x, center_y - height * 0.5),
+        max: Vec2::new(rect.max.x, center_y + height * 0.5),
+    }
+}
+
+fn center_glyphs(glyphs: &mut [PositionedGlyph], height: f32) -> f32 {
+    let Some((min_y, max_y)) = glyphs
+        .iter()
+        .map(|glyph| {
+            let half_height = glyph.atlas_info.rect.height() * 0.5;
+            (
+                glyph.position.y - half_height,
+                glyph.position.y + half_height,
+            )
+        })
+        .reduce(|(min_y, max_y), (glyph_min_y, glyph_max_y)| {
+            (min_y.min(glyph_min_y), max_y.max(glyph_max_y))
+        })
+    else {
+        return 0.;
+    };
+    if !min_y.is_finite() || !max_y.is_finite() {
+        return 0.;
+    }
+
+    let y_offset = height * 0.5 - (min_y + max_y) * 0.5;
+    for glyph in glyphs {
+        glyph.position.y += y_offset;
+    }
+    y_offset
+}
+
+fn offset_rects_y(rects: &mut [Rect], y_offset: f32) {
+    for rect in rects {
+        *rect = offset_rect_y(*rect, y_offset);
+    }
+}
+
+fn offset_run_geometry_y(run_geometry: &mut [RunGeometry], y_offset: f32) {
+    for geometry in run_geometry {
+        geometry.bounds = offset_rect_y(geometry.bounds, y_offset);
+        geometry.strikethrough_y += y_offset;
+        geometry.underline_y += y_offset;
+    }
+}
+
+fn offset_rect_y(rect: Rect, y_offset: f32) -> Rect {
+    Rect {
+        min: Vec2::new(rect.min.x, rect.min.y + y_offset),
+        max: Vec2::new(rect.max.x, rect.max.y + y_offset),
     }
 }
 
@@ -732,5 +832,24 @@ fn scroll_axis(v_min: f32, v_max: f32, t_min: f32, t_max: f32) -> f32 {
         t_max - v_size
     } else {
         v_min
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_height_is_relative_to_line_bounds() {
+        let raw_cursor = Rect::new(4., 8., 6., 12.);
+
+        assert_eq!(
+            apply_cursor_height(raw_cursor, 0.5, Some((0., 20.))),
+            Rect::new(4., 5., 6., 15.)
+        );
+        assert_eq!(
+            apply_cursor_height(raw_cursor, 1., Some((0., 20.))),
+            Rect::new(4., 0., 6., 20.)
+        );
     }
 }

@@ -131,6 +131,8 @@ pub struct EditableText {
     pub pending_paste: Option<ClipboardRead>,
     /// Cursor width, relative to font size
     pub cursor_width: f32,
+    /// Cursor height, relative to line height
+    pub cursor_height: f32,
     /// Cursor blink period in seconds.
     pub cursor_blink_period: Duration,
     /// Maximum number of characters the text input can contain.
@@ -180,6 +182,7 @@ impl Default for EditableText {
             pending_edits: Vec::new(),
             pending_paste: None,
             cursor_width: 0.2,
+            cursor_height: 1.0,
             cursor_blink_period: Duration::from_secs(1),
             max_characters: None,
             visible_lines: Some(1.),
