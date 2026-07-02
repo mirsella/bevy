@@ -24,7 +24,7 @@ use bevy_camera::{Camera, Camera2d, Camera3d, RenderTarget};
 use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_render::camera::{extract_cameras, CameraMainPassTextureFormats};
-use bevy_shader::load_shader_library;
+use bevy_shader::{load_shader_library, Shader};
 use bevy_sprite_render::SpriteAssetEvents;
 use bevy_ui::widget::{
     ImageNode, ImageNodeSize, NodeImageMode, TextOutline, TextScroll, TextShadow, ViewportNode,
@@ -36,7 +36,7 @@ use bevy_ui::{
 };
 
 use bevy_app::prelude::*;
-use bevy_asset::{embedded_asset, AssetEvent, AssetId, Assets};
+use bevy_asset::{embedded_asset, load_embedded_asset, AssetEvent, AssetId, Assets, Handle};
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
 use bevy_core_pipeline::schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
 use bevy_core_pipeline::upscaling::upscaling;
@@ -199,10 +199,18 @@ impl Default for BoxShadowSamples {
 #[derive(Default)]
 pub struct UiRenderPlugin;
 
+#[derive(Resource)]
+struct SrgbUiCompositeShader {
+    _handle: Handle<Shader>,
+}
+
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui.wgsl");
         embedded_asset!(app, "srgb_ui_composite.wgsl");
+        app.insert_resource(SrgbUiCompositeShader {
+            _handle: load_embedded_asset!(app, "srgb_ui_composite.wgsl"),
+        });
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<GlobalUiDebugOptions>();

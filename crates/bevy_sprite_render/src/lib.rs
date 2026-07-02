@@ -26,7 +26,7 @@ pub mod prelude {
     pub use crate::{ColorMaterial, MeshMaterial2d, SpriteMaterial};
 }
 
-use bevy_shader::load_shader_library;
+use bevy_shader::{load_shader_library, Shader};
 pub use mesh2d::*;
 pub use render::*;
 pub use sprite_mesh::*;
@@ -34,7 +34,7 @@ pub(crate) use texture_slice::*;
 pub use tilemap_chunk::*;
 
 use bevy_app::prelude::*;
-use bevy_asset::{embedded_asset, AssetEventSystems};
+use bevy_asset::{embedded_asset, load_embedded_asset, AssetEventSystems, Handle};
 use bevy_core_pipeline::{
     core_2d::{main_opaque_pass_2d, main_transparent_pass_2d, AlphaMask2d, Opaque2d},
     schedule::{Core2d, Core2dSystems},
@@ -66,12 +66,20 @@ pub enum SpriteSystems {
     ComputeSlices,
 }
 
+#[derive(Resource)]
+struct SrgbCompositeShader {
+    _handle: Handle<Shader>,
+}
+
 impl Plugin for SpriteRenderPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "render/sprite_view_bindings.wgsl");
 
         embedded_asset!(app, "render/sprite.wgsl");
         embedded_asset!(app, "render/srgb_composite.wgsl");
+        app.insert_resource(SrgbCompositeShader {
+            _handle: load_embedded_asset!(app, "render/srgb_composite.wgsl"),
+        });
 
         if !app.is_plugin_added::<TextureAtlasPlugin>() {
             app.add_plugins(TextureAtlasPlugin);
