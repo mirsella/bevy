@@ -1197,7 +1197,12 @@ pub fn prepare_srgb_sprite_textures(
                 sample_count,
                 dimension: TextureDimension::D2,
                 format,
-                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                // Multisampled attachments are resolved before sampling and may be renderbuffers.
+                usage: if sample_count > 1 {
+                    TextureUsages::RENDER_ATTACHMENT
+                } else {
+                    TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING
+                },
                 view_formats: &[],
             },
         );

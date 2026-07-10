@@ -134,7 +134,7 @@ pub fn srgb_ui_composite_pass(
 
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("srgb_ui_composite_pass"),
-        color_attachments: &[Some(target.get_color_attachment())],
+        color_attachments: &[Some(target.get_unsampled_color_attachment())],
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
