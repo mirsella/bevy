@@ -27,6 +27,7 @@ pub mod states;
 
 pub use easy_screenshot::*;
 
+#[cfg(feature = "bevy_pbr")]
 pub mod render_debug;
 
 pub mod infinite_grid;

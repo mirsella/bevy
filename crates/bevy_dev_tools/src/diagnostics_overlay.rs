@@ -9,9 +9,7 @@ use bevy_app::prelude::*;
 use bevy_color::{palettes, prelude::*};
 use bevy_diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy_ecs::{prelude::*, relationship::Relationship};
-use bevy_pbr::{diagnostic::MaterialAllocatorDiagnosticPlugin, StandardMaterial};
 use bevy_picking::prelude::*;
-use bevy_render::diagnostic::MeshAllocatorDiagnosticPlugin;
 use bevy_text::prelude::*;
 use bevy_time::common_conditions::on_timer;
 use bevy_ui::prelude::*;
@@ -28,8 +26,6 @@ const DEFAULT_PADDING: UiRect = UiRect::all(Val::Px(4.));
 /// Initial Z-index for the [`DiagnosticsOverlayPlane`]
 pub const INITIAL_DIAGNOSTICS_OVERLAY_PLANE_Z_INDEX: GlobalZIndex = GlobalZIndex(1_000_000);
 /// Alias to shorten the name
-type StandardMaterialAllocator = MaterialAllocatorDiagnosticPlugin<StandardMaterial>;
-
 /// Diagnostics overlay displays on a draggable and collapsible window
 /// statistics stored on the [`DiagnosticsStore`]. Spawning an entity
 /// with this component will create the window for you. Some presets
@@ -115,10 +111,12 @@ impl DiagnosticsOverlay {
         }
     }
 
-    /// Create a [`DiagnosticsOverlay`] with the diagnostics from
-    /// [`MaterialAllocatorDiagnosticPlugin`] of [`StandardMaterial`] and
-    /// [`MeshAllocatorDiagnosticPlugin`]
+    /// Creates a [`DiagnosticsOverlay`] with standard material and mesh allocator diagnostics.
+    #[cfg(feature = "bevy_pbr")]
     pub fn mesh_and_standard_material() -> Self {
+        use bevy_pbr::{diagnostic::MaterialAllocatorDiagnosticPlugin, StandardMaterial};
+        use bevy_render::diagnostic::MeshAllocatorDiagnosticPlugin;
+        type StandardMaterialAllocator = MaterialAllocatorDiagnosticPlugin<StandardMaterial>;
         Self {
             title: Cow::Owned("Mesh and standard materials".to_owned()),
             items: vec![

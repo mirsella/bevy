@@ -260,6 +260,7 @@ bevy_pbr = [
   "bevy_light",
   "bevy_material",
   "bevy_core_pipeline",
+  "bevy_dev_tools?/bevy_pbr",
   "bevy_gizmos_render?/bevy_pbr",
 ]
 bevy_sprite_render = [
