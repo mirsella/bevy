@@ -178,7 +178,10 @@ pub fn update_editable_text_styles(
             editable_text.editor.set_scale(target.scale_factor());
         }
 
-        if text_font.is_changed()
+        let initialize = editable_text.is_added() || target.is_added();
+        let text_font_changed = initialize || text_font.is_changed();
+
+        if text_font_changed
             || matches!(text_font.font_size, FontSize::Rem(_)) && rem_size.is_changed()
             || matches!(
                 text_font.font_size,
@@ -193,14 +196,11 @@ pub fn update_editable_text_styles(
                 ));
         }
 
-        if text_font.is_changed() {
-            let Ok(resolved_font) = resolve_font_source(&text_font, fonts.as_ref()) else {
-                continue;
-            };
-
-            let family = resolved_font.into_owned();
+        if text_font_changed {
             let style_set = editable_text.editor.edit_styles();
-            style_set.insert(StyleProperty::FontFamily(family));
+            if let Ok(resolved_font) = resolve_font_source(&text_font, fonts.as_ref()) {
+                style_set.insert(StyleProperty::FontFamily(resolved_font.into_owned()));
+            }
             style_set.insert(StyleProperty::FontWeight(text_font.weight.into()));
             style_set.insert(StyleProperty::FontWidth(text_font.width.into()));
             style_set.insert(StyleProperty::FontStyle(text_font.style.into()));
@@ -216,12 +216,14 @@ pub fn update_editable_text_styles(
             )));
         }
 
-        if line_height.is_changed() {
-            let style_set = editable_text.editor.edit_styles();
-            style_set.insert(StyleProperty::LineHeight(line_height.eval()));
+        if initialize || line_height.is_changed() {
+            editable_text
+                .editor
+                .edit_styles()
+                .insert(StyleProperty::LineHeight(line_height.eval()));
         }
 
-        if text_layout.is_changed() {
+        if initialize || text_layout.is_changed() {
             let style_set = editable_text.editor.edit_styles();
             match text_layout.linebreak {
                 LineBreak::AnyCharacter => {
@@ -245,7 +247,6 @@ pub fn update_editable_text_styles(
                     style_set.insert(StyleProperty::TextWrapMode(parley::TextWrapMode::Wrap));
                 }
             }
-
             editable_text
                 .editor
                 .set_alignment(text_layout.justify.into());
@@ -838,6 +839,7 @@ fn scroll_axis(v_min: f32, v_max: f32, t_min: f32, t_max: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_app::{App, Update};
 
     #[test]
     fn cursor_height_is_relative_to_line_bounds() {
@@ -851,5 +853,44 @@ mod tests {
             apply_cursor_height(raw_cursor, 1., Some((0., 20.))),
             Rect::new(4., 0., 6., 20.)
         );
+    }
+
+    #[test]
+    fn initializes_alignment_when_target_arrives_after_a_missed_run() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Font>>()
+            .init_resource::<RemSize>()
+            .add_systems(Update, update_editable_text_styles);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                EditableText::new("test"),
+                TextLayout::justify(bevy_text::Justify::Center),
+            ))
+            .id();
+
+        app.update();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(ComputedUiRenderTargetInfo::default());
+        app.update();
+
+        // Empty font assets also verify that failed font resolution does not skip alignment.
+        let mut editable_text = app.world_mut().get_mut::<EditableText>(entity).unwrap();
+        editable_text.editor_mut().set_width(Some(100.));
+        let offset = editable_text
+            .editor_mut()
+            .layout(
+                &mut parley::FontContext::new(),
+                &mut parley::LayoutContext::new(),
+            )
+            .lines()
+            .next()
+            .unwrap()
+            .metrics()
+            .offset;
+
+        assert!(offset > 0.);
     }
 }
