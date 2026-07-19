@@ -1057,6 +1057,35 @@ mod tests {
     }
 
     #[test]
+    fn physical_pixel_border_ignores_ui_scale() {
+        let mut app = setup_ui_test_app();
+        app.world_mut().resource_mut::<UiScale>().0 = 2.;
+
+        let ui_node = app
+            .world_mut()
+            .spawn(Node {
+                align_self: AlignSelf::Start,
+                border: UiRect {
+                    left: px(1.),
+                    right: physical_px(1.),
+                    top: px(1.),
+                    bottom: physical_px(1.),
+                },
+                ..default()
+            })
+            .id();
+
+        app.update();
+        let mut ui_surface = app.world_mut().resource_mut::<UiSurface>();
+        let layout = ui_surface.get_layout(ui_node, true).unwrap().0;
+
+        assert_eq!(layout.border.left, 2.);
+        assert_eq!(layout.border.right, 1.);
+        assert_eq!(layout.border.top, 2.);
+        assert_eq!(layout.border.bottom, 1.);
+    }
+
+    #[test]
     fn measure_funcs_should_be_removed_on_content_size_clear() {
         let mut app = setup_ui_test_app();
         let world = app.world_mut();

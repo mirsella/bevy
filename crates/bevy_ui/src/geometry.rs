@@ -1,6 +1,5 @@
 use bevy_math::{MismatchedUnitsError, StableInterpolate as _, TryStableInterpolate, Vec2};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_text::FontSize;
 use bevy_utils::default;
 use core::ops::{Div, DivAssign, Mul, MulAssign, Neg};
 use thiserror::Error;
@@ -11,10 +10,12 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// Represents the possible value types for layout properties.
 ///
 /// This enum allows specifying values for various [`Node`](crate::Node) properties in different units,
-/// such as logical pixels, percentages, or automatically determined values.
+/// such as logical pixels, physical pixels, percentages, or automatically determined values.
 ///
-/// `Val` also implements [`core::str::FromStr`] to allow parsing values from strings in the format `#.#px`. Whitespaces between the value and unit is allowed. The following units are supported:
+/// `Val` also implements [`core::str::FromStr`] to allow parsing values from strings such as `1.5px`.
+/// Whitespace between the value and unit is allowed. The following units are supported:
 /// * `px`: logical pixels
+/// * `physicalpx`: physical pixels
 /// * `%`: percentage
 /// * `vw`: percentage of the viewport width
 /// * `vh`: percentage of the viewport height
@@ -55,6 +56,8 @@ pub enum Val {
     VMin(f32),
     /// Set this value in percent of the viewport's larger dimension.
     VMax(f32),
+    /// Set this value in physical pixels of the UI render target.
+    PhysicalPx(f32),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -105,6 +108,8 @@ impl core::str::FromStr for Val {
 
         if unit.eq_ignore_ascii_case("px") {
             Ok(Val::Px(value))
+        } else if unit.eq_ignore_ascii_case("physicalpx") {
+            Ok(Val::PhysicalPx(value))
         } else if unit.eq_ignore_ascii_case("%") {
             Ok(Val::Percent(value))
         } else if unit.eq_ignore_ascii_case("vw") {
@@ -132,6 +137,7 @@ impl PartialEq for Val {
                 | (Self::Vh(_), Self::Vh(_))
                 | (Self::VMin(_), Self::VMin(_))
                 | (Self::VMax(_), Self::VMax(_))
+                | (Self::PhysicalPx(_), Self::PhysicalPx(_))
         );
 
         let left = match self {
@@ -141,7 +147,8 @@ impl PartialEq for Val {
             | Self::Vw(v)
             | Self::Vh(v)
             | Self::VMin(v)
-            | Self::VMax(v) => Some(v),
+            | Self::VMax(v)
+            | Self::PhysicalPx(v) => Some(v),
         };
 
         let right = match other {
@@ -151,7 +158,8 @@ impl PartialEq for Val {
             | Self::Vw(v)
             | Self::Vh(v)
             | Self::VMin(v)
-            | Self::VMax(v) => Some(v),
+            | Self::VMax(v)
+            | Self::PhysicalPx(v) => Some(v),
         };
 
         match (same_unit, left, right) {
@@ -323,6 +331,7 @@ impl Val {
             (Val::Vh(u), Val::Vh(v)) => Ok(Val::Vh(u + v)),
             (Val::VMin(u), Val::VMin(v)) => Ok(Val::VMin(u + v)),
             (Val::VMax(u), Val::VMax(v)) => Ok(Val::VMax(u + v)),
+            (Val::PhysicalPx(u), Val::PhysicalPx(v)) => Ok(Val::PhysicalPx(u + v)),
             _ => Err(ValArithmeticError::IncompatibleUnits),
         }
     }
@@ -347,6 +356,7 @@ impl Val {
             (Val::Vh(u), Val::Vh(v)) => Ok(Val::Vh(u - v)),
             (Val::VMin(u), Val::VMin(v)) => Ok(Val::VMin(u - v)),
             (Val::VMax(u), Val::VMax(v)) => Ok(Val::VMax(u - v)),
+            (Val::PhysicalPx(u), Val::PhysicalPx(v)) => Ok(Val::PhysicalPx(u - v)),
             _ => Err(ValArithmeticError::IncompatibleUnits),
         }
     }
@@ -370,6 +380,7 @@ impl Mul<f32> for Val {
             Val::Vh(value) => Val::Vh(value * rhs),
             Val::VMin(value) => Val::VMin(value * rhs),
             Val::VMax(value) => Val::VMax(value * rhs),
+            Val::PhysicalPx(value) => Val::PhysicalPx(value * rhs),
         }
     }
 }
@@ -383,7 +394,8 @@ impl MulAssign<f32> for Val {
             | Val::Vw(value)
             | Val::Vh(value)
             | Val::VMin(value)
-            | Val::VMax(value) => *value *= rhs,
+            | Val::VMax(value)
+            | Val::PhysicalPx(value) => *value *= rhs,
         }
     }
 }
@@ -400,6 +412,7 @@ impl Div<f32> for Val {
             Val::Vh(value) => Val::Vh(value / rhs),
             Val::VMin(value) => Val::VMin(value / rhs),
             Val::VMax(value) => Val::VMax(value / rhs),
+            Val::PhysicalPx(value) => Val::PhysicalPx(value / rhs),
         }
     }
 }
@@ -413,7 +426,8 @@ impl DivAssign<f32> for Val {
             | Val::Vw(value)
             | Val::Vh(value)
             | Val::VMin(value)
-            | Val::VMax(value) => *value /= rhs,
+            | Val::VMax(value)
+            | Val::PhysicalPx(value) => *value /= rhs,
         }
     }
 }
@@ -429,6 +443,7 @@ impl Neg for Val {
             Val::Vh(value) => Val::Vh(-value),
             Val::VMin(value) => Val::VMin(-value),
             Val::VMax(value) => Val::VMax(-value),
+            Val::PhysicalPx(value) => Val::PhysicalPx(-value),
             _ => self,
         }
     }
@@ -456,6 +471,7 @@ impl Val {
         match self {
             Val::Percent(value) => Ok(physical_base_value * value / 100.0),
             Val::Px(value) => Ok(value * scale_factor),
+            Val::PhysicalPx(value) => Ok(value),
             Val::Vw(value) => Ok(physical_target_size.x * value / 100.0),
             Val::Vh(value) => Ok(physical_target_size.y * value / 100.0),
             Val::VMin(value) => {
@@ -465,20 +481,6 @@ impl Val {
                 Ok(physical_target_size.x.max(physical_target_size.y) * value / 100.0)
             }
             Val::Auto => Err(ValArithmeticError::NonEvaluable),
-        }
-    }
-}
-
-impl From<Val> for FontSize {
-    fn from(value: Val) -> Self {
-        match value {
-            Val::Auto => FontSize::Rem(1.),
-            Val::Px(px) => FontSize::Px(px),
-            Val::Percent(percent) => FontSize::Rem(percent / 100.),
-            Val::Vw(vw) => FontSize::Vw(vw),
-            Val::Vh(vh) => FontSize::Vh(vh),
-            Val::VMin(vmin) => FontSize::VMin(vmin),
-            Val::VMax(vmax) => FontSize::VMax(vmax),
         }
     }
 }
@@ -501,6 +503,9 @@ impl TryStableInterpolate for Val {
             (Val::Vh(a), Val::Vh(b)) => Ok(Val::Vh(a.interpolate_stable(b, t))),
             (Val::VMin(a), Val::VMin(b)) => Ok(Val::VMin(a.interpolate_stable(b, t))),
             (Val::VMax(a), Val::VMax(b)) => Ok(Val::VMax(a.interpolate_stable(b, t))),
+            (Val::PhysicalPx(a), Val::PhysicalPx(b)) => {
+                Ok(Val::PhysicalPx(a.interpolate_stable(b, t)))
+            }
             (Val::Auto, Val::Auto) => Ok(Val::Auto),
             _ => Err(MismatchedUnitsError),
         }
@@ -540,6 +545,11 @@ pub const fn auto() -> Val {
 /// Returns a [`Val::Px`] representing a value in logical pixels.
 pub fn px<T: ValNum>(value: T) -> Val {
     Val::Px(value.val_num_f32())
+}
+
+/// Returns a [`Val::PhysicalPx`] representing a value in physical pixels of the UI render target.
+pub fn physical_px<T: ValNum>(value: T) -> Val {
+    Val::PhysicalPx(value.val_num_f32())
 }
 
 /// Returns a [`Val::Percent`] representing a percentage of the parent node's length
@@ -1192,6 +1202,19 @@ mod tests {
     }
 
     #[test]
+    fn val_resolve_physical_px_ignores_scale() {
+        let size = 250.;
+        let viewport_size = vec2(1000., 500.);
+
+        for scale_factor in [0.25, 1., 3.] {
+            assert_eq!(
+                Val::PhysicalPx(10.).resolve(scale_factor, size, viewport_size),
+                Ok(10.)
+            );
+        }
+    }
+
+    #[test]
     fn val_resolve_viewport_coords() {
         let size = 250.;
         let viewport_size = vec2(500., 500.);
@@ -1253,6 +1276,10 @@ mod tests {
         assert_eq!(Val::Vh(1.).try_add(Val::Vh(2.)), Ok(Val::Vh(3.)));
         assert_eq!(Val::VMin(1.).try_add(Val::VMin(2.)), Ok(Val::VMin(3.)));
         assert_eq!(Val::VMax(1.).try_add(Val::VMax(2.)), Ok(Val::VMax(3.)));
+        assert_eq!(
+            Val::PhysicalPx(1.).try_add(Val::PhysicalPx(2.)),
+            Ok(Val::PhysicalPx(3.))
+        );
     }
 
     #[test]
@@ -1282,6 +1309,10 @@ mod tests {
         assert_eq!(Val::Vh(3.).try_sub(Val::Vh(2.)), Ok(Val::Vh(1.)));
         assert_eq!(Val::VMin(3.).try_sub(Val::VMin(2.)), Ok(Val::VMin(1.)));
         assert_eq!(Val::VMax(3.).try_sub(Val::VMax(2.)), Ok(Val::VMax(1.)));
+        assert_eq!(
+            Val::PhysicalPx(3.).try_sub(Val::PhysicalPx(2.)),
+            Ok(Val::PhysicalPx(1.))
+        );
     }
 
     #[test]
@@ -1311,6 +1342,10 @@ mod tests {
         assert_eq!("3.5px".parse::<Val>(), Ok(Val::Px(3.5)));
         assert_eq!("-3px".parse::<Val>(), Ok(Val::Px(-3.)));
         assert_eq!("3.5 PX".parse::<Val>(), Ok(Val::Px(3.5)));
+
+        assert_eq!("3physicalpx".parse::<Val>(), Ok(Val::PhysicalPx(3.)));
+        assert_eq!("3 physicalpx".parse::<Val>(), Ok(Val::PhysicalPx(3.)));
+        assert_eq!("3.5 PHYSICALPX".parse::<Val>(), Ok(Val::PhysicalPx(3.5)));
 
         assert_eq!("3%".parse::<Val>(), Ok(Val::Percent(3.)));
         assert_eq!("3 %".parse::<Val>(), Ok(Val::Percent(3.)));
@@ -1401,6 +1436,7 @@ mod tests {
     fn val_constructor_fns_return_correct_val_variant() {
         assert_eq!(auto(), Val::Auto);
         assert_eq!(px(0.0), Val::Px(0.0));
+        assert_eq!(physical_px(0.0), Val::PhysicalPx(0.0));
         assert_eq!(percent(0.0), Val::Percent(0.0));
         assert_eq!(vw(0.0), Val::Vw(0.0));
         assert_eq!(vh(0.0), Val::Vh(0.0));

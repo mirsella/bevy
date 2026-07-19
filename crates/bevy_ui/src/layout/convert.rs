@@ -18,6 +18,7 @@ impl Val {
             Val::Auto => style_helpers::auto(),
             Val::Percent(value) => style_helpers::percent(value / 100.),
             Val::Px(value) => style_helpers::length(context.scale_factor * value),
+            Val::PhysicalPx(value) => style_helpers::length(value),
             Val::VMin(value) => {
                 style_helpers::length(context.physical_size.min_element() * value / 100.)
             }
@@ -34,6 +35,7 @@ impl Val {
             Val::Auto => style_helpers::length(0.0_f32),
             Val::Percent(value) => style_helpers::percent(value / 100.),
             Val::Px(value) => style_helpers::length(context.scale_factor * value),
+            Val::PhysicalPx(value) => style_helpers::length(value),
             Val::VMin(value) => {
                 style_helpers::length(context.physical_size.min_element() * value / 100.)
             }
@@ -678,6 +680,7 @@ mod tests {
             (Val::Auto, LengthPercentage::length(0.)),
             (Val::Percent(1.), LengthPercentage::percent(0.01)),
             (Val::Px(1.), LengthPercentage::length(2.)),
+            (Val::PhysicalPx(1.), LengthPercentage::length(1.)),
             (Val::Vw(1.), LengthPercentage::length(8.)),
             (Val::Vh(1.), LengthPercentage::length(6.)),
             (Val::VMin(2.), LengthPercentage::length(12.)),
