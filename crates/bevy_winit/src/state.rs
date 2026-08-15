@@ -500,6 +500,12 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.app_exit.is_none() {
+            self.world_mut().write_message(AppExit::Success);
+            self.run_app_update();
+            self.app_exit = Some(self.app.should_exit().unwrap_or(AppExit::Success));
+        }
+
         // Drop windows while event loop is still active, before TLS destruction.
         // Prevents panic on macOS when exiting from exclusive fullscreen.
         WINIT_WINDOWS.with(|ww| ww.borrow_mut().windows.clear());

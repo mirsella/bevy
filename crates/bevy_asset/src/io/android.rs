@@ -17,8 +17,7 @@ pub struct AndroidAssetReader;
 
 impl AssetReader for AndroidAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        let asset_manager = bevy_android::ANDROID_APP
-            .get()
+        let asset_manager = bevy_android::get()
             .expect("Bevy must be setup with the #[bevy_main] macro on Android")
             .asset_manager();
         let mut opened_asset = asset_manager
@@ -31,8 +30,7 @@ impl AssetReader for AndroidAssetReader {
 
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
         let meta_path = get_meta_path(path);
-        let asset_manager = bevy_android::ANDROID_APP
-            .get()
+        let asset_manager = bevy_android::get()
             .expect("Bevy must be setup with the #[bevy_main] macro on Android")
             .asset_manager();
         let mut opened_asset = asset_manager
@@ -47,8 +45,7 @@ impl AssetReader for AndroidAssetReader {
         &'a self,
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
-        let asset_manager = bevy_android::ANDROID_APP
-            .get()
+        let asset_manager = bevy_android::get()
             .expect("Bevy must be setup with the #[bevy_main] macro on Android")
             .asset_manager();
         let opened_assets_dir = asset_manager
@@ -73,8 +70,7 @@ impl AssetReader for AndroidAssetReader {
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
-        let asset_manager = bevy_android::ANDROID_APP
-            .get()
+        let asset_manager = bevy_android::get()
             .expect("Bevy must be setup with the #[bevy_main] macro on Android")
             .asset_manager();
         // HACK: `AssetManager` does not provide a way to check if path
