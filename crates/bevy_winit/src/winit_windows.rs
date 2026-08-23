@@ -422,6 +422,7 @@ pub(crate) fn attempt_grab(
     }
 
     let grab_result = match grab_mode {
+        CursorGrabMode::None if cfg!(any(target_os = "android", target_os = "ios")) => Ok(()),
         CursorGrabMode::None => winit_window.set_cursor_grab(WinitCursorGrabMode::None),
         CursorGrabMode::Confined => winit_window
             .set_cursor_grab(WinitCursorGrabMode::Confined)
