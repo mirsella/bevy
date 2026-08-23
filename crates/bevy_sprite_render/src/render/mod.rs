@@ -1161,21 +1161,25 @@ pub fn extract_srgb_sprite_camera_phases(
 pub struct SrgbSpriteTexture {
     texture: CachedTexture,
     resolve_texture: Option<CachedTexture>,
-}
-
-#[derive(Component)]
-pub struct SrgbCompositeBindGroup {
-    bind_group: BindGroup,
+    composite_bind_group: BindGroup,
 }
 
 pub fn prepare_srgb_sprite_textures(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     mut texture_cache: ResMut<TextureCache>,
-    views: Query<(Entity, &ExtractedCamera, &ExtractedView, &Msaa)>,
+    pipeline_cache: Res<PipelineCache>,
+    composite_pipeline: Res<SrgbCompositePipeline>,
+    views: Query<(
+        Entity,
+        &ExtractedCamera,
+        &ExtractedView,
+        &Msaa,
+        Option<&SrgbSpriteTexture>,
+    )>,
     srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
 ) {
-    for (entity, camera, view, msaa) in &views {
+    for (entity, camera, view, msaa, current_texture) in &views {
         if !srgb_phases.contains_key(&view.retained_view_entity) {
             continue;
         }
@@ -1225,36 +1229,29 @@ pub fn prepare_srgb_sprite_textures(
             None
         };
 
-        commands.entity(entity).insert(SrgbSpriteTexture {
-            texture,
-            resolve_texture,
-        });
-    }
-}
-
-pub fn prepare_srgb_composite_bind_groups(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    pipeline_cache: Res<PipelineCache>,
-    composite_pipeline: Res<SrgbCompositePipeline>,
-    views: Query<(Entity, &SrgbSpriteTexture)>,
-) {
-    for (entity, srgb_texture) in &views {
-        let texture_view = srgb_texture
-            .resolve_texture
-            .as_ref()
-            .map(|texture| &texture.default_view)
-            .unwrap_or(&srgb_texture.texture.default_view);
-
-        let bind_group = render_device.create_bind_group(
+        let texture_view = &resolve_texture.as_ref().unwrap_or(&texture).default_view;
+        if current_texture.is_some_and(|current| {
+            current.texture.default_view.id() == texture.default_view.id()
+                && current
+                    .resolve_texture
+                    .as_ref()
+                    .map(|texture| texture.default_view.id())
+                    == resolve_texture
+                        .as_ref()
+                        .map(|texture| texture.default_view.id())
+        }) {
+            continue;
+        }
+        let composite_bind_group = render_device.create_bind_group(
             "srgb_composite_bind_group",
             &pipeline_cache.get_bind_group_layout(&composite_pipeline.layout),
             &BindGroupEntries::sequential((texture_view, &composite_pipeline.sampler)),
         );
-
-        commands
-            .entity(entity)
-            .insert(SrgbCompositeBindGroup { bind_group });
+        commands.entity(entity).insert(SrgbSpriteTexture {
+            texture,
+            resolve_texture,
+            composite_bind_group,
+        });
     }
 }
 
@@ -1305,7 +1302,7 @@ pub fn srgb_sprite_pass(
 pub fn srgb_composite_pass(
     view: ViewQuery<(
         &ViewTarget,
-        &SrgbCompositeBindGroup,
+        &SrgbSpriteTexture,
         &SrgbCompositePipelineId,
         &ExtractedView,
     )>,
@@ -1313,7 +1310,7 @@ pub fn srgb_composite_pass(
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let (view_target, composite_bind_group, composite_pipeline_id, view) = view.into_inner();
+    let (view_target, srgb_texture, composite_pipeline_id, view) = view.into_inner();
 
     let Some(phase) = srgb_phases.get(&view.retained_view_entity) else {
         return;
@@ -1349,7 +1346,7 @@ pub fn srgb_composite_pass(
     });
 
     render_pass.set_render_pipeline(pipeline);
-    render_pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
+    render_pass.set_bind_group(0, &srgb_texture.composite_bind_group, &[]);
     render_pass.draw(0..3, 0..1);
 }
 

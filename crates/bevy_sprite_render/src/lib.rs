@@ -143,7 +143,6 @@ impl Plugin for SpriteRenderPlugin {
                         prepare_sprite_image_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         prepare_sprite_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         prepare_srgb_sprite_textures.in_set(RenderSystems::PrepareResources),
-                        prepare_srgb_composite_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                         sort_binned_render_phase::<Opaque2d>.in_set(RenderSystems::PhaseSort),
                         sort_binned_render_phase::<AlphaMask2d>.in_set(RenderSystems::PhaseSort),
                         sort_phase_system::<SrgbTransparent2d>.in_set(RenderSystems::PhaseSort),
