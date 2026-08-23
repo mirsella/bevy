@@ -676,7 +676,7 @@ pub fn prepare_mesh_view_bind_groups(
     (ssr_buffer, contact_shadows_buffer, oit_buffers): (
         Res<ScreenSpaceReflectionsBuffer>,
         Res<ContactShadowsBuffer>,
-        Res<OitBuffers>,
+        Option<Res<OitBuffers>>,
     ),
     (
         decals_buffer,
@@ -813,6 +813,9 @@ pub fn prepare_mesh_view_bind_groups(
             }
 
             if let Some(view_oit_settings_offset) = view_oit_settings_offset {
+                let oit_buffers = oit_buffers
+                    .as_ref()
+                    .expect("OIT view requires OrderIndependentTransparencyPlugin");
                 layout_key |= MeshPipelineViewLayoutKey::OIT_ENABLED;
                 offsets.push(view_oit_settings_offset.offset);
                 entries = entries.extend_with_indices((

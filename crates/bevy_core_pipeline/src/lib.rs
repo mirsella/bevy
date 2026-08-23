@@ -42,7 +42,10 @@ use bevy_render::RenderApp;
 use oit::OrderIndependentTransparencyPlugin;
 
 #[derive(Default)]
-pub struct CorePipelinePlugin;
+pub struct CorePipelinePlugin {
+    /// Prevents [`OrderIndependentTransparencyPlugin`] from being added.
+    pub disable_oit: bool,
+}
 
 impl Plugin for CorePipelinePlugin {
     fn build(&self, app: &mut App) {
@@ -53,10 +56,12 @@ impl Plugin for CorePipelinePlugin {
                 BlitPlugin,
                 TonemappingPlugin,
                 UpscalingPlugin,
-                OrderIndependentTransparencyPlugin,
                 MipGenerationPlugin,
                 BackgroundMotionVectorsPlugin,
             ));
+        if !self.disable_oit {
+            app.add_plugins(OrderIndependentTransparencyPlugin);
+        }
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
