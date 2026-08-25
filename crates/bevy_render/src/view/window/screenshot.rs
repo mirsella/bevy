@@ -1,5 +1,6 @@
 use super::ExtractedWindows;
 use crate::{
+    camera::NormalizedRenderTargetExt,
     gpu_readback,
     render_asset::RenderAssets,
     render_resource::{
@@ -8,12 +9,14 @@ use crate::{
     },
     renderer::RenderDevice,
     texture::{GpuImage, ManualTextureViews, OutputColorAttachment},
-    view::{prepare_view_attachments, prepare_view_targets, ViewTargetAttachments, WindowSurfaces},
+    view::{prepare_view_attachments, prepare_view_targets, ViewTargetAttachments},
     ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use alloc::{borrow::Cow, sync::Arc};
 use bevy_app::{First, Plugin, Update};
-use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle, RenderAssetUsages};
+use bevy_asset::{
+    embedded_asset, load_embedded_asset, AssetServer, Assets, Handle, RenderAssetUsages,
+};
 use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -28,13 +31,13 @@ use bevy_material::{
         VertexState,
     },
 };
+use bevy_math::UVec2;
 use bevy_platform::collections::HashSet;
 use bevy_reflect::Reflect;
 use bevy_shader::Shader;
 use bevy_tasks::AsyncComputeTaskPool;
 use bevy_utils::default;
-use bevy_window::{PrimaryWindow, WindowRef};
-use core::ops::Deref;
+use bevy_window::{PrimaryWindow, Window, WindowRef};
 use std::{
     path::Path,
     sync::{
@@ -79,6 +82,15 @@ pub struct ScreenshotCaptured {
 #[reflect(Component, Debug)]
 pub struct Screenshot(pub RenderTarget);
 
+/// The dimensions of the image returned for a [`Screenshot`].
+///
+/// Rendering still occurs at the target's native resolution. The completed frame is resized on the
+/// GPU before readback, so this does not affect cameras, UI layout, or the presented image.
+/// Both dimensions must be nonzero and no larger than the render target.
+#[derive(Component, Deref, DerefMut, Reflect, Debug)]
+#[reflect(Component, Debug)]
+pub struct ScreenshotResolution(pub UVec2);
+
 /// A marker component that indicates that a screenshot is currently being captured.
 #[derive(Component, Default)]
 pub struct Capturing;
@@ -111,18 +123,24 @@ impl Screenshot {
 }
 
 struct ScreenshotPreparedState {
-    pub texture: Texture,
-    pub buffer: Buffer,
-    pub bind_group: BindGroup,
-    pub pipeline_id: CachedRenderPipelineId,
-    pub size: Extent3d,
+    texture: Texture,
+    resized_texture: Option<(Texture, TextureView)>,
+    buffer: Buffer,
+    bind_group: BindGroup,
+    pipeline_id: CachedRenderPipelineId,
+    size: Extent3d,
+}
+
+struct RenderScreenshotTarget {
+    target: NormalizedRenderTarget,
+    resolution: Option<UVec2>,
 }
 
 #[derive(Resource, Deref, DerefMut)]
 pub struct CapturedScreenshots(pub Arc<Mutex<Receiver<(Entity, Image)>>>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
-struct RenderScreenshotTargets(EntityHashMap<NormalizedRenderTarget>);
+struct RenderScreenshotTargets(EntityHashMap<RenderScreenshotTarget>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct RenderScreenshotsPrepared(EntityHashMap<ScreenshotPreparedState>);
@@ -219,7 +237,10 @@ fn extract_screenshots(
             SystemState<(
                 Commands,
                 Query<Entity, With<PrimaryWindow>>,
-                Query<(Entity, &Screenshot), Without<Capturing>>,
+                Query<(Entity, &'static Window)>,
+                Res<Assets<Image>>,
+                Res<ManualTextureViews>,
+                Query<(Entity, &Screenshot, Option<&ScreenshotResolution>), Without<Capturing>>,
             )>,
         >,
     >,
@@ -229,7 +250,7 @@ fn extract_screenshots(
         *system_state = Some(SystemState::new(&mut main_world));
     }
     let system_state = system_state.as_mut().unwrap();
-    let (mut commands, primary_window, screenshots) =
+    let (mut commands, primary_window, windows, images, manual_texture_views, screenshots) =
         system_state.get_mut(&mut main_world).unwrap();
 
     targets.clear();
@@ -237,7 +258,13 @@ fn extract_screenshots(
 
     let primary_window = primary_window.iter().next();
 
-    for (entity, screenshot) in screenshots.iter() {
+    for (entity, screenshot, resolution) in screenshots.iter() {
+        let resolution = resolution.map(|resolution| resolution.0);
+        if resolution.is_some_and(|resolution| resolution.x == 0 || resolution.y == 0) {
+            error!("Screenshot resolution must be nonzero, skipping entity {entity}");
+            commands.entity(entity).despawn();
+            continue;
+        }
         let render_target = screenshot.0.clone();
         let Some(render_target) = render_target.normalize(primary_window) else {
             warn!(
@@ -246,6 +273,27 @@ fn extract_screenshots(
             );
             continue;
         };
+        if matches!(render_target, NormalizedRenderTarget::None { .. }) {
+            error!("Cannot capture RenderTarget::None, skipping entity {entity}");
+            commands.entity(entity).despawn();
+            continue;
+        }
+        let Ok(info) =
+            render_target.get_render_target_info(windows.iter(), &images, &manual_texture_views)
+        else {
+            // The requested asset or window may become available on a later frame.
+            continue;
+        };
+        if let Some(resolution) = resolution
+            && (resolution.x > info.physical_size.x || resolution.y > info.physical_size.y)
+        {
+            error!(
+                "Screenshot resolution {resolution} exceeds render target size {}, skipping entity {entity}",
+                info.physical_size
+            );
+            commands.entity(entity).despawn();
+            continue;
+        }
         if seen_targets.contains(&render_target) {
             warn!(
                 "Duplicate render target for screenshot, skipping entity {}: {:?}",
@@ -256,7 +304,13 @@ fn extract_screenshots(
             continue;
         }
         seen_targets.insert(render_target.clone());
-        targets.insert(entity, render_target);
+        targets.insert(
+            entity,
+            RenderScreenshotTarget {
+                target: render_target,
+                resolution,
+            },
+        );
         commands.entity(entity).insert(Capturing);
     }
 
@@ -266,105 +320,76 @@ fn extract_screenshots(
 fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
-    window_surfaces: Res<WindowSurfaces>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
-    pipeline_cache: Res<PipelineCache>,
+    mut pipeline_cache: ResMut<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>,
     images: Res<RenderAssets<GpuImage>>,
+    windows: Res<ExtractedWindows>,
     manual_texture_views: Res<ManualTextureViews>,
     mut view_target_attachments: ResMut<ViewTargetAttachments>,
 ) {
     prepared.clear();
-    for (entity, target) in targets.iter() {
-        match target {
+    for (entity, request) in targets.iter() {
+        let size = match &request.target {
             NormalizedRenderTarget::Window(window) => {
-                let window = window.entity();
-                let Some(surface_data) = window_surfaces.surfaces.get(&window) else {
-                    warn!("Unknown window for screenshot, skipping: {}", window);
-                    continue;
-                };
-                let view_format = surface_data
-                    .texture_view_format
-                    .unwrap_or(surface_data.configuration.format);
-                let size = Extent3d {
-                    width: surface_data.configuration.width,
-                    height: surface_data.configuration.height,
+                windows.get(&window.entity()).map(|window| Extent3d {
+                    width: window.physical_width,
+                    height: window.physical_height,
                     ..default()
-                };
-                let (texture_view, state) = prepare_screenshot_state(
-                    size,
-                    view_format,
-                    &render_device,
-                    &screenshot_pipeline,
-                    &pipeline_cache,
-                    &mut pipelines,
-                );
-                prepared.insert(*entity, state);
-                view_target_attachments.insert(
-                    target.clone(),
-                    OutputColorAttachment::new(texture_view.clone(), view_format),
-                );
+                })
             }
-            NormalizedRenderTarget::Image(image) => {
-                let Some(gpu_image) = images.get(&image.handle) else {
-                    warn!("Unknown image for screenshot, skipping: {:?}", image);
-                    continue;
-                };
-                let view_format = gpu_image.view_format();
-                let (texture_view, state) = prepare_screenshot_state(
-                    gpu_image.texture_descriptor.size,
-                    view_format,
-                    &render_device,
-                    &screenshot_pipeline,
-                    &pipeline_cache,
-                    &mut pipelines,
-                );
-                prepared.insert(*entity, state);
-                view_target_attachments.insert(
-                    target.clone(),
-                    OutputColorAttachment::new(texture_view.clone(), view_format),
-                );
-            }
-            NormalizedRenderTarget::TextureView(texture_view) => {
-                let Some(manual_texture_view) = manual_texture_views.get(texture_view) else {
-                    warn!(
-                        "Unknown manual texture view for screenshot, skipping: {:?}",
-                        texture_view
-                    );
-                    continue;
-                };
-                let view_format = manual_texture_view.view_format;
-                let size = manual_texture_view.size.to_extents();
-                let (texture_view, state) = prepare_screenshot_state(
-                    size,
-                    view_format,
-                    &render_device,
-                    &screenshot_pipeline,
-                    &pipeline_cache,
-                    &mut pipelines,
-                );
-                prepared.insert(*entity, state);
-                view_target_attachments.insert(
-                    target.clone(),
-                    OutputColorAttachment::new(texture_view.clone(), view_format),
-                );
-            }
-            NormalizedRenderTarget::None { .. } => {
-                // Nothing to screenshot!
-            }
-        }
+            NormalizedRenderTarget::Image(image) => images
+                .get(&image.handle)
+                .map(|image| image.texture_descriptor.size),
+            NormalizedRenderTarget::TextureView(texture_view) => manual_texture_views
+                .get(texture_view)
+                .map(|texture_view| texture_view.size.to_extents()),
+            NormalizedRenderTarget::None { .. } => None,
+        };
+        let Some((size, view_format)) = size.zip(request.target.get_texture_view_format(
+            &windows,
+            &images,
+            &manual_texture_views,
+        )) else {
+            warn!(target = ?request.target, "Unknown render target for screenshot, skipping");
+            continue;
+        };
+        let (texture_view, state) = prepare_screenshot_state(
+            size,
+            request.resolution,
+            view_format,
+            &render_device,
+            &screenshot_pipeline,
+            &mut pipeline_cache,
+            &mut pipelines,
+        );
+        prepared.insert(*entity, state);
+        view_target_attachments.insert(
+            request.target.clone(),
+            OutputColorAttachment::new(texture_view, view_format),
+        );
     }
 }
 
 fn prepare_screenshot_state(
     size: Extent3d,
+    resolution: Option<UVec2>,
     format: TextureFormat,
     render_device: &RenderDevice,
     pipeline: &ScreenshotToScreenPipeline,
-    pipeline_cache: &PipelineCache,
+    pipeline_cache: &mut PipelineCache,
     pipelines: &mut SpecializedRenderPipelines<ScreenshotToScreenPipeline>,
 ) -> (TextureView, ScreenshotPreparedState) {
+    let output_size = resolution.map_or(size, |resolution| Extent3d {
+        width: resolution.x,
+        height: resolution.y,
+        ..default()
+    });
+    assert!(
+        output_size.width <= size.width && output_size.height <= size.height,
+        "screenshot resolution must not exceed the render target"
+    );
     let texture = render_device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot-capture-rendertarget"),
         size,
@@ -378,9 +403,24 @@ fn prepare_screenshot_state(
         view_formats: &[],
     });
     let texture_view = texture.create_view(&Default::default());
+    let resized_texture = (output_size != size).then(|| {
+        let texture = render_device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot-resized-rendertarget"),
+            size: output_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        (texture, view)
+    });
     let buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("screenshot-transfer-buffer"),
-        size: gpu_readback::get_aligned_size(size, format.pixel_size().unwrap_or(0) as u32) as u64,
+        size: gpu_readback::get_aligned_size(output_size, format.pixel_size().unwrap_or(0) as u32)
+            as u64,
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -390,15 +430,17 @@ fn prepare_screenshot_state(
         &BindGroupEntries::single(&texture_view),
     );
     let pipeline_id = pipelines.specialize(pipeline_cache, pipeline, format);
+    pipeline_cache.block_on_render_pipeline(pipeline_id);
 
     (
         texture_view,
         ScreenshotPreparedState {
             texture,
+            resized_texture,
             buffer,
             bind_group,
             pipeline_id,
-            size,
+            size: output_size,
         },
     )
 }
@@ -411,6 +453,7 @@ impl Plugin for ScreenshotPlugin {
 
         let (tx, rx) = std::sync::mpsc::channel();
         app.register_type::<Screenshot>()
+            .register_type::<ScreenshotResolution>()
             .register_type::<ScreenshotCaptured>()
             .insert_resource(CapturedScreenshots(Arc::new(Mutex::new(rx))))
             .add_systems(
@@ -503,79 +546,18 @@ pub(crate) fn submit_screenshot_commands(world: &World, encoder: &mut CommandEnc
     let windows = world.resource::<ExtractedWindows>();
     let manual_texture_views = world.resource::<ManualTextureViews>();
 
-    for (entity, render_target) in targets.iter() {
-        match render_target {
-            NormalizedRenderTarget::Window(window) => {
-                let window = window.entity();
-                let Some(window) = windows.get(&window) else {
-                    continue;
-                };
-                let width = window.physical_width;
-                let height = window.physical_height;
-                let Some(texture_format) = window.swap_chain_texture_view_format else {
-                    continue;
-                };
-                let Some(swap_chain_texture_view) = window.swap_chain_texture_view.as_ref() else {
-                    continue;
-                };
-                render_screenshot(
-                    encoder,
-                    prepared,
-                    pipelines,
-                    entity,
-                    width,
-                    height,
-                    texture_format,
-                    swap_chain_texture_view,
-                );
-            }
-            NormalizedRenderTarget::Image(image) => {
-                let Some(gpu_image) = gpu_images.get(&image.handle) else {
-                    warn!("Unknown image for screenshot, skipping: {:?}", image);
-                    continue;
-                };
-                let width = gpu_image.texture_descriptor.size.width;
-                let height = gpu_image.texture_descriptor.size.height;
-                let texture_format = gpu_image.texture_descriptor.format;
-                let texture_view = gpu_image.texture_view.deref();
-                render_screenshot(
-                    encoder,
-                    prepared,
-                    pipelines,
-                    entity,
-                    width,
-                    height,
-                    texture_format,
-                    texture_view,
-                );
-            }
-            NormalizedRenderTarget::TextureView(texture_view) => {
-                let Some(texture_view) = manual_texture_views.get(texture_view) else {
-                    warn!(
-                        "Unknown manual texture view for screenshot, skipping: {:?}",
-                        texture_view
-                    );
-                    continue;
-                };
-                let width = texture_view.size.x;
-                let height = texture_view.size.y;
-                let texture_format = texture_view.view_format;
-                let texture_view = texture_view.texture_view.deref();
-                render_screenshot(
-                    encoder,
-                    prepared,
-                    pipelines,
-                    entity,
-                    width,
-                    height,
-                    texture_format,
-                    texture_view,
-                );
-            }
-            NormalizedRenderTarget::None { .. } => {
-                // Nothing to screenshot!
-            }
-        };
+    for (entity, request) in targets.iter() {
+        let texture_view =
+            request
+                .target
+                .get_texture_view(windows, gpu_images, manual_texture_views);
+        render_screenshot(
+            encoder,
+            prepared,
+            pipelines,
+            entity,
+            texture_view.map(|view| &**view),
+        );
     }
 }
 
@@ -584,55 +566,87 @@ fn render_screenshot(
     prepared: &RenderScreenshotsPrepared,
     pipelines: &PipelineCache,
     entity: &Entity,
-    width: u32,
-    height: u32,
-    texture_format: TextureFormat,
-    texture_view: &wgpu::TextureView,
+    texture_view: Option<&wgpu::TextureView>,
 ) {
-    if let Some(prepared_state) = &prepared.get(entity) {
-        let extent = Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+    if let Some(prepared_state) = prepared.get(entity) {
+        let pipeline = pipelines
+            .get_render_pipeline(prepared_state.pipeline_id)
+            .expect("screenshot pipeline should be compiled during preparation");
+
+        if let Some((_, resized_view)) = &prepared_state.resized_texture {
+            blit_screenshot(
+                encoder,
+                pipeline,
+                &prepared_state.bind_group,
+                resized_view,
+                "screenshot_resize_pass",
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+        }
+
+        let output_texture = prepared_state
+            .resized_texture
+            .as_ref()
+            .map_or(&prepared_state.texture, |(texture, _)| texture);
         encoder.copy_texture_to_buffer(
-            prepared_state.texture.as_image_copy(),
+            output_texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &prepared_state.buffer,
-                layout: gpu_readback::layout_data(extent, texture_format),
+                layout: gpu_readback::layout_data(
+                    prepared_state.size,
+                    prepared_state.texture.format(),
+                ),
             },
-            extent,
+            prepared_state.size,
         );
 
-        if let Some(pipeline) = pipelines.get_render_pipeline(prepared_state.pipeline_id) {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("screenshot_to_screen_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: texture_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &prepared_state.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+        if let Some(texture_view) = texture_view {
+            blit_screenshot(
+                encoder,
+                pipeline,
+                &prepared_state.bind_group,
+                texture_view,
+                "screenshot_to_screen_pass",
+                wgpu::LoadOp::Load,
+            );
         }
     }
+}
+
+fn blit_screenshot<'a>(
+    encoder: &mut CommandEncoder,
+    pipeline: &'a wgpu::RenderPipeline,
+    bind_group: &'a BindGroup,
+    target: &'a wgpu::TextureView,
+    label: &'static str,
+    load: wgpu::LoadOp<wgpu::Color>,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 pub(crate) fn collect_screenshots(world: &mut World) {
     #[cfg(feature = "trace")]
     let _span = bevy_log::info_span!("collect_screenshots").entered();
 
-    let sender = world.resource::<RenderScreenshotsSender>().deref().clone();
+    let sender = world.resource::<RenderScreenshotsSender>().0.clone();
     let prepared = world.resource::<RenderScreenshotsPrepared>();
 
     for (entity, prepared) in prepared.iter() {
@@ -658,26 +672,20 @@ pub(crate) fn collect_screenshots(world: &mut World) {
             });
             rx.recv().await.unwrap();
             let data = buffer_slice.get_mapped_range();
-            // we immediately move the data to CPU memory to avoid holding the mapped view for long
-            let mut result = Vec::from(&*data);
-            drop(data);
-
-            if result.len() != ((width * height) as usize * pixel_size) {
-                // Our buffer has been padded because we needed to align to a multiple of 256.
-                // We remove this padding here
-                let initial_row_bytes = width as usize * pixel_size;
-                let buffered_row_bytes =
-                    gpu_readback::align_byte_size(width * pixel_size as u32) as usize;
-
-                let mut take_offset = buffered_row_bytes;
-                let mut place_offset = initial_row_bytes;
-                for _ in 1..height {
-                    result.copy_within(take_offset..take_offset + buffered_row_bytes, place_offset);
-                    take_offset += buffered_row_bytes;
-                    place_offset += initial_row_bytes;
+            // Move directly into tightly packed CPU memory instead of copying padding first.
+            let row_bytes = width as usize * pixel_size;
+            let buffered_row_bytes =
+                gpu_readback::align_byte_size(width * pixel_size as u32) as usize;
+            let result = if row_bytes == buffered_row_bytes {
+                Vec::from(&*data)
+            } else {
+                let mut result = Vec::with_capacity(row_bytes * height as usize);
+                for row in data.chunks_exact(buffered_row_bytes) {
+                    result.extend_from_slice(&row[..row_bytes]);
                 }
-                result.truncate(initial_row_bytes * height as usize);
-            }
+                result
+            };
+            drop(data);
 
             if let Err(e) = sender.send((
                 entity,

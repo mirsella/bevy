@@ -203,7 +203,6 @@ struct SurfaceData {
     // TODO: what lifetime should this be?
     surface: WgpuWrapper<wgpu::Surface<'static>>,
     configuration: SurfaceConfiguration,
-    texture_view_format: Option<TextureFormat>,
 }
 
 #[derive(Resource, Default)]
@@ -440,7 +439,6 @@ pub fn create_surfaces(
                 SurfaceData {
                     surface: WgpuWrapper::new(surface),
                     configuration,
-                    texture_view_format,
                 }
             });
 
