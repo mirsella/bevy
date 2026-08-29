@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use winit::event_loop::ActiveEventLoop;
 
 use accesskit::{
-    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, Role, Tree,
-    TreeId, TreeUpdate,
+    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, Rect, Role,
+    Tree, TreeId, TreeUpdate,
 };
 use accesskit_winit::Adapter;
 use bevy_a11y::{
@@ -55,6 +55,7 @@ struct AccessKitState {
     name: String,
     entity: Entity,
     requested: AccessibilityRequested,
+    root_bounds: Rect,
 }
 
 impl AccessKitState {
@@ -62,6 +63,7 @@ impl AccessKitState {
         name: impl Into<String>,
         entity: Entity,
         requested: AccessibilityRequested,
+        root_bounds: Rect,
     ) -> Arc<Mutex<Self>> {
         let name = name.into();
 
@@ -69,12 +71,14 @@ impl AccessKitState {
             name,
             entity,
             requested,
+            root_bounds,
         }))
     }
 
     fn build_root(&mut self) -> Node {
         let mut node = Node::new(Role::Window);
         node.set_label(self.name.clone());
+        node.set_bounds(self.root_bounds);
         node
     }
 
@@ -139,7 +143,9 @@ pub(crate) fn prepare_accessibility_for_window(
     adapters: &mut AccessKitAdapters,
     handlers: &mut WinitActionRequestHandlers,
 ) {
-    let state = AccessKitState::new(name, entity, accessibility_requested);
+    let size = winit_window.inner_size();
+    let root_bounds = Rect::new(0.0, 0.0, f64::from(size.width), f64::from(size.height));
+    let state = AccessKitState::new(name, entity, accessibility_requested, root_bounds);
     let activation_handler = WinitActivationHandler::new(Arc::clone(&state));
 
     let action_request_handler = WinitActionRequestHandler::new();
@@ -260,6 +266,8 @@ fn update_adapter(
         let title = primary_window.title.clone();
         window_node.set_label(title.into_boxed_str());
     }
+    let size = primary_window.physical_size();
+    window_node.set_bounds(Rect::new(0.0, 0.0, f64::from(size.x), f64::from(size.y)));
     window_node.set_children(window_children);
     let node_id = NodeId(primary_window_id.to_bits());
     let window_update = (node_id, window_node);
