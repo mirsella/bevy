@@ -35,6 +35,16 @@ impl AccessKitAdapters {
     pub const fn new() -> Self {
         Self(EntityHashMap::new())
     }
+
+    /// Replaces the adapter's current tree with the root for `window`.
+    pub fn reset_window_tree(&mut self, entity: Entity, window: &Window) -> bool {
+        let Some(adapter) = self.get_mut(&entity) else {
+            return false;
+        };
+        adapter
+            .update_if_active(|| window_tree_update(entity, &window.title, window_bounds(window)));
+        true
+    }
 }
 
 /// Maps window entities to their respective [`ActionRequest`]s.
@@ -75,25 +85,9 @@ impl AccessKitState {
         }))
     }
 
-    fn build_root(&mut self) -> Node {
-        let mut node = Node::new(Role::Window);
-        node.set_label(self.name.clone());
-        node.set_bounds(self.root_bounds);
-        node
-    }
-
     fn build_initial_tree(&mut self) -> TreeUpdate {
-        let root = self.build_root();
-        let accesskit_window_id = NodeId(self.entity.to_bits());
-        let tree = Tree::new(accesskit_window_id);
         self.requested.set(true);
-
-        TreeUpdate {
-            nodes: vec![(accesskit_window_id, root)],
-            tree: Some(tree),
-            tree_id: TreeId::ROOT,
-            focus: accesskit_window_id,
-        }
+        window_tree_update(self.entity, &self.name, self.root_bounds)
     }
 }
 
@@ -261,13 +255,12 @@ fn update_adapter(
         let node_id = NodeId(entity.to_bits());
         to_update.push((node_id, node));
     }
-    let mut window_node = Node::new(Role::Window);
-    if primary_window.focused {
-        let title = primary_window.title.clone();
-        window_node.set_label(title.into_boxed_str());
-    }
-    let size = primary_window.physical_size();
-    window_node.set_bounds(Rect::new(0.0, 0.0, f64::from(size.x), f64::from(size.y)));
+    let mut window_node = window_node(
+        primary_window
+            .focused
+            .then_some(primary_window.title.as_str()),
+        window_bounds(primary_window),
+    );
     window_node.set_children(window_children);
     let node_id = NodeId(primary_window_id.to_bits());
     let window_update = (node_id, window_node);
@@ -278,6 +271,30 @@ fn update_adapter(
         tree_id: TreeId::ROOT,
         focus: NodeId(focus.get().unwrap_or(primary_window_id).to_bits()),
     }
+}
+
+fn window_bounds(window: &Window) -> Rect {
+    let size = window.physical_size();
+    Rect::new(0.0, 0.0, f64::from(size.x), f64::from(size.y))
+}
+
+fn window_tree_update(entity: Entity, label: &str, bounds: Rect) -> TreeUpdate {
+    let root = NodeId(entity.to_bits());
+    TreeUpdate {
+        nodes: vec![(root, window_node(Some(label), bounds))],
+        tree: Some(Tree::new(root)),
+        tree_id: TreeId::ROOT,
+        focus: root,
+    }
+}
+
+fn window_node(label: Option<&str>, bounds: Rect) -> Node {
+    let mut node = Node::new(Role::Window);
+    if let Some(label) = label {
+        node.set_label(label);
+    }
+    node.set_bounds(bounds);
+    node
 }
 
 #[inline]
