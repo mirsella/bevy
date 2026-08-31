@@ -1,7 +1,7 @@
 use crate::{
     render_asset::RenderAssets,
     render_resource::{BindGroupLayout, Buffer, PipelineCache, Sampler, TextureView},
-    renderer::{RenderDevice, WgpuWrapper},
+    renderer::{wgpu_wrapper, RenderDevice},
     texture::GpuImage,
 };
 use bevy_derive::{Deref, DerefMut};
@@ -20,6 +20,11 @@ use super::{BindlessDescriptor, BindlessSlabResourceLimit};
 
 define_atomic_id!(BindGroupId);
 
+wgpu_wrapper! {
+    #[derive(Clone, Debug)]
+    struct WgpuBindGroup(wgpu::BindGroup);
+}
+
 /// Bind groups are responsible for binding render resources (e.g. buffers, textures, samplers)
 /// to a [`TrackedRenderPass`](crate::render_phase::TrackedRenderPass).
 /// This makes them accessible in the pipeline (shaders) as uniforms.
@@ -32,7 +37,7 @@ define_atomic_id!(BindGroupId);
 #[derive(Clone, Debug)]
 pub struct BindGroup {
     id: BindGroupId,
-    value: WgpuWrapper<wgpu::BindGroup>,
+    value: WgpuBindGroup,
 }
 
 impl BindGroup {
@@ -61,7 +66,7 @@ impl From<wgpu::BindGroup> for BindGroup {
     fn from(value: wgpu::BindGroup) -> Self {
         BindGroup {
             id: BindGroupId::new(),
-            value: WgpuWrapper::new(value),
+            value: WgpuBindGroup::new(value),
         }
     }
 }
