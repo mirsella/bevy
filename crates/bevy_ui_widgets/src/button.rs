@@ -13,7 +13,10 @@ use bevy_ecs::{
 use bevy_input::keyboard::{KeyCode, KeyboardInput};
 use bevy_input::ButtonState;
 use bevy_input_focus::FocusedInput;
-use bevy_picking::events::{Cancel, Click, DragEnd, Pointer, Press, Release};
+use bevy_picking::{
+    events::{Cancel, Click, DragEnd, Pointer, Press, Release},
+    prelude::PointerButton,
+};
 use bevy_reflect::Reflect;
 use bevy_ui::{InteractionDisabled, Pressed};
 
@@ -63,7 +66,9 @@ fn button_on_pointer_click(
     >,
     mut commands: Commands,
 ) {
-    if let Ok((pressed, disabled, activate_on_press)) = q_state.get_mut(click.entity) {
+    if click.button == PointerButton::Primary
+        && let Ok((pressed, disabled, activate_on_press)) = q_state.get_mut(click.entity)
+    {
         click.propagate(false);
         if pressed && !disabled && !activate_on_press {
             commands.trigger(Activate {
@@ -86,7 +91,9 @@ fn button_on_pointer_down(
     >,
     mut commands: Commands,
 ) {
-    if let Ok((button, disabled, pressed, activate_on_press)) = q_state.get_mut(press.entity) {
+    if press.button == PointerButton::Primary
+        && let Ok((button, disabled, pressed, activate_on_press)) = q_state.get_mut(press.entity)
+    {
         press.propagate(false);
         if !disabled && !pressed {
             commands.entity(button).insert(Pressed);
@@ -102,7 +109,9 @@ fn button_on_pointer_up(
     mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<Button>>,
     mut commands: Commands,
 ) {
-    if let Ok((button, disabled, pressed)) = q_state.get_mut(release.entity) {
+    if release.button == PointerButton::Primary
+        && let Ok((button, disabled, pressed)) = q_state.get_mut(release.entity)
+    {
         release.propagate(false);
         if !disabled && pressed {
             commands.entity(button).remove::<Pressed>();
@@ -115,7 +124,9 @@ fn button_on_pointer_drag_end(
     mut q_state: Query<(Entity, Has<InteractionDisabled>, Has<Pressed>), With<Button>>,
     mut commands: Commands,
 ) {
-    if let Ok((button, disabled, pressed)) = q_state.get_mut(drag_end.entity) {
+    if drag_end.button == PointerButton::Primary
+        && let Ok((button, disabled, pressed)) = q_state.get_mut(drag_end.entity)
+    {
         drag_end.propagate(false);
         if !disabled && pressed {
             commands.entity(button).remove::<Pressed>();
