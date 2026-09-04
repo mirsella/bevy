@@ -1,5 +1,9 @@
+use alloc::collections::VecDeque;
+
 use approx::relative_eq;
 use bevy_app::{App, AppExit, PluginsState};
+#[cfg(target_os = "ios")]
+use bevy_ecs::message::{MessageRegistry, ShouldUpdateMessages};
 use bevy_ecs::{
     change_detection::{DetectChanges, Res},
     entity::Entity,
@@ -35,7 +39,7 @@ use bevy_window::{
     WindowScaleFactorChanged, WindowThemeChanged,
 };
 #[cfg(target_os = "android")]
-use bevy_window::{CursorOptions, PrimaryWindow, RawHandleWrapper};
+use bevy_window::{CursorOptions, PrimaryWindow, RawHandleWrapper, RawHandleWrapperHolder};
 
 use crate::{
     accessibility::ACCESS_KIT_ADAPTERS,
@@ -72,8 +76,12 @@ pub(crate) struct WinitAppRunnerState {
 
     /// Current app lifecycle state.
     lifecycle: AppLifecycle,
+    /// Whether the platform currently allows active application work.
+    application_active: bool,
     /// The previous app lifecycle state.
     previous_lifecycle: AppLifecycle,
+    /// Lifecycle transitions received while another transition is still being processed.
+    pending_lifecycles: VecDeque<AppLifecycle>,
     /// Bevy window events to send
     bevy_window_events: Vec<bevy_window::WindowEvent>,
     /// Raw Winit window events to send
@@ -103,7 +111,9 @@ impl WinitAppRunnerState {
         Self {
             app,
             lifecycle: AppLifecycle::Idle,
+            application_active: false,
             previous_lifecycle: AppLifecycle::Idle,
+            pending_lifecycles: VecDeque::new(),
             app_exit: None,
             update_mode: UpdateMode::Continuous,
             window_event_received: false,
@@ -173,12 +183,55 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Mark the state as `WillResume`. This will let the schedule run one extra time
         // when actually resuming the app
-        self.lifecycle = AppLifecycle::WillResume;
+        self.application_active = true;
+        let _ = self.queue_lifecycle(AppLifecycle::WillResume);
 
         // Create the initial window if needed
         let mut create_window = SystemState::<CreateWindowParams>::from_world(self.world_mut());
         create_windows(event_loop, create_window.get_mut(self.world_mut()).unwrap());
         create_window.apply(self.world_mut());
+
+        #[cfg(target_os = "android")]
+        {
+            let mut query = self.world_mut().query_filtered::<(
+                Entity,
+                &Window,
+                &CursorOptions,
+                &RawHandleWrapperHolder,
+            ), (With<CachedWindow>, Without<RawHandleWrapper>)>(
+            );
+            if let Ok((entity, window, cursor_options, handle_holder)) = query.single(self.world())
+            {
+                let window = window.clone();
+                let cursor_options = cursor_options.clone();
+                let handle_holder = handle_holder.clone();
+
+                WINIT_WINDOWS.with_borrow_mut(|winit_windows| {
+                    ACCESS_KIT_ADAPTERS.with_borrow_mut(|adapters| {
+                        let mut create_window =
+                            SystemState::<CreateWindowParams>::from_world(self.world_mut());
+
+                        let (.., mut handlers, accessibility_requested, monitors) =
+                            create_window.get_mut(self.world_mut()).unwrap();
+
+                        let winit_window = winit_windows.create_window(
+                            event_loop,
+                            entity,
+                            &window,
+                            &cursor_options,
+                            adapters,
+                            &mut handlers,
+                            &accessibility_requested,
+                            &monitors,
+                        );
+
+                        let wrapper = RawHandleWrapper::new(winit_window).unwrap();
+                        *handle_holder.0.lock().unwrap() = Some(wrapper.clone());
+                        self.world_mut().entity_mut(entity).insert(wrapper);
+                    });
+                });
+            }
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WinitUserEvent) {
@@ -496,7 +549,28 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Mark the state as `WillSuspend`. This will let the schedule run one last time
         // before actually suspending to let the application react
-        self.lifecycle = AppLifecycle::WillSuspend;
+        self.application_active = false;
+        let _transition_queued = self.queue_lifecycle(AppLifecycle::WillSuspend);
+
+        #[cfg(target_os = "android")]
+        {
+            // Remove the `RawHandleWrapper` from the primary window to destroy its surface.
+            let mut query = self
+                .world_mut()
+                .query_filtered::<(Entity, &RawHandleWrapperHolder), With<PrimaryWindow>>();
+            if let Ok((entity, handle_holder)) = query.single(self.world()) {
+                let handle_holder = handle_holder.clone();
+                *handle_holder.0.lock().unwrap() = None;
+                self.world_mut()
+                    .entity_mut(entity)
+                    .remove::<RawHandleWrapper>();
+            }
+
+            if _transition_queued {
+                // Winit requires Android render surfaces to be dropped before this callback returns.
+                self.run_app_update();
+            }
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -535,77 +609,11 @@ impl WinitAppRunnerState {
             should_update = true;
         }
 
-        if self.lifecycle == AppLifecycle::WillSuspend {
-            self.lifecycle = AppLifecycle::Suspended;
-            // Trigger one last update to enter the suspended state
+        if self.lifecycle != self.previous_lifecycle {
             should_update = true;
             self.ran_update_since_last_redraw = false;
 
-            #[cfg(target_os = "android")]
-            {
-                // Remove the `RawHandleWrapper` from the primary window.
-                // This will trigger the surface destruction.
-                let mut query = self
-                    .world_mut()
-                    .query_filtered::<Entity, With<PrimaryWindow>>();
-                if let Ok(entity) = query.single(&self.world()) {
-                    self.world_mut()
-                        .entity_mut(entity)
-                        .remove::<RawHandleWrapper>();
-                }
-            }
-        }
-
-        if self.lifecycle == AppLifecycle::WillResume {
-            self.lifecycle = AppLifecycle::Running;
-            // Trigger the update to enter the running state
-            should_update = true;
-            // Trigger the next redraw to refresh the screen immediately
-            self.redraw_requested = true;
-
-            #[cfg(target_os = "android")]
-            {
-                // Get windows that are cached but without raw handles. Those window were already created, but got their
-                // handle wrapper removed when the app was suspended.
-
-                let mut query = self.world_mut()
-                    .query_filtered::<(Entity, &Window, &CursorOptions), (With<CachedWindow>, Without<RawHandleWrapper>)>();
-                if let Ok((entity, window, cursor_options)) = query.single(&self.world()) {
-                    let window = window.clone();
-                    let cursor_options = cursor_options.clone();
-
-                    WINIT_WINDOWS.with_borrow_mut(|winit_windows| {
-                        ACCESS_KIT_ADAPTERS.with_borrow_mut(|adapters| {
-                            let mut create_window =
-                                SystemState::<CreateWindowParams>::from_world(self.world_mut());
-
-                            let (.., mut handlers, accessibility_requested, monitors) =
-                                create_window.get_mut(self.world_mut()).unwrap();
-
-                            let winit_window = winit_windows.create_window(
-                                event_loop,
-                                entity,
-                                &window,
-                                &cursor_options,
-                                adapters,
-                                &mut handlers,
-                                &accessibility_requested,
-                                &monitors,
-                            );
-
-                            let wrapper = RawHandleWrapper::new(winit_window).unwrap();
-
-                            self.world_mut().entity_mut(entity).insert(wrapper);
-                        });
-                    });
-                }
-            }
-        }
-
-        // Notifies a lifecycle change
-        if self.lifecycle != self.previous_lifecycle {
-            self.previous_lifecycle = self.lifecycle;
-            self.bevy_window_events.send(self.lifecycle);
+            self.notify_lifecycle_change();
         }
 
         // This is recorded before running app.update(), to run the next cycle after a correct timeout.
@@ -684,12 +692,12 @@ impl WinitAppRunnerState {
                         target_os = "android",
                         target_os = "ios",
                         all(target_os = "linux", any(feature = "x11", feature = "wayland"))
-                    )) =>
-                    {
+                    )) => {
                         let visible = WINIT_WINDOWS.with_borrow(|winit_windows| {
-                            winit_windows.windows.iter().any(|(_, w)| {
-                                w.is_visible().unwrap_or(false)
-                            })
+                            winit_windows
+                                .windows
+                                .iter()
+                                .any(|(_, w)| w.is_visible().unwrap_or(false))
                         });
 
                         event_loop.set_control_flow(if visible {
@@ -770,13 +778,84 @@ impl WinitAppRunnerState {
     }
 
     fn run_app_update(&mut self) {
-        self.reset_on_update();
+        loop {
+            self.reset_on_update();
+            if self.lifecycle != self.previous_lifecycle {
+                self.notify_lifecycle_change();
+            }
+            self.forward_bevy_events();
 
-        self.forward_bevy_events();
+            if self.app.plugins_state() != PluginsState::Cleaned {
+                break;
+            }
+            self.update_app();
 
-        if self.app.plugins_state() == PluginsState::Cleaned {
-            self.app.update();
+            self.lifecycle = match self.lifecycle {
+                AppLifecycle::WillSuspend => AppLifecycle::Suspended,
+                AppLifecycle::WillResume => AppLifecycle::Running,
+                _ => match self.pending_lifecycles.pop_front() {
+                    Some(lifecycle) => lifecycle,
+                    None => break,
+                },
+            };
         }
+    }
+
+    fn update_app(&mut self) {
+        #[cfg(target_os = "ios")]
+        if matches!(
+            self.lifecycle,
+            AppLifecycle::WillSuspend | AppLifecycle::Suspended
+        ) || !self.application_active
+        {
+            // Winit's suspension callback means iOS is already backgrounded, where Metal
+            // forbids the render work that updating sub-apps could submit.
+            let main = self.app.main_mut();
+            let message_update = main
+                .world()
+                .get_resource::<MessageRegistry>()
+                .map(|registry| registry.should_update);
+            if let Some(mut registry) = main.world_mut().get_resource_mut::<MessageRegistry>() {
+                registry.should_update = ShouldUpdateMessages::Waiting;
+            }
+            main.run_default_schedule();
+            if let Some(message_update) = message_update
+                && let Some(mut registry) = main.world_mut().get_resource_mut::<MessageRegistry>()
+            {
+                registry.should_update = message_update;
+            }
+            return;
+        }
+
+        self.app.update();
+    }
+
+    fn notify_lifecycle_change(&mut self) {
+        self.previous_lifecycle = self.lifecycle;
+        self.bevy_window_events.send(self.lifecycle);
+    }
+
+    fn queue_lifecycle(&mut self, lifecycle: AppLifecycle) -> bool {
+        let latest = self
+            .pending_lifecycles
+            .back()
+            .copied()
+            .unwrap_or(self.lifecycle);
+        let active = matches!(lifecycle, AppLifecycle::WillResume | AppLifecycle::Running);
+        let latest_active = matches!(latest, AppLifecycle::WillResume | AppLifecycle::Running);
+        if active == latest_active {
+            return false;
+        }
+
+        if matches!(
+            self.lifecycle,
+            AppLifecycle::WillSuspend | AppLifecycle::WillResume
+        ) {
+            self.pending_lifecycles.push_back(lifecycle);
+        } else {
+            self.lifecycle = lifecycle;
+        }
+        true
     }
 
     fn forward_bevy_events(&mut self) {
@@ -974,6 +1053,49 @@ mod tests {
     use bevy_app::Update;
 
     use super::*;
+
+    #[derive(Resource, Default)]
+    struct ObservedLifecycles(Vec<Vec<AppLifecycle>>);
+
+    #[test]
+    fn queued_lifecycle_updates_follow_documented_order() {
+        let mut app = App::new();
+        app.add_message::<AppLifecycle>()
+            .add_message::<BevyWindowEvent>()
+            .init_resource::<ObservedLifecycles>()
+            .add_systems(
+                Update,
+                |mut lifecycles: MessageReader<AppLifecycle>,
+                 mut observed: ResMut<ObservedLifecycles>| {
+                    observed.0.push(lifecycles.read().copied().collect());
+                },
+            );
+        app.finish();
+        app.cleanup();
+
+        let mut state = WinitAppRunnerState::new(app);
+        state.lifecycle = AppLifecycle::Running;
+        state.previous_lifecycle = AppLifecycle::Running;
+        state.queue_lifecycle(AppLifecycle::WillSuspend);
+        state.queue_lifecycle(AppLifecycle::WillResume);
+        state.queue_lifecycle(AppLifecycle::WillResume);
+        state.queue_lifecycle(AppLifecycle::WillSuspend);
+        state.run_app_update();
+        assert_eq!(state.lifecycle, AppLifecycle::Suspended);
+        assert!(state.pending_lifecycles.is_empty());
+
+        assert_eq!(
+            state.world().resource::<ObservedLifecycles>().0,
+            vec![
+                vec![AppLifecycle::WillSuspend],
+                vec![AppLifecycle::Suspended],
+                vec![AppLifecycle::WillResume],
+                vec![AppLifecycle::Running],
+                vec![AppLifecycle::WillSuspend],
+                vec![AppLifecycle::Suspended],
+            ]
+        );
+    }
 
     #[test]
     fn test_react_to_scale_factor_change_with_changed_scale_factor() {
