@@ -35,7 +35,7 @@ pub fn main() {
                     // Only has an effect on iOS
                     prefers_status_bar_hidden: true,
                     // Only has an effect on iOS
-                    preferred_screen_edges_deferring_system_gestures: ScreenEdge::Bottom,
+                    preferred_screen_edges_deferring_system_gestures: ScreenEdge::BOTTOM,
                     ..default()
                 }),
                 ..default()

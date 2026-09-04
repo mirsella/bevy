@@ -744,12 +744,6 @@ pub fn convert_resize_direction(resize_direction: CompassOctant) -> winit::windo
 #[cfg(target_os = "ios")]
 /// Converts a [`bevy_window::ScreenEdge`] to a [`winit::platform::ios::ScreenEdge`].
 pub(crate) fn convert_screen_edge(edge: ScreenEdge) -> winit::platform::ios::ScreenEdge {
-    match edge {
-        ScreenEdge::None => winit::platform::ios::ScreenEdge::NONE,
-        ScreenEdge::Top => winit::platform::ios::ScreenEdge::TOP,
-        ScreenEdge::Bottom => winit::platform::ios::ScreenEdge::BOTTOM,
-        ScreenEdge::Left => winit::platform::ios::ScreenEdge::LEFT,
-        ScreenEdge::Right => winit::platform::ios::ScreenEdge::RIGHT,
-        ScreenEdge::All => winit::platform::ios::ScreenEdge::ALL,
-    }
+    winit::platform::ios::ScreenEdge::from_bits(edge.bits())
+        .expect("Bevy and Winit screen edge bits must match")
 }

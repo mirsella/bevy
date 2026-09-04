@@ -22,7 +22,7 @@ bevy_reflect = [
 ]
 
 ## Adds serialization support through `serde`.
-serialize = ["serde", "bevy_ecs/serialize", "bevy_input/serialize"]
+serialize = ["serde", "bitflags/serde", "bevy_ecs/serialize", "bevy_input/serialize"]
 
 # Enable custom cursor support
 custom_cursor = ["bevy_image", "bevy_asset"]
@@ -67,6 +67,7 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.19.1", default-features 
 ], optional = true }
 
 # other
+bitflags = { version = "2.3", default-features = false }
 serde = { version = "1.0", features = [
   "alloc",
   "derive",

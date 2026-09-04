@@ -1463,30 +1463,32 @@ impl Default for EnabledButtons {
 #[derive(Component, Default)]
 pub struct ClosingWindow;
 
-/// The edges of a screen. Corresponds to [`winit::platform::ios::ScreenEdge`].
-///
-/// # Platform-specific
-///
-/// - Only used on iOS.
-///
-/// [`winit::platform::ios::ScreenEdge`]: https://docs.rs/winit/latest/x86_64-apple-darwin/winit/platform/ios/struct.ScreenEdge.html
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "bevy_reflect", derive(Reflect))]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-pub enum ScreenEdge {
-    #[default]
-    /// No edge.
-    None,
-    /// The top edge of the screen.
-    Top,
-    /// The left edge of the screen.
-    Left,
-    /// The bottom edge of the screen.
-    Bottom,
-    /// The right edge of the screen.
-    Right,
-    /// All edges of the screen.
-    All,
+bitflags::bitflags! {
+    /// The edges of a screen. Corresponds to [`winit::platform::ios::ScreenEdge`].
+    ///
+    /// # Platform-specific
+    ///
+    /// - Only used on iOS.
+    ///
+    /// [`winit::platform::ios::ScreenEdge`]: https://docs.rs/winit/latest/x86_64-apple-darwin/winit/platform/ios/struct.ScreenEdge.html
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
+    #[cfg_attr(feature = "bevy_reflect", derive(Reflect), reflect(opaque))]
+    #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+    pub struct ScreenEdge: u8 {
+        /// No edge.
+        const NONE = 0;
+        /// The top edge of the screen.
+        const TOP = 1 << 0;
+        /// The left edge of the screen.
+        const LEFT = 1 << 1;
+        /// The bottom edge of the screen.
+        const BOTTOM = 1 << 2;
+        /// The right edge of the screen.
+        const RIGHT = 1 << 3;
+        /// All edges of the screen.
+        const ALL = Self::TOP.bits() | Self::LEFT.bits() | Self::BOTTOM.bits() | Self::RIGHT.bits();
+    }
 }
 
 #[cfg(test)]
