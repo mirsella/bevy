@@ -301,10 +301,32 @@ pub fn prepare_windows(
         };
 
         let surface = &surface_data.surface;
-        match surface.get_current_texture() {
+        let mut surface_texture = surface.get_current_texture();
+        let reconfigured = matches!(&surface_texture, wgpu::CurrentSurfaceTexture::Outdated);
+        if reconfigured {
+            render_device.configure_surface(surface, &surface_data.configuration);
+            surface_texture = surface.get_current_texture();
+        }
+
+        match surface_texture {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 window.set_swapchain_texture(surface_texture);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                bevy_log::error!("Couldn't get swap chain texture: surface was lost");
+                window.swap_chain_texture = None;
+                window.swap_chain_texture_view = None;
+                window.swap_chain_texture_format = None;
+                window.swap_chain_texture_view_format = None;
+                window_surfaces.remove(&window.entity);
+                continue;
+            }
+            variant if reconfigured => {
+                // This is a common occurrence on X11 and Xwayland with NVIDIA drivers
+                // when opening and resizing the window.
+                warn!("Couldn't get swap chain texture after configuring. Cause: '{variant:?}'");
+                continue;
             }
             #[cfg(target_os = "linux")]
             wgpu::CurrentSurfaceTexture::Timeout if may_erroneously_timeout() => {
@@ -312,22 +334,6 @@ pub fn prepare_windows(
                     "Couldn't get swap chain texture. This is probably a quirk \
                         of your Linux GPU driver, so it can be safely ignored."
                 );
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                render_device.configure_surface(surface, &surface_data.configuration);
-                let frame = match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(surface_texture)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
-                    variant => {
-                        // This is a common occurrence on X11 and Xwayland with NVIDIA drivers
-                        // when opening and resizing the window.
-                        warn!(
-                            "Couldn't get swap chain texture after configuring. Cause: '{variant:?}'"
-                        );
-                        continue;
-                    }
-                };
-                window.set_swapchain_texture(frame);
             }
             wgpu::CurrentSurfaceTexture::Occluded => {}
             other => {
