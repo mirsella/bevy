@@ -5,6 +5,7 @@ use bevy_asset::*;
 use bevy_ecs::{
     prelude::{Component, With},
     query::ROQueryItem,
+    schedule::ScheduleConfigs,
     system::{
         lifetimeless::{Read, SRes},
         *,
@@ -14,10 +15,14 @@ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
     globals::{GlobalsBuffer, GlobalsUniform},
-    render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
+    render_asset::{
+        prepare_assets, PrepareAssetError, RenderAsset, RenderAssetDependency, RenderAssetPlugin,
+        RenderAssets,
+    },
     render_phase::*,
     render_resource::{binding_types::uniform_buffer, *},
     renderer::{RenderDevice, RenderQueue},
+    storage::GpuShaderBuffer,
     sync_world::{MainEntity, TemporaryRenderEntity},
     view::*,
     Extract, ExtractSchedule, Render, RenderSystems,
@@ -51,7 +56,10 @@ where
 
         app.init_asset::<M>()
             .register_type::<MaterialNode<M>>()
-            .add_plugins(RenderAssetPlugin::<PreparedUiMaterial<M>, GpuImage>::default());
+            .add_plugins(RenderAssetPlugin::<
+                PreparedUiMaterial<M>,
+                UiMaterialDependencies,
+            >::default());
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -72,6 +80,19 @@ where
                     ),
                 );
         }
+    }
+}
+
+struct UiMaterialDependencies;
+
+impl RenderAssetDependency for UiMaterialDependencies {
+    fn register_system(render_app: &mut SubApp, system: ScheduleConfigs<ScheduleSystem>) {
+        render_app.add_systems(
+            Render,
+            system
+                .after(prepare_assets::<GpuImage>)
+                .after(prepare_assets::<GpuShaderBuffer>),
+        );
     }
 }
 

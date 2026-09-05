@@ -17,7 +17,7 @@ use bevy_picking::Pickable;
 use bevy_reflect::Reflect;
 use bevy_render::storage::ShaderBuffer;
 use bevy_text::{RemSize, TextColor, TextFont, TextSpan};
-use bevy_time::common_conditions::on_timer;
+use bevy_time::{Real, Time, Timer, TimerMode};
 use bevy_ui::{
     widget::{Text, TextUiWriter},
     ComputedUiRenderTargetInfo, FlexDirection, GlobalZIndex, Node, PositionType, Val,
@@ -85,6 +85,7 @@ impl Plugin for FpsOverlayPlugin {
         }
 
         app.insert_resource(self.config.clone())
+            .init_resource::<FpsOverlaySample>()
             .configure_sets(
                 Update,
                 FpsOverlaySystems::Customize.before(FpsOverlaySystems::UpdateText),
@@ -96,8 +97,11 @@ impl Plugin for FpsOverlayPlugin {
                     (toggle_display, customize_overlay)
                         .run_if(resource_changed::<FpsOverlayConfig>)
                         .in_set(FpsOverlaySystems::Customize),
+                    sample_frames
+                        .after(FpsOverlaySystems::Customize)
+                        .before(FpsOverlaySystems::UpdateText),
                     update_text
-                        .run_if(on_timer(self.config.refresh_interval))
+                        .after(FrameTimeDiagnosticsPlugin::diagnostic_system)
                         .in_set(FpsOverlaySystems::UpdateText),
                 ),
             );
@@ -118,6 +122,9 @@ pub struct FpsOverlayConfig {
     ///
     /// Defaults to once every 100 ms.
     pub refresh_interval: Duration,
+    /// Display frames divided by elapsed real time over each refresh interval,
+    /// instead of the diagnostic's exponentially smoothed FPS. Defaults to false.
+    pub average_over_interval: bool,
     /// Configuration of the frame time graph
     pub frame_time_graph_config: FrameTimeGraphConfig,
 }
@@ -129,6 +136,7 @@ impl Default for FpsOverlayConfig {
             text_color: Color::WHITE,
             enabled: true,
             refresh_interval: Duration::from_millis(100),
+            average_over_interval: false,
             // TODO set this to display refresh rate if possible
             frame_time_graph_config: FrameTimeGraphConfig::target_fps(60.0),
         }
@@ -203,6 +211,14 @@ fn setup(
         .with_children(|p| {
             p.spawn((
                 Text::new("FPS: "),
+                Node {
+                    display: if overlay_config.enabled {
+                        bevy_ui::Display::DEFAULT
+                    } else {
+                        bevy_ui::Display::None
+                    },
+                    ..Default::default()
+                },
                 overlay_config.text_config.clone(),
                 TextColor(overlay_config.text_color),
                 FpsText,
@@ -226,7 +242,7 @@ fn setup(
                     Node {
                         width: Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE),
                         height: Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE),
-                        display: if overlay_config.frame_time_graph_config.enabled {
+                        display: if overlay_config.enabled && overlay_config.frame_time_graph_config.enabled {
                             bevy_ui::Display::DEFAULT
                         } else {
                             bevy_ui::Display::None
@@ -254,14 +270,72 @@ fn setup(
         });
 }
 
+#[derive(Resource, Default)]
+pub(crate) struct FpsOverlaySample {
+    timer: Timer,
+    frames: u64,
+    config: Option<(Duration, bool, bool)>,
+    pub(crate) average: Option<f64>,
+}
+
+impl FpsOverlaySample {
+    fn tick(&mut self, delta: Duration, config: &FpsOverlayConfig) {
+        let settings = (
+            config.refresh_interval,
+            config.average_over_interval,
+            config.enabled,
+        );
+        if self.config != Some(settings) {
+            *self = Self {
+                timer: Timer::new(config.refresh_interval, TimerMode::Repeating),
+                config: Some(settings),
+                ..Default::default()
+            };
+        }
+        self.average = None;
+        if !config.enabled || delta.is_zero() {
+            return;
+        }
+        let elapsed = self.timer.elapsed() + delta;
+        self.frames += 1;
+        if self.timer.tick(delta).just_finished() {
+            self.average = Some(self.frames as f64 / elapsed.as_secs_f64());
+            if config.average_over_interval {
+                // Averages consume whole frames and their full elapsed interval.
+                self.timer.reset();
+            }
+            self.frames = 0;
+        }
+    }
+}
+
+fn sample_frames(
+    time: Res<Time<Real>>,
+    config: Res<FpsOverlayConfig>,
+    mut sample: ResMut<FpsOverlaySample>,
+) {
+    sample.tick(time.delta(), &config);
+}
+
 fn update_text(
+    config: Res<FpsOverlayConfig>,
+    sample: Res<FpsOverlaySample>,
     diagnostic: Res<DiagnosticsStore>,
     query: Query<Entity, With<FpsText>>,
     mut writer: TextUiWriter,
 ) {
+    let Some(average) = sample.average else {
+        return;
+    };
+    let value = if config.average_over_interval {
+        Some(average)
+    } else {
+        diagnostic
+            .get(&FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|fps| fps.smoothed())
+    };
     if let Ok(entity) = query.single()
-        && let Some(fps) = diagnostic.get(&FrameTimeDiagnosticsPlugin::FPS)
-        && let Some(value) = fps.smoothed()
+        && let Some(value) = value
     {
         *writer.text(entity, 1) = format!("{value:.2}");
     }
@@ -286,7 +360,7 @@ fn toggle_display(
         (&mut Node, &ComputedUiRenderTargetInfo),
         (With<FpsText>, Without<FrameTimeGraph>),
     >,
-    mut graph_node: Single<&mut Node, (With<FrameTimeGraph>, Without<FpsText>)>,
+    mut graph_nodes: Query<&mut Node, (With<FrameTimeGraph>, Without<FpsText>)>,
     rem_size: Res<RemSize>,
 ) {
     if overlay_config.enabled {
@@ -295,17 +369,79 @@ fn toggle_display(
         text_node.0.display = bevy_ui::Display::None;
     }
 
-    if overlay_config.frame_time_graph_config.enabled {
-        // Scale the frame time graph based on the font size of the overlay
-        let font_size = overlay_config
-            .text_config
-            .font_size
-            .eval(text_node.1.logical_size(), rem_size.0);
-        graph_node.width = Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE);
-        graph_node.height = Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE);
+    for mut graph_node in &mut graph_nodes {
+        if overlay_config.enabled && overlay_config.frame_time_graph_config.enabled {
+            // Scale the frame time graph based on the font size of the overlay
+            let font_size = overlay_config
+                .text_config
+                .font_size
+                .eval(text_node.1.logical_size(), rem_size.0);
+            graph_node.width = Val::Px(font_size * FRAME_TIME_GRAPH_WIDTH_SCALE);
+            graph_node.height = Val::Px(font_size * FRAME_TIME_GRAPH_HEIGHT_SCALE);
 
-        graph_node.display = bevy_ui::Display::DEFAULT;
-    } else {
-        graph_node.display = bevy_ui::Display::None;
+            graph_node.display = bevy_ui::Display::DEFAULT;
+        } else {
+            graph_node.display = bevy_ui::Display::None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_smoothed_refresh_matches_native_repeating_timer() {
+        let config = FpsOverlayConfig::default();
+        let mut sample = FpsOverlaySample::default();
+        let mut native_timer = Timer::new(config.refresh_interval, TimerMode::Repeating);
+        let mut refreshes = 0;
+        for _ in 0..100 {
+            let delta = Duration::from_millis(33);
+            sample.tick(delta, &config);
+            native_timer.tick(delta);
+            assert_eq!(sample.average.is_some(), native_timer.just_finished());
+            refreshes += usize::from(sample.average.is_some());
+        }
+        assert_eq!(refreshes, 33);
+    }
+
+    #[test]
+    fn fps_interval_averaging_and_runtime_changes() {
+        let mut sample = FpsOverlaySample::default();
+        let mut config = FpsOverlayConfig {
+            refresh_interval: Duration::from_secs(1),
+            average_over_interval: true,
+            ..Default::default()
+        };
+        sample.tick(Duration::ZERO, &config);
+        assert_eq!(sample.average, None);
+        for _ in 0..50 {
+            sample.tick(Duration::from_millis(10), &config);
+            assert_eq!(sample.average, None);
+        }
+        for _ in 0..24 {
+            sample.tick(Duration::from_millis(20), &config);
+            assert_eq!(sample.average, None);
+        }
+        sample.tick(Duration::from_millis(20), &config);
+        assert_eq!(sample.average, Some(75.0));
+        sample.tick(Duration::from_millis(1100), &config);
+        assert_eq!(sample.average, Some(1.0 / 1.1));
+        sample.tick(Duration::from_millis(900), &config);
+        config.refresh_interval = Duration::from_millis(100);
+        config.average_over_interval = false;
+        sample.tick(Duration::from_millis(50), &config);
+        assert_eq!(sample.average, None);
+        sample.tick(Duration::from_millis(50), &config);
+        assert_eq!(sample.average, Some(20.0));
+        config.enabled = false;
+        sample.tick(Duration::from_secs(10), &config);
+        assert_eq!(sample.average, None);
+        config.enabled = true;
+        sample.tick(Duration::from_millis(50), &config);
+        assert_eq!(sample.average, None);
+        sample.tick(Duration::from_millis(50), &config);
+        assert_eq!(sample.average, Some(20.0));
     }
 }

@@ -4,6 +4,7 @@ use bevy_app::{Plugin, Update};
 use bevy_asset::{load_internal_asset, uuid_handle, Asset, Assets, Handle};
 use bevy_diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
     schedule::IntoScheduleConfigs,
     system::{Res, ResMut},
 };
@@ -16,7 +17,7 @@ use bevy_render::{
 use bevy_shader::{Shader, ShaderRef};
 use bevy_ui_render::prelude::{UiMaterial, UiMaterialPlugin};
 
-use crate::fps_overlay::{FpsOverlayConfig, FpsOverlaySystems};
+use crate::fps_overlay::{FpsOverlayConfig, FpsOverlaySample, FpsOverlaySystems};
 
 const FRAME_TIME_GRAPH_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("4e38163a-5782-47a5-af52-d9161472ab59");
@@ -42,7 +43,9 @@ impl Plugin for FrameTimeGraphPlugin {
         app.add_plugins(UiMaterialPlugin::<FrametimeGraphMaterial>::default())
             .add_systems(
                 Update,
-                update_frame_time_values.in_set(FpsOverlaySystems::UpdateText),
+                update_frame_time_values
+                    .after(FrameTimeDiagnosticsPlugin::diagnostic_system)
+                    .in_set(FpsOverlaySystems::UpdateText),
             );
     }
 }
@@ -81,7 +84,8 @@ impl FrameTimeGraphConfigUniform {
 pub struct FrametimeGraphMaterial {
     /// The history of the previous frame times value.
     ///
-    /// This should be updated every frame to match the frame time history from the [`DiagnosticsStore`]
+    /// Updated from [`DiagnosticsStore`] at the overlay's refresh interval, or every
+    /// frame when used without an FPS overlay.
     #[storage(0, read_only)]
     pub values: Handle<ShaderBuffer>, // Vec<f32>,
     /// The configuration values used by the shader to control how the graph is rendered
@@ -101,8 +105,11 @@ fn update_frame_time_values(
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     diagnostics_store: Res<DiagnosticsStore>,
     config: Option<Res<FpsOverlayConfig>>,
+    sample: Option<Res<FpsOverlaySample>>,
 ) {
-    if !config.is_none_or(|c| c.frame_time_graph_config.enabled) {
+    if !config.is_none_or(|c| c.enabled && c.frame_time_graph_config.enabled)
+        || sample.is_some_and(|s| s.average.is_none())
+    {
         return;
     }
     let Some(frame_time) = diagnostics_store.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME) else {
@@ -110,12 +117,36 @@ fn update_frame_time_values(
     };
     let frame_times = frame_time
         .values()
-        // convert to millis
+        // Convert milliseconds to seconds.
         .map(|x| *x as f32 / 1000.0)
         .collect::<Vec<_>>();
-    for (_, material) in frame_time_graph_materials.iter_mut() {
+    if frame_times.is_empty() {
+        return;
+    }
+    let size = size_of_val(frame_times.as_slice()) as u64;
+    // Identify every affected material before resizing buffers that may be shared.
+    let resized = frame_time_graph_materials
+        .iter()
+        .filter_map(|(id, material)| {
+            (buffers
+                .get(&material.values)
+                .unwrap()
+                .buffer_description
+                .size
+                != size)
+                .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    for (_, material) in frame_time_graph_materials.iter() {
         let mut buffer = buffers.get_mut(&material.values).unwrap();
-
-        buffer.set_data(frame_times.clone());
+        buffer.buffer_description.size = size;
+        buffer.set_data(frame_times.as_slice());
+    }
+    for id in resized {
+        frame_time_graph_materials
+            .bypass_change_detection()
+            .get_mut(id)
+            .unwrap()
+            .into_inner();
     }
 }
