@@ -4,7 +4,7 @@ use crate::{
     gpu_readback,
     render_asset::RenderAssets,
     render_resource::{
-        BindGroup, BindGroupEntries, Buffer, BufferUsages, PipelineCache,
+        BindGroup, BindGroupEntries, Buffer, BufferUsages, CachedPipelineState, PipelineCache,
         SpecializedRenderPipeline, SpecializedRenderPipelines, Texture, TextureUsages, TextureView,
     },
     renderer::RenderDevice,
@@ -19,6 +19,7 @@ use bevy_asset::{
 };
 use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget};
 use bevy_derive::{Deref, DerefMut};
+use bevy_diagnostic::FrameCount;
 use bevy_ecs::{
     entity::EntityHashMap, message::message_update_system, prelude::*, system::SystemState,
 };
@@ -34,7 +35,7 @@ use bevy_material::{
 use bevy_math::UVec2;
 use bevy_platform::collections::HashSet;
 use bevy_reflect::Reflect;
-use bevy_shader::Shader;
+use bevy_shader::{Shader, ShaderCacheError};
 use bevy_tasks::AsyncComputeTaskPool;
 use bevy_utils::default;
 use bevy_window::{PrimaryWindow, Window, WindowRef};
@@ -53,6 +54,11 @@ pub struct ScreenshotCaptured {
     pub entity: Entity,
     #[deref]
     pub image: Image,
+    /// Main-world [`FrameCount`] at extraction of the frame that was captured, not the
+    /// request or readback completion frame. Retries use the successful attempt's frame.
+    /// Since `FrameCount` increments in `Last`, a request made in `Update` at count `N`
+    /// normally captures count `N.wrapping_add(1)`.
+    pub frame_count: u32,
 }
 
 /// A component that signals to the renderer to capture a screenshot this frame.
@@ -63,6 +69,10 @@ pub struct ScreenshotCaptured {
 /// Screenshots are captured asynchronously and may not be available immediately after the frame
 /// that the component is spawned on. The observer should be used to handle the screenshot when it
 /// is ready.
+/// If the capture pipeline is not ready, capture is deferred to a later frame. Frame-specific
+/// metadata (such as privacy masks) must not assume the captured image is from the request frame.
+/// Use [`ScreenshotCaptured::frame_count`] to identify the captured extraction frame.
+/// A permanent pipeline error is logged and the request is despawned without a capture event.
 ///
 /// Note that the screenshot entity will be despawned after the screenshot is captured and the
 /// observer is triggered.
@@ -129,15 +139,18 @@ struct ScreenshotPreparedState {
     bind_group: BindGroup,
     pipeline_id: CachedRenderPipelineId,
     size: Extent3d,
+    frame_count: u32,
 }
 
 struct RenderScreenshotTarget {
     target: NormalizedRenderTarget,
     resolution: Option<UVec2>,
+    failed: bool,
+    frame_count: u32,
 }
 
 #[derive(Resource, Deref, DerefMut)]
-pub struct CapturedScreenshots(pub Arc<Mutex<Receiver<(Entity, Image)>>>);
+pub struct CapturedScreenshots(pub Arc<Mutex<Receiver<ScreenshotCaptured>>>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct RenderScreenshotTargets(EntityHashMap<RenderScreenshotTarget>);
@@ -146,7 +159,7 @@ struct RenderScreenshotTargets(EntityHashMap<RenderScreenshotTarget>);
 struct RenderScreenshotsPrepared(EntityHashMap<ScreenshotPreparedState>);
 
 #[derive(Resource, Deref, DerefMut)]
-struct RenderScreenshotsSender(Sender<(Entity, Image)>);
+struct RenderScreenshotsSender(Sender<ScreenshotCaptured>);
 
 /// Saves the captured screenshot to disk at the provided path.
 pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>) {
@@ -223,14 +236,15 @@ pub fn trigger_screenshots(
     captured_screenshots: ResMut<CapturedScreenshots>,
 ) {
     let captured_screenshots = captured_screenshots.lock().unwrap();
-    while let Ok((entity, image)) = captured_screenshots.try_recv() {
-        commands.entity(entity).insert(Captured);
-        commands.trigger(ScreenshotCaptured { image, entity });
+    while let Ok(capture) = captured_screenshots.try_recv() {
+        commands.entity(capture.entity).insert(Captured);
+        commands.trigger(capture);
     }
 }
 
 fn extract_screenshots(
     mut targets: ResMut<RenderScreenshotTargets>,
+    prepared: Res<RenderScreenshotsPrepared>,
     mut main_world: ResMut<MainWorld>,
     mut system_state: Local<
         Option<
@@ -246,14 +260,22 @@ fn extract_screenshots(
     >,
     mut seen_targets: Local<HashSet<NormalizedRenderTarget>>,
 ) {
-    if system_state.is_none() {
-        *system_state = Some(SystemState::new(&mut main_world));
+    // Extraction reserves requests before preparation can establish pipeline readiness.
+    // Release unprepared requests for retry, but leave successful captures awaiting readback.
+    for (entity, request) in targets.drain() {
+        if let Ok(mut entity) = main_world.get_entity_mut(entity) {
+            if request.failed {
+                entity.despawn();
+            } else if !prepared.contains_key(&entity.id()) {
+                entity.remove::<Capturing>();
+            }
+        }
     }
-    let system_state = system_state.as_mut().unwrap();
+    let frame_count = main_world.resource::<FrameCount>().0;
+    let system_state = system_state.get_or_insert_with(|| SystemState::new(&mut main_world));
     let (mut commands, primary_window, windows, images, manual_texture_views, screenshots) =
         system_state.get_mut(&mut main_world).unwrap();
 
-    targets.clear();
     seen_targets.clear();
 
     let primary_window = primary_window.iter().next();
@@ -294,7 +316,7 @@ fn extract_screenshots(
             commands.entity(entity).despawn();
             continue;
         }
-        if seen_targets.contains(&render_target) {
+        if !seen_targets.insert(render_target.clone()) {
             warn!(
                 "Duplicate render target for screenshot, skipping entity {}: {:?}",
                 entity, render_target
@@ -303,12 +325,13 @@ fn extract_screenshots(
             commands.entity(entity).despawn();
             continue;
         }
-        seen_targets.insert(render_target.clone());
         targets.insert(
             entity,
             RenderScreenshotTarget {
                 target: render_target,
                 resolution,
+                failed: false,
+                frame_count,
             },
         );
         commands.entity(entity).insert(Capturing);
@@ -318,7 +341,7 @@ fn extract_screenshots(
 }
 
 fn prepare_screenshots(
-    targets: Res<RenderScreenshotTargets>,
+    mut targets: ResMut<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
@@ -330,7 +353,7 @@ fn prepare_screenshots(
     mut view_target_attachments: ResMut<ViewTargetAttachments>,
 ) {
     prepared.clear();
-    for (entity, request) in targets.iter() {
+    for (entity, request) in targets.iter_mut() {
         let size = match &request.target {
             NormalizedRenderTarget::Window(window) => {
                 windows.get(&window.entity()).map(|window| Extent3d {
@@ -355,94 +378,89 @@ fn prepare_screenshots(
             warn!(target = ?request.target, "Unknown render target for screenshot, skipping");
             continue;
         };
-        let (texture_view, state) = prepare_screenshot_state(
-            size,
-            request.resolution,
-            view_format,
-            &render_device,
-            &screenshot_pipeline,
-            &mut pipeline_cache,
-            &mut pipelines,
+        let pipeline_id = pipelines.specialize(&pipeline_cache, &screenshot_pipeline, view_format);
+        pipeline_cache.block_on_render_pipeline(pipeline_id);
+        match pipeline_cache.get_render_pipeline_state(pipeline_id) {
+            CachedPipelineState::Ok(_) => {}
+            CachedPipelineState::Queued
+            | CachedPipelineState::Creating(_)
+            | CachedPipelineState::Err(
+                ShaderCacheError::ShaderNotLoaded(_)
+                | ShaderCacheError::ShaderImportNotYetAvailable,
+            ) => continue,
+            CachedPipelineState::Err(err) => {
+                error!("Screenshot pipeline failed for entity {entity}: {err}");
+                request.failed = true;
+                continue;
+            }
+        }
+        let output_size = request.resolution.map_or(size, |resolution| Extent3d {
+            width: resolution.x,
+            height: resolution.y,
+            ..default()
+        });
+        assert!(
+            output_size.width <= size.width && output_size.height <= size.height,
+            "screenshot resolution must not exceed the render target"
         );
-        prepared.insert(*entity, state);
+        let texture = render_device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot-capture-rendertarget"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: view_format,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
+                | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&Default::default());
+        let resized_texture = (output_size != size).then(|| {
+            let texture = render_device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screenshot-resized-rendertarget"),
+                size: output_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: view_format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            (texture, view)
+        });
+        let buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot-transfer-buffer"),
+            size: gpu_readback::get_aligned_size(
+                output_size,
+                view_format.pixel_size().unwrap_or(0) as u32,
+            ) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = render_device.create_bind_group(
+            "screenshot-to-screen-bind-group",
+            &pipeline_cache.get_bind_group_layout(&screenshot_pipeline.bind_group_layout),
+            &BindGroupEntries::single(&texture_view),
+        );
+        prepared.insert(
+            *entity,
+            ScreenshotPreparedState {
+                texture,
+                resized_texture,
+                buffer,
+                bind_group,
+                pipeline_id,
+                size: output_size,
+                frame_count: request.frame_count,
+            },
+        );
         view_target_attachments.insert(
             request.target.clone(),
             OutputColorAttachment::new(texture_view, view_format),
         );
     }
-}
-
-fn prepare_screenshot_state(
-    size: Extent3d,
-    resolution: Option<UVec2>,
-    format: TextureFormat,
-    render_device: &RenderDevice,
-    pipeline: &ScreenshotToScreenPipeline,
-    pipeline_cache: &mut PipelineCache,
-    pipelines: &mut SpecializedRenderPipelines<ScreenshotToScreenPipeline>,
-) -> (TextureView, ScreenshotPreparedState) {
-    let output_size = resolution.map_or(size, |resolution| Extent3d {
-        width: resolution.x,
-        height: resolution.y,
-        ..default()
-    });
-    assert!(
-        output_size.width <= size.width && output_size.height <= size.height,
-        "screenshot resolution must not exceed the render target"
-    );
-    let texture = render_device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("screenshot-capture-rendertarget"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: TextureUsages::RENDER_ATTACHMENT
-            | TextureUsages::COPY_SRC
-            | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let texture_view = texture.create_view(&Default::default());
-    let resized_texture = (output_size != size).then(|| {
-        let texture = render_device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("screenshot-resized-rendertarget"),
-            size: output_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&Default::default());
-        (texture, view)
-    });
-    let buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("screenshot-transfer-buffer"),
-        size: gpu_readback::get_aligned_size(output_size, format.pixel_size().unwrap_or(0) as u32)
-            as u64,
-        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bind_group = render_device.create_bind_group(
-        "screenshot-to-screen-bind-group",
-        &pipeline_cache.get_bind_group_layout(&pipeline.bind_group_layout),
-        &BindGroupEntries::single(&texture_view),
-    );
-    let pipeline_id = pipelines.specialize(pipeline_cache, pipeline, format);
-    pipeline_cache.block_on_render_pipeline(pipeline_id);
-
-    (
-        texture_view,
-        ScreenshotPreparedState {
-            texture,
-            resized_texture,
-            buffer,
-            bind_group,
-            pipeline_id,
-            size: output_size,
-        },
-    )
 }
 
 pub struct ScreenshotPlugin;
@@ -651,6 +669,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
 
     for (entity, prepared) in prepared.iter() {
         let entity = *entity;
+        let frame_count = prepared.frame_count;
         let sender = sender.clone();
         let width = prepared.size.width;
         let height = prepared.size.height;
@@ -687,9 +706,10 @@ pub(crate) fn collect_screenshots(world: &mut World) {
             };
             drop(data);
 
-            if let Err(e) = sender.send((
+            if let Err(e) = sender.send(ScreenshotCaptured {
                 entity,
-                Image::new(
+                frame_count,
+                image: Image::new(
                     Extent3d {
                         width,
                         height,
@@ -700,11 +720,261 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                     texture_format,
                     RenderAssetUsages::MAIN_WORLD,
                 ),
-            )) {
+            }) {
                 error!("Failed to send screenshot: {}", e);
             }
         };
 
         AsyncComputeTaskPool::get().spawn(finish).detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        extract_plugin::ExtractPlugin,
+        renderer::{RenderAdapter, RenderQueue},
+        texture::ManualTextureView,
+    };
+    use bevy_app::App;
+    use bevy_ecs::system::RunSystemOnce;
+    use bevy_tasks::{block_on, TaskPool};
+
+    #[derive(Resource, Default)]
+    struct Captures(Vec<(Entity, UVec2, u32)>);
+
+    fn setup(resolution: Option<UVec2>, synchronous: bool) -> (App, Entity, Handle<Shader>) {
+        AsyncComputeTaskPool::get_or_init(TaskPool::new);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            flags: default(),
+            memory_budget_thresholds: default(),
+            display: None,
+            backend_options: wgpu::BackendOptions {
+                noop: wgpu::NoopBackendOptions { enable: true },
+                ..default()
+            },
+        });
+        let adapter = block_on(instance.request_adapter(&default())).unwrap();
+        let (device, queue) = block_on(adapter.request_device(&default())).unwrap();
+        let device = RenderDevice::from(device);
+        let cache = PipelineCache::new(device.clone(), RenderAdapter::new(adapter), synchronous);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&default());
+        let handle = ManualTextureViewHandle(0);
+        let mut views = ManualTextureViews::default();
+        views.insert(
+            handle,
+            ManualTextureView::with_default_format(view.clone(), UVec2::splat(4)),
+        );
+        let mut attachments = ViewTargetAttachments::default();
+        attachments.insert(
+            NormalizedRenderTarget::TextureView(handle),
+            OutputColorAttachment::new(view, TextureFormat::Rgba8UnormSrgb),
+        );
+        let shader = Handle::<Shader>::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new();
+        app.add_plugins((ExtractPlugin::default(), bevy_diagnostic::FrameCountPlugin))
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Captures>()
+            .insert_resource(views.clone())
+            .insert_resource(CapturedScreenshots(Arc::new(Mutex::new(rx))));
+        let mut entity = app.world_mut().spawn(Screenshot::texture_view(handle));
+        entity.observe(
+            |capture: On<ScreenshotCaptured>, mut captures: ResMut<Captures>| {
+                captures
+                    .0
+                    .push((capture.entity, capture.image.size(), capture.frame_count));
+            },
+        );
+        if let Some(resolution) = resolution {
+            entity.insert(ScreenshotResolution(resolution));
+        }
+        let entity = entity.id();
+        app.sub_app_mut(RenderApp)
+            .init_resource::<RenderScreenshotTargets>()
+            .init_resource::<RenderScreenshotsPrepared>()
+            .init_resource::<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>()
+            .init_resource::<RenderAssets<GpuImage>>()
+            .init_resource::<ExtractedWindows>()
+            .insert_resource(views)
+            .insert_resource(attachments)
+            .insert_resource(device)
+            .insert_resource(RenderQueue::new(queue))
+            .insert_resource(cache)
+            .insert_resource(RenderScreenshotsSender(tx))
+            .insert_resource(ScreenshotToScreenPipeline {
+                bind_group_layout: BindGroupLayoutDescriptor::new(
+                    "screenshot-to-screen-bgl",
+                    &BindGroupLayoutEntries::single(
+                        wgpu::ShaderStages::FRAGMENT,
+                        texture_2d(wgpu::TextureSampleType::Float { filterable: false }),
+                    ),
+                ),
+                shader: shader.clone(),
+            })
+            .add_systems(ExtractSchedule, extract_screenshots);
+        (app, entity, shader)
+    }
+
+    fn extract(app: &mut App) {
+        let mut render = app.remove_sub_app(RenderApp).unwrap();
+        render.extract(app.world_mut());
+        app.insert_sub_app(RenderApp, render);
+    }
+
+    #[test]
+    fn screenshot_waits_for_shader_and_retries_original_request() {
+        for (resolution, synchronous) in [
+            (None, true),
+            (None, false),
+            (Some(UVec2::splat(2)), true),
+            (Some(UVec2::splat(2)), false),
+        ] {
+            let (mut app, entity, shader) = setup(resolution, synchronous);
+            let target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
+            let original_view = app
+                .sub_app(RenderApp)
+                .world()
+                .resource::<ViewTargetAttachments>()[&target]
+                .view
+                .id();
+            // Simulate inactive startup: main schedules run, but extraction has not happened.
+            let creation_frame = app.world().resource::<FrameCount>().0;
+            app.main_mut().run_default_schedule();
+            app.main_mut().run_default_schedule();
+            assert!(!app.world().entity(entity).contains::<Capturing>());
+            for _ in 0..3 {
+                let extraction_frame = app.world().resource::<FrameCount>().0;
+                extract(&mut app);
+                assert!(app.world().entity(entity).contains::<Capturing>());
+                let world = app.sub_app_mut(RenderApp).world_mut();
+                assert!(world
+                    .resource::<RenderScreenshotTargets>()
+                    .contains_key(&entity));
+                assert_eq!(
+                    world.resource::<RenderScreenshotTargets>()[&entity].frame_count,
+                    extraction_frame
+                );
+                assert_ne!(extraction_frame, creation_frame.wrapping_add(1));
+                world.run_system_once(prepare_screenshots).unwrap();
+                assert!(world.resource::<RenderScreenshotsPrepared>().is_empty());
+                assert_eq!(
+                    world.resource::<ViewTargetAttachments>()[&target].view.id(),
+                    original_view
+                );
+                world.resource_mut::<PipelineCache>().process_queue();
+                let mut encoder = world
+                    .resource::<RenderDevice>()
+                    .create_command_encoder(&default());
+                submit_screenshot_commands(world, &mut encoder);
+                app.main_mut().run_default_schedule();
+            }
+
+            let world = app.sub_app_mut(RenderApp).world_mut();
+            world.resource_mut::<PipelineCache>().set_shader(
+                shader.id(),
+                Shader::from_wgsl(include_str!("screenshot.wgsl"), "screenshot.wgsl"),
+            );
+            world.resource_mut::<PipelineCache>().process_queue();
+            let capture_frame = app.world().resource::<FrameCount>().0;
+            extract(&mut app);
+            let world = app.sub_app_mut(RenderApp).world_mut();
+            world.run_system_once(prepare_screenshots).unwrap();
+            assert!(world
+                .resource::<RenderScreenshotsPrepared>()
+                .contains_key(&entity));
+            assert_eq!(
+                world.resource::<RenderScreenshotsPrepared>()[&entity].frame_count,
+                capture_frame
+            );
+            assert_ne!(
+                world.resource::<ViewTargetAttachments>()[&target].view.id(),
+                original_view
+            );
+            let mut encoder = world
+                .resource::<RenderDevice>()
+                .create_command_encoder(&default());
+            submit_screenshot_commands(world, &mut encoder);
+            world.resource::<RenderQueue>().submit([encoder.finish()]);
+            collect_screenshots(world);
+            // A successful request must not be re-extracted while readback is in flight.
+            app.main_mut().run_default_schedule();
+            extract(&mut app);
+            assert!(app
+                .sub_app(RenderApp)
+                .world()
+                .resource::<RenderScreenshotTargets>()
+                .is_empty());
+            assert!(app.world().entity(entity).contains::<Capturing>());
+
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+            while app.world().resource::<Captures>().0.is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "screenshot readback timed out"
+                );
+                app.sub_app(RenderApp)
+                    .world()
+                    .resource::<RenderDevice>()
+                    .poll(wgpu::PollType::Poll)
+                    .unwrap();
+                AsyncComputeTaskPool::get().with_local_executor(|executor| {
+                    executor.try_tick();
+                });
+                app.world_mut()
+                    .run_system_once(trigger_screenshots)
+                    .unwrap();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                app.world().resource::<Captures>().0,
+                [(entity, resolution.unwrap_or(UVec2::splat(4)), capture_frame)]
+            );
+            assert_ne!(capture_frame, creation_frame.wrapping_add(1));
+            assert_ne!(capture_frame, app.world().resource::<FrameCount>().0);
+            app.world_mut().run_system_once(clear_screenshots).unwrap();
+            assert!(app.world().get_entity(entity).is_err());
+        }
+    }
+
+    #[test]
+    fn screenshot_permanent_shader_error_cancels_request() {
+        let (mut app, entity, shader) = setup(None, true);
+        app.sub_app_mut(RenderApp)
+            .world_mut()
+            .resource_mut::<PipelineCache>()
+            .set_shader(
+                shader.id(),
+                Shader::from_wgsl("invalid wgsl", "broken.wgsl"),
+            );
+        extract(&mut app);
+        let world = app.sub_app_mut(RenderApp).world_mut();
+        world.run_system_once(prepare_screenshots).unwrap();
+        assert!(world.resource::<RenderScreenshotsPrepared>().is_empty());
+        assert!(world.resource::<RenderScreenshotTargets>()[&entity].failed);
+        extract(&mut app);
+        assert!(app.world().get_entity(entity).is_err());
+        assert!(app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<RenderScreenshotTargets>()
+            .is_empty());
+        assert!(app.world().resource::<Captures>().0.is_empty());
     }
 }
