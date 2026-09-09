@@ -72,7 +72,7 @@ impl PluginGroup for UiWidgetsPlugins {
             .add(ScrollAreaPlugin)
             .add(ScrollbarPlugin)
             .add(SliderPlugin)
-            .add(EditableTextInputPlugin)
+            .add(EditableTextInputPlugin::default())
     }
 }
 

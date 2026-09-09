@@ -483,7 +483,23 @@ pub enum ImeSystems {
 ///
 /// Note that [`TextEdit`]s are applied during [`PostUpdate`]
 /// in the [`EditableTextSystems`](bevy_text::EditableTextSystems) system set.
-pub struct EditableTextInputPlugin;
+pub struct EditableTextInputPlugin {
+    /// Automatically activate window IME for the focused editor and position its candidate UI.
+    ///
+    /// Defaults to `true`. Set to `false` when an external text-input backend owns platform
+    /// focus, such as a native text view or a browser input element. Neither window-management
+    /// system is registered in that case. This does not disable processing of [`Ime`] events,
+    /// keyboard editing, or focus-loss composition cleanup.
+    pub manage_window_ime: bool,
+}
+
+impl Default for EditableTextInputPlugin {
+    fn default() -> Self {
+        Self {
+            manage_window_ime: true,
+        }
+    }
+}
 
 impl Plugin for EditableTextInputPlugin {
     fn build(&self, app: &mut App) {
@@ -495,11 +511,24 @@ impl Plugin for EditableTextInputPlugin {
             .add_observer(on_focus_select_all)
             .add_systems(
                 PreUpdate,
-                (
-                    on_ime_input.in_set(ImeSystems::HandleEvents),
-                    listen_for_ime_input_when_text_input_focused
-                        .in_set(ImeSystems::ToggleWindowIMEInput),
-                )
+                on_ime_input
+                    .in_set(ImeSystems::HandleEvents)
+                    .after(InputSystems)
+                    .after(InputFocusSystems::Dispatch)
+                    .after(UiSystems::Focus),
+            )
+            .add_systems(
+                PostUpdate,
+                apply_queued_select_all
+                    .in_set(UiSystems::PostLayout)
+                    .before(update_editable_text_layout),
+            );
+
+        if self.manage_window_ime {
+            app.add_systems(
+                PreUpdate,
+                listen_for_ime_input_when_text_input_focused
+                    .in_set(ImeSystems::ToggleWindowIMEInput)
                     .after(InputSystems)
                     .after(InputFocusSystems::Dispatch)
                     .after(UiSystems::Focus),
@@ -515,13 +544,8 @@ impl Plugin for EditableTextInputPlugin {
                     // FocusChangeEvents does not mutate the actual InputFocus;
                     // this is a false positive that can be ignored
                     .ambiguous_with(InputFocusSystems::FocusChangeEvents),
-            )
-            .add_systems(
-                PostUpdate,
-                apply_queued_select_all
-                    .in_set(UiSystems::PostLayout)
-                    .before(update_editable_text_layout),
             );
+        }
 
         // These components cannot be registered in `bevy_text` where `EditableText` is defined,
         // because that would create a circular dependency between `bevy_text` and `bevy_ui`.
@@ -529,5 +553,96 @@ impl Plugin for EditableTextInputPlugin {
             .register_required_components::<EditableText, TextNodeFlags>()
             .register_required_components::<EditableText, ContentSize>()
             .register_required_components::<EditableText, TextScroll>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ime_app(plugin: EditableTextInputPlugin) -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.init_resource::<InputFocus>()
+            .add_message::<Ime>()
+            .add_plugins(plugin);
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let editor = app.world_mut().spawn(EditableText::default()).id();
+        (app, window, editor)
+    }
+
+    #[test]
+    fn default_window_ime_follows_focus() {
+        let (mut app, window, editor) = ime_app(EditableTextInputPlugin::default());
+        for focused in [true, false, true] {
+            app.insert_resource(if focused {
+                InputFocus::from_entity(editor)
+            } else {
+                InputFocus::default()
+            });
+            app.world_mut().run_schedule(PreUpdate);
+            assert_eq!(
+                app.world().get::<Window>(window).unwrap().ime_enabled,
+                focused
+            );
+        }
+    }
+
+    #[test]
+    fn external_window_ime_preserves_owner_state_and_processes_composition() {
+        let (mut app, window, editor) = ime_app(EditableTextInputPlugin {
+            manage_window_ime: false,
+        });
+        for enabled in [false, true] {
+            app.world_mut()
+                .get_mut::<Window>(window)
+                .unwrap()
+                .ime_enabled = enabled;
+            for focused in [true, false, true] {
+                app.insert_resource(if focused {
+                    InputFocus::from_entity(editor)
+                } else {
+                    InputFocus::default()
+                });
+                app.world_mut().run_schedule(PreUpdate);
+                assert_eq!(
+                    app.world().get::<Window>(window).unwrap().ime_enabled,
+                    enabled
+                );
+            }
+        }
+        app.world_mut().write_message(Ime::Preedit {
+            window,
+            value: "に".into(),
+            cursor: Some((0, 3)),
+        });
+        app.world_mut().write_message(Ime::Commit {
+            window,
+            value: "日".into(),
+        });
+        app.world_mut().run_schedule(PreUpdate);
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(editor)
+                .unwrap()
+                .pending_edits,
+            [
+                TextEdit::ImeSetCompose {
+                    value: "に".into(),
+                    cursor: Some(PreeditCursor {
+                        anchor: 0,
+                        focus: 3
+                    }),
+                },
+                TextEdit::ImeCommit {
+                    value: "日".into()
+                },
+            ]
+        );
+        // No UiScale resource: the window candidate-position system must not be registered.
+        app.add_message::<Pointer<Release>>();
+        app.world_mut().run_schedule(PostUpdate);
     }
 }
