@@ -100,6 +100,16 @@ impl ExtractedWindow {
             surface_texture.present();
         }
     }
+
+    /// Drop the surface texture so that the next frame acquires a fresh one.
+    ///
+    /// Browsers may destroy a canvas' texture out of band, for example while the tab is hidden.
+    /// Drawing into that texture then fails validation, so an app recovering from the error
+    /// discards its window surfaces instead.
+    pub fn discard_swapchain_texture(&mut self) {
+        self.swap_chain_texture = None;
+        self.swap_chain_texture_view = None;
+    }
 }
 
 #[derive(Default, Resource)]
@@ -119,6 +129,15 @@ impl Deref for ExtractedWindows {
 impl DerefMut for ExtractedWindows {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.windows
+    }
+}
+
+impl ExtractedWindows {
+    /// Drop every window's surface texture. See [`ExtractedWindow::discard_swapchain_texture`].
+    pub fn discard_swapchain_textures(&mut self) {
+        for window in self.windows.values_mut() {
+            window.discard_swapchain_texture();
+        }
     }
 }
 
@@ -270,6 +289,11 @@ pub fn prepare_windows(
             continue;
         };
 
+        // On the web a canvas' texture is only valid for the frame it was acquired in, so a texture
+        // from an earlier frame must never be reused, whether or not that frame was presented.
+        #[cfg(target_family = "wasm")]
+        window.discard_swapchain_texture();
+
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
         if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
             continue;
@@ -315,8 +339,7 @@ pub fn prepare_windows(
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 bevy_log::error!("Couldn't get swap chain texture: surface was lost");
-                window.swap_chain_texture = None;
-                window.swap_chain_texture_view = None;
+                window.discard_swapchain_texture();
                 window.swap_chain_texture_format = None;
                 window.swap_chain_texture_view_format = None;
                 window_surfaces.remove(&window.entity);
