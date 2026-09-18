@@ -21,7 +21,9 @@ use crate::{
     accessibility::{
         prepare_accessibility_for_window, AccessKitAdapters, WinitActionRequestHandlers,
     },
-    converters::{convert_enabled_buttons, convert_window_level, convert_window_theme},
+    converters::{
+        convert_enabled_buttons, convert_window_level, convert_window_theme, convert_winit_theme,
+    },
     winit_monitors::WinitMonitors,
 };
 
@@ -57,7 +59,7 @@ impl WinitWindows {
         &mut self,
         event_loop: &ActiveEventLoop,
         entity: Entity,
-        window: &Window,
+        window: &mut Window,
         cursor_options: &CursorOptions,
         adapters: &mut AccessKitAdapters,
         handlers: &mut WinitActionRequestHandlers,
@@ -171,24 +173,6 @@ impl WinitWindows {
             winit_window_attributes = winit_window_attributes
                 .with_prefers_status_bar_hidden(window.prefers_status_bar_hidden);
         }
-
-        let display_info = DisplayInfo {
-            window_physical_resolution: (
-                window.resolution.physical_width(),
-                window.resolution.physical_height(),
-            ),
-            window_logical_resolution: (window.resolution.width(), window.resolution.height()),
-            monitor_name: maybe_selected_monitor
-                .as_ref()
-                .and_then(MonitorHandle::name),
-            scale_factor: maybe_selected_monitor
-                .as_ref()
-                .map(MonitorHandle::scale_factor),
-            refresh_rate_millihertz: maybe_selected_monitor
-                .as_ref()
-                .and_then(MonitorHandle::refresh_rate_millihertz),
-        };
-        bevy_log::debug!("{display_info}");
 
         #[cfg(any(
             all(
@@ -333,6 +317,38 @@ impl WinitWindows {
                 window.title, err
             );
         }
+
+        // Seed the real surface size now; the requested size only corrects on the first resize event.
+        window
+            .resolution
+            .set_scale_factor_and_apply_to_physical_size(winit_window.scale_factor() as f32);
+        let inner_size = winit_window.inner_size();
+        if inner_size.width > 0 && inner_size.height > 0 {
+            window
+                .resolution
+                .set_physical_resolution(inner_size.width, inner_size.height);
+        }
+        if let Some(theme) = winit_window.theme() {
+            window.window_theme = Some(convert_winit_theme(theme));
+        }
+
+        let display_info = DisplayInfo {
+            window_physical_resolution: (
+                window.resolution.physical_width(),
+                window.resolution.physical_height(),
+            ),
+            window_logical_resolution: (window.resolution.width(), window.resolution.height()),
+            monitor_name: maybe_selected_monitor
+                .as_ref()
+                .and_then(MonitorHandle::name),
+            scale_factor: maybe_selected_monitor
+                .as_ref()
+                .map(MonitorHandle::scale_factor),
+            refresh_rate_millihertz: maybe_selected_monitor
+                .as_ref()
+                .and_then(MonitorHandle::refresh_rate_millihertz),
+        };
+        bevy_log::debug!("{display_info}");
 
         self.entity_to_winit.insert(entity, winit_window.id());
         self.winit_to_entity.insert(winit_window.id(), entity);

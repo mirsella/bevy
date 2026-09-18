@@ -202,7 +202,7 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
             );
             if let Ok((entity, window, cursor_options, handle_holder)) = query.single(self.world())
             {
-                let window = window.clone();
+                let mut window = window.clone();
                 let cursor_options = cursor_options.clone();
                 let handle_holder = handle_holder.clone();
 
@@ -217,7 +217,7 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                         let winit_window = winit_windows.create_window(
                             event_loop,
                             entity,
-                            &window,
+                            &mut window,
                             &cursor_options,
                             adapters,
                             &mut handlers,
@@ -227,7 +227,12 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
 
                         let wrapper = RawHandleWrapper::new(winit_window).unwrap();
                         *handle_holder.0.lock().unwrap() = Some(wrapper.clone());
-                        self.world_mut().entity_mut(entity).insert(wrapper);
+                        // Write back the backend-synced metrics and cache.
+                        self.world_mut().entity_mut(entity).insert((
+                            wrapper,
+                            CachedWindow(window.clone()),
+                            window,
+                        ));
                     });
                 });
             }
@@ -859,8 +864,8 @@ impl WinitAppRunnerState {
     }
 
     fn forward_bevy_events(&mut self) {
-        let raw_winit_events = self.raw_winit_events.drain(..).collect::<Vec<_>>();
-        let window_events = self.bevy_window_events.drain(..).collect::<Vec<_>>();
+        let raw_winit_events = core::mem::take(&mut self.raw_winit_events);
+        let window_events = core::mem::take(&mut self.bevy_window_events);
         let world = self.world_mut();
 
         if !raw_winit_events.is_empty() {

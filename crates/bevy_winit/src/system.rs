@@ -26,7 +26,7 @@ use crate::{
     accessibility::ACCESS_KIT_ADAPTERS,
     converters::{
         convert_enabled_buttons, convert_resize_direction, convert_window_level,
-        convert_window_theme, convert_winit_theme,
+        convert_window_theme,
     },
     get_selected_videomode, select_monitor,
     state::react_to_resize,
@@ -69,21 +69,13 @@ pub fn create_windows(
                 let winit_window = winit_windows.create_window(
                     event_loop,
                     entity,
-                    &window,
+                    &mut window,
                     cursor_options,
                     adapters,
                     &mut handlers,
                     &accessibility_requested,
                     &monitors,
                 );
-
-                if let Some(theme) = winit_window.theme() {
-                    window.window_theme = Some(convert_winit_theme(theme));
-                }
-
-                window
-                    .resolution
-                    .set_scale_factor_and_apply_to_physical_size(winit_window.scale_factor() as f32);
 
                 commands.entity(entity).insert((
                     CachedWindow(window.clone()),
@@ -288,7 +280,7 @@ pub(crate) fn despawn_windows(
 
 /// The cached state of the window so we can check which properties were changed from within the app.
 #[derive(Debug, Clone, Component, Deref, DerefMut)]
-pub(crate) struct CachedWindow(Window);
+pub(crate) struct CachedWindow(pub(crate) Window);
 
 /// The cached state of the window so we can check which properties were changed from within the app.
 #[derive(Debug, Clone, Component, Deref, DerefMut)]
