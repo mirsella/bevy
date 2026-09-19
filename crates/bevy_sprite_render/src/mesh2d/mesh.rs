@@ -45,7 +45,8 @@ use bevy_render::{
         PhaseItem, PhaseItemExtraIndex, RenderCommand, RenderCommandResult, TrackedRenderPass,
     },
     render_resource::{binding_types::uniform_buffer, *},
-    renderer::RenderDevice,
+    renderer::{RenderAdapterInfo, RenderDevice},
+    settings::Backends,
     sync_world::{MainEntity, MainEntityHashMap},
     texture::{FallbackImage, GpuImage},
     view::{
@@ -75,6 +76,7 @@ impl Plugin for Mesh2dRenderPlugin {
         // These bindings should be loaded as a shader library, but it depends on runtime
         // information, so we will load it in a system.
         embedded_asset!(app, "mesh2d_bindings.wgsl");
+        embedded_asset!(app, "mesh2d_mesh_access.wgsl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -183,12 +185,15 @@ pub fn init_batched_instance_buffer(mut commands: Commands, render_device: Res<R
     ));
 }
 
-fn load_mesh2d_bindings(render_device: Res<RenderDevice>, asset_server: Res<AssetServer>) {
+fn load_mesh2d_bindings(
+    render_device: Res<RenderDevice>,
+    adapter_info: Res<RenderAdapterInfo>,
+    asset_server: Res<AssetServer>,
+) {
     let mut mesh_bindings_shader_defs = Vec::with_capacity(1);
+    let batch_size = GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device.limits());
 
-    if let Some(per_object_buffer_batch_size) =
-        GpuArrayBuffer::<Mesh2dUniform>::batch_size(&render_device.limits())
-    {
+    if let Some(per_object_buffer_batch_size) = batch_size {
         mesh_bindings_shader_defs.push(ShaderDefVal::UInt(
             "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
             per_object_buffer_batch_size,
@@ -209,6 +214,164 @@ fn load_mesh2d_bindings(render_device: Res<RenderDevice>, asset_server: Res<Asse
     // Forget the handle so we don't have to store it anywhere, and we keep the embedded asset
     // loaded. Note: This is what happens in `load_shader_library` internally.
     core::mem::forget(handle);
+
+    // Adreno GLES can fail linking dynamically indexed Mesh2d uniform reads when
+    // the fragment shader consumes varyings (reproduced on Chrome / Adreno 725).
+    // Keep the uniform layout and batch capacity; select instances with literal
+    // indices instead. Check the actual backend, including dual-feature WASM builds.
+    let workaround_batch_size = batch_size.filter(|_| {
+        cfg!(target_arch = "wasm32")
+            && needs_mesh2d_uniform_index_workaround(
+                adapter_info.backend.into(),
+                adapter_info.vendor,
+                &adapter_info.name,
+            )
+    });
+    let handle: Handle<Shader> = if let Some(batch_size) = workaround_batch_size {
+        tracing::info!(
+            batch_size,
+            "Using Adreno WebGL Mesh2d uniform indexing workaround"
+        );
+        // Only this generated accessor requires a rebuild to change. The bindings,
+        // types and mesh functions remain embedded assets with normal hot reload.
+        asset_server.add(Shader::from_wgsl(
+            mesh2d_uniform_access_shader(batch_size),
+            "mesh2d_mesh_access.wgsl",
+        ))
+    } else {
+        load_embedded_asset!(asset_server.as_ref(), "mesh2d_mesh_access.wgsl")
+    };
+    core::mem::forget(handle);
+}
+
+fn needs_mesh2d_uniform_index_workaround(backend: Backends, vendor: u32, name: &str) -> bool {
+    // WebGL implementations may redact the vendor ID but still expose a renderer
+    // name. Completely redacted metadata is not evidence of an Adreno adapter.
+    backend == Backends::GL && (vendor == 0x5143 || name.contains("Adreno"))
+}
+
+fn mesh2d_uniform_access_shader(batch_size: u32) -> String {
+    use core::fmt::Write;
+
+    let mut source = String::from(
+        "#define_import_path bevy_sprite::mesh2d_mesh_access\n\
+         #import bevy_sprite::{mesh2d_types::Mesh2d, mesh2d_bindings::mesh}\n\
+         fn get_mesh(instance_index: u32) -> Mesh2d {\n\
+         switch instance_index {\n",
+    );
+    for index in 0..batch_size {
+        writeln!(source, "case {index}u: {{ return mesh[{index}u]; }}").unwrap();
+    }
+    // Batching guarantees in-range indices; WGSL still requires a default arm.
+    source.push_str("default: { return Mesh2d(); }\n}\n}\n");
+    source
+}
+
+#[cfg(test)]
+mod uniform_index_tests {
+    use super::{mesh2d_uniform_access_shader, needs_mesh2d_uniform_index_workaround};
+    use bevy_render::settings::Backends;
+    use naga_oil::compose::{
+        ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue,
+    };
+
+    #[test]
+    fn only_identified_adreno_gl_adapters_need_workaround() {
+        for backend in [Backends::GL, Backends::BROWSER_WEBGPU, Backends::VULKAN] {
+            for (vendor, name, adreno) in [
+                (0x5143, "", true),
+                (0, "ANGLE (Qualcomm, Adreno (TM) 725, OpenGL ES 3.2)", true),
+                (0, "", false),
+                (0x8086, "Intel", false),
+            ] {
+                assert_eq!(
+                    needs_mesh2d_uniform_index_workaround(backend, vendor, name),
+                    backend == Backends::GL && adreno,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composed_uniform_switch_maps_each_instance_to_its_literal_slot() {
+        for batch_size in [1, 2, 24, 42, 64] {
+            let source = mesh2d_uniform_access_shader(batch_size);
+            let module = compose_access_shader(&source, Some(batch_size));
+            let (_, function) = module
+                .functions
+                .iter()
+                .find(|(_, function)| function.name.as_deref().unwrap().starts_with("get_mesh"))
+                .unwrap();
+            let naga::Statement::Switch { cases, .. } = &function.body[0] else {
+                panic!("Mesh access must select constant-index reads with a switch");
+            };
+            assert_eq!(cases.len(), batch_size as usize + 1);
+            for (index, case) in cases[..batch_size as usize].iter().enumerate() {
+                assert_eq!(case.value, naga::SwitchValue::U32(index as u32));
+                let naga::Statement::Return { value: Some(value) } = case.body.last().unwrap()
+                else {
+                    panic!("Each case must return the entire Mesh2d value");
+                };
+                let naga::Expression::Load { pointer } = function.expressions[*value] else {
+                    panic!("Expected a uniform load");
+                };
+                let naga::Expression::AccessIndex { base, index: slot } =
+                    function.expressions[pointer]
+                else {
+                    panic!("Uniform instance selection must not use dynamic indexing");
+                };
+                assert_eq!(slot, index as u32);
+                assert!(matches!(
+                    function.expressions[base],
+                    naga::Expression::GlobalVariable(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_accessor_composes_for_uniform_and_storage_buffers() {
+        for batch_size in [None, Some(42)] {
+            compose_access_shader(include_str!("mesh2d_mesh_access.wgsl"), batch_size);
+        }
+    }
+
+    fn compose_access_shader(source: &str, batch_size: Option<u32>) -> naga::Module {
+        let defs = batch_size
+            .map(|size| {
+                (
+                    "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
+                    ShaderDefValue::UInt(size),
+                )
+            })
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut composer = Composer::default();
+        for (source, file_path) in [
+            (include_str!("mesh2d_types.wgsl"), "mesh2d_types.wgsl"),
+            (include_str!("mesh2d_bindings.wgsl"), "mesh2d_bindings.wgsl"),
+            (source, "mesh2d_mesh_access.wgsl"),
+        ] {
+            composer
+                .add_composable_module(ComposableModuleDescriptor {
+                    source,
+                    file_path,
+                    shader_defs: defs.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        composer.make_naga_module(NagaModuleDescriptor {
+            source: "#import bevy_sprite::mesh2d_mesh_access::get_mesh\n\
+                @vertex fn vertex(@builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+                let m = get_mesh(i);\n\
+                return m.world_from_local[0] + m.local_from_world_transpose_a[0]\n\
+                + vec4<f32>(m.local_from_world_transpose_b + f32(m.flags) + f32(m.tag));\n}\n",
+            file_path: "mesh_access_test.wgsl",
+            shader_defs: defs,
+            ..Default::default()
+        }).unwrap()
+    }
 }
 
 #[derive(Component)]
