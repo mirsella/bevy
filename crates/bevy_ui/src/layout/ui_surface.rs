@@ -61,6 +61,9 @@ pub struct UiSurface {
     pub root_entity_to_viewport_node: EntityHashMap<taffy::NodeId>,
     pub(super) entity_to_taffy: EntityHashMap<LayoutNode>,
     pub(super) taffy: UiTree<NodeMeasure>,
+    // Last successful solve per root. Include the generational viewport ID so a
+    // recreated viewport can never reuse the previous viewport's rounded layout.
+    computed_viewports: EntityHashMap<(taffy::NodeId, UVec2)>,
     taffy_children_scratch: Vec<taffy::NodeId>,
     #[cfg(feature = "ghost_nodes")]
     pub(super) dirty_ghost_children_scratch: EntityHashSet,
@@ -95,6 +98,7 @@ impl Default for UiSurface {
             root_entity_to_viewport_node: Default::default(),
             entity_to_taffy: Default::default(),
             taffy,
+            computed_viewports: Default::default(),
             taffy_children_scratch: Vec::new(),
             #[cfg(feature = "ghost_nodes")]
             dirty_ghost_children_scratch: EntityHashSet::new(),
@@ -110,9 +114,10 @@ impl UiSurface {
         layout_context: &LayoutContext,
         entity: Entity,
         node: &Node,
-        mut new_node_context: Option<NodeMeasure>,
+        new_node_context: Option<NodeMeasure>,
     ) {
         let taffy = &mut self.taffy;
+        let style = convert::from_node(node, layout_context);
 
         match self.entity_to_taffy.entry(entity) {
             Entry::Occupied(entry) => {
@@ -123,15 +128,15 @@ impl UiSurface {
                         .unwrap();
                 }
 
-                taffy
-                    .set_style(taffy_node.id, convert::from_node(node, layout_context))
-                    .unwrap();
+                if taffy.style(taffy_node.id).unwrap() != &style {
+                    taffy.set_style(taffy_node.id, style).unwrap();
+                }
             }
             Entry::Vacant(entry) => {
-                let taffy_node = if let Some(measure) = new_node_context.take() {
-                    taffy.new_leaf_with_context(convert::from_node(node, layout_context), measure)
+                let taffy_node = if let Some(measure) = new_node_context {
+                    taffy.new_leaf_with_context(style, measure)
                 } else {
-                    taffy.new_leaf(convert::from_node(node, layout_context))
+                    taffy.new_leaf(style)
                 };
                 entry.insert(taffy_node.unwrap().into());
             }
@@ -155,8 +160,9 @@ impl UiSurface {
                 self.taffy_children_scratch.push(taffy_node.id);
                 if let Some(viewport_id) = taffy_node.viewport_id.take() {
                     self.taffy.remove(viewport_id).ok();
+                    self.root_entity_to_viewport_node.remove(&child);
+                    self.computed_viewports.remove(&child);
                 }
-                self.root_entity_to_viewport_node.remove(&child);
             }
         }
 
@@ -202,13 +208,20 @@ impl UiSurface {
                         ..default()
                     })
                     .unwrap();
-                self.taffy.add_child(implicit_root, root_node.id).unwrap();
+                // Unlike add_child, set_children detaches a promoted root from its
+                // previous parent and invalidates that parent's layout cache.
+                self.taffy
+                    .set_children(implicit_root, &[root_node.id])
+                    .unwrap();
                 root_node.viewport_id = Some(implicit_root);
                 implicit_root
             })
     }
 
-    /// Compute the layout for the given implicit taffy viewport node
+    /// Compute the layout for the given implicit taffy viewport node.
+    /// Reuses the rounded layout when both the tree and viewport are unchanged.
+    /// Changes to a measurement must be submitted through `update_node_context`
+    /// or `upsert_node`, as required by Taffy's layout cache.
     pub fn compute_layout<'a>(
         &mut self,
         ui_root_entity: Entity,
@@ -217,6 +230,14 @@ impl UiSurface {
         font_system: &'a mut FontCx,
     ) {
         let implicit_viewport_node = self.get_or_insert_taffy_viewport_node(ui_root_entity);
+        if self.computed_viewports.get(&ui_root_entity)
+            == Some(&(implicit_viewport_node, render_target_resolution))
+            && !self.taffy.dirty(implicit_viewport_node).unwrap()
+        {
+            // Taffy caches the solve, but still traverses the entire tree to round
+            // it on every compute_layout_with_measure call.
+            return;
+        }
 
         let available_space = taffy::geometry::Size {
             width: taffy::style::AvailableSpace::Definite(render_target_resolution.x as f32),
@@ -261,18 +282,27 @@ impl UiSurface {
                 },
             )
             .unwrap();
+        self.computed_viewports.insert(
+            ui_root_entity,
+            (implicit_viewport_node, render_target_resolution),
+        );
     }
 
     /// Removes each entity from the internal map and then removes their associated nodes from taffy
     pub fn remove_entities(&mut self, entities: impl IntoIterator<Item = Entity>) {
         for entity in entities {
             if let Some(node) = self.entity_to_taffy.remove(&entity) {
+                // Taffy 0.10's remove does not invalidate the former parent.
+                if let Some(parent) = self.taffy.parent(node.id) {
+                    self.taffy.mark_dirty(parent).unwrap();
+                }
                 self.taffy.remove(node.id).unwrap();
                 if let Some(viewport_node) = node.viewport_id {
                     self.taffy.remove(viewport_node).ok();
                 }
             }
             self.root_entity_to_viewport_node.remove(&entity);
+            self.computed_viewports.remove(&entity);
         }
     }
 
@@ -281,7 +311,7 @@ impl UiSurface {
     /// On success returns a pair consisting of the final resolved layout values after rounding
     /// and the size of the node after layout resolution but before rounding.
     pub fn get_layout(
-        &mut self,
+        &self,
         entity: Entity,
         use_rounding: bool,
     ) -> Result<(taffy::Layout, Vec2), LayoutError> {
@@ -289,24 +319,20 @@ impl UiSurface {
             return Err(LayoutError::InvalidHierarchy);
         };
 
-        if use_rounding {
-            self.taffy.enable_rounding();
+        // Keep rounding enabled on the tree: compute_layout must always produce
+        // both layouts, including when subsequent calls reuse the cached result.
+        let unrounded = self.taffy.unrounded_layout(taffy_node.id);
+        let layout = if use_rounding {
+            self.taffy
+                .layout(taffy_node.id)
+                .map_err(LayoutError::TaffyError)?
         } else {
-            self.taffy.disable_rounding();
-        }
-
-        let out = match self.taffy.layout(taffy_node.id).cloned() {
-            Ok(layout) => {
-                self.taffy.disable_rounding();
-                let taffy_size = self.taffy.layout(taffy_node.id).unwrap().size;
-                let unrounded_size = Vec2::new(taffy_size.width, taffy_size.height);
-                Ok((layout, unrounded_size))
-            }
-            Err(taffy_error) => Err(LayoutError::TaffyError(taffy_error)),
+            unrounded
         };
-
-        self.taffy.enable_rounding();
-        out
+        Ok((
+            *layout,
+            Vec2::new(unrounded.size.width, unrounded.size.height),
+        ))
     }
 }
 
@@ -334,6 +360,295 @@ mod tests {
     use crate::{ContentSize, FixedMeasure};
     use bevy_math::Vec2;
     use taffy::TraversePartialTree;
+
+    fn compute(surface: &mut UiSurface, root: Entity, resolution: UVec2) {
+        let mut world = bevy_ecs::world::World::new();
+        let mut query = world.query::<&mut bevy_text::ComputedTextBlock>();
+        surface.compute_layout(
+            root,
+            resolution,
+            &mut query.query_mut(&mut world),
+            &mut FontCx::default(),
+        );
+    }
+
+    fn assert_matches_fresh_layout(surface: &mut UiSurface, root: Entity, resolution: UVec2) {
+        let entities: Vec<_> = surface.entity_to_taffy.keys().copied().collect();
+        let layouts: Vec<_> = entities
+            .iter()
+            .map(|entity| {
+                (
+                    surface.get_layout(*entity, true).unwrap(),
+                    surface.get_layout(*entity, false).unwrap(),
+                )
+            })
+            .collect();
+        // Clear descendant caches too: dirtying only the viewport would let a
+        // stale child cache pass this comparison against a supposedly fresh solve.
+        for entity in &entities {
+            surface
+                .taffy
+                .mark_dirty(surface.entity_to_taffy[entity].id)
+                .unwrap();
+        }
+        let viewport = surface.get_or_insert_taffy_viewport_node(root);
+        surface.taffy.mark_dirty(viewport).unwrap();
+        compute(surface, root, resolution);
+        for (entity, (rounded, unrounded)) in entities.into_iter().zip(layouts) {
+            assert_eq!(surface.get_layout(entity, true).unwrap(), rounded);
+            assert_eq!(surface.get_layout(entity, false).unwrap(), unrounded);
+        }
+    }
+
+    #[test]
+    fn cached_layout_preserves_rounding_and_invalidates_on_resize_and_style() {
+        let mut surface = UiSurface::default();
+        let root = Entity::from_raw_u32(1).unwrap();
+        let mut node = Node {
+            width: crate::Val::Percent(33.3),
+            height: crate::Val::Px(10.25),
+            ..default()
+        };
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
+        let resolution = UVec2::new(100, 100);
+        compute(&mut surface, root, resolution);
+        let first = surface.get_layout(root, true).unwrap();
+        assert_eq!(first.0.size.width, 33.0);
+        assert_ne!(first.0.size.width, first.1.x);
+        let viewport = surface.get_or_insert_taffy_viewport_node(root);
+        assert!(!surface.taffy.dirty(viewport).unwrap());
+
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
+        assert!(!surface.taffy.dirty(viewport).unwrap());
+        // A changed Bevy Node can still convert to the same Taffy style.
+        node.border_radius = crate::BorderRadius::all(crate::Val::Px(5.0));
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
+        assert!(!surface.taffy.dirty(viewport).unwrap());
+        let unrounded = surface.get_layout(root, false).unwrap();
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, true).unwrap(), first);
+        assert_eq!(surface.get_layout(root, false).unwrap(), unrounded);
+        assert_matches_fresh_layout(&mut surface, root, resolution);
+
+        let resized = UVec2::new(200, 100);
+        compute(&mut surface, root, resized);
+        assert_eq!(surface.get_layout(root, true).unwrap().0.size.width, 67.0);
+        assert_matches_fresh_layout(&mut surface, root, resized);
+
+        node.width = crate::Val::Px(40.25);
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
+        assert!(surface.taffy.dirty(viewport).unwrap());
+        compute(&mut surface, root, resized);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 40.25);
+        assert_matches_fresh_layout(&mut surface, root, resized);
+
+        let scaled_context = LayoutContext {
+            scale_factor: 2.0,
+            ..LayoutContext::TEST_CONTEXT
+        };
+        surface.upsert_node(&scaled_context, root, &node, None);
+        compute(&mut surface, root, resized);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 80.5);
+        assert_matches_fresh_layout(&mut surface, root, resized);
+    }
+
+    #[test]
+    fn cached_layout_does_not_reuse_a_recreated_clean_viewport() {
+        let mut surface = UiSurface::default();
+        let root = Entity::from_raw_u32(1).unwrap();
+        let resolution = UVec2::splat(100);
+        let node = Node {
+            width: crate::Val::Percent(50.0),
+            ..default()
+        };
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
+        compute(&mut surface, root, resolution);
+
+        // Recreate the viewport while retaining the old cache entry, then make
+        // it clean at another resolution. Identity must prevent an early return.
+        let old_viewport = surface.root_entity_to_viewport_node.remove(&root).unwrap();
+        surface.taffy.remove(old_viewport).unwrap();
+        let viewport = surface.get_or_insert_taffy_viewport_node(root);
+        assert_ne!(viewport, old_viewport);
+        surface
+            .taffy
+            .compute_layout(
+                viewport,
+                taffy::Size {
+                    width: taffy::AvailableSpace::Definite(200.0),
+                    height: taffy::AvailableSpace::Definite(200.0),
+                },
+            )
+            .unwrap();
+        assert!(!surface.taffy.dirty(viewport).unwrap());
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 100.0);
+
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 50.0);
+        assert_matches_fresh_layout(&mut surface, root, resolution);
+    }
+
+    #[test]
+    fn cached_layout_invalidates_on_measure_changes_and_removal() {
+        let mut surface = UiSurface::default();
+        let root = Entity::from_raw_u32(1).unwrap();
+        let child = Entity::from_raw_u32(2).unwrap();
+        let resolution = UVec2::splat(100);
+        surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &Node::default(), None);
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            child,
+            &Node::default(),
+            Some(NodeMeasure::Fixed(FixedMeasure {
+                size: Vec2::splat(10.25),
+            })),
+        );
+        surface.update_children(root, [child].into_iter());
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 10.25);
+
+        surface
+            .update_node_context(
+                child,
+                NodeMeasure::Fixed(FixedMeasure {
+                    size: Vec2::splat(20.25),
+                }),
+            )
+            .unwrap();
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 20.25);
+        assert_matches_fresh_layout(&mut surface, root, resolution);
+
+        surface.try_remove_node_context(child);
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 0.0);
+
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            child,
+            &Node::default(),
+            Some(NodeMeasure::Fixed(FixedMeasure {
+                size: Vec2::splat(30.25),
+            })),
+        );
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 30.25);
+        // Exercise removal without a preceding update_children call.
+        surface.remove_entities([child]);
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, false).unwrap().0.size.width, 0.0);
+        assert_matches_fresh_layout(&mut surface, root, resolution);
+    }
+
+    #[test]
+    fn cached_layout_invalidates_on_text_measure_changes() {
+        let mut surface = UiSurface::default();
+        let root = Entity::from_raw_u32(1).unwrap();
+        let resolution = UVec2::splat(100);
+        // Definite height exercises text intrinsic widths without requiring fonts
+        // or a shaped buffer, which are independent of layout invalidation.
+        let node = Node {
+            height: crate::Val::Px(10.0),
+            ..default()
+        };
+        let measure = |width| {
+            NodeMeasure::Text(crate::widget::TextMeasure {
+                info: bevy_text::TextMeasureInfo {
+                    min: Vec2::new(width, 10.0),
+                    max: Vec2::new(width, 10.0),
+                    entity: root,
+                },
+            })
+        };
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            root,
+            &node,
+            Some(measure(20.0)),
+        );
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, true).unwrap().0.size.width, 20.0);
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            root,
+            &node,
+            Some(measure(40.0)),
+        );
+        compute(&mut surface, root, resolution);
+        assert_eq!(surface.get_layout(root, true).unwrap().0.size.width, 40.0);
+        assert_matches_fresh_layout(&mut surface, root, resolution);
+    }
+
+    #[test]
+    fn cached_layout_handles_reparenting_and_root_role_changes() {
+        let mut surface = UiSurface::default();
+        let a = Entity::from_raw_u32(1).unwrap();
+        let b = Entity::from_raw_u32(2).unwrap();
+        let child = Entity::from_raw_u32(3).unwrap();
+        let resolution = UVec2::splat(100);
+        for entity in [a, b] {
+            surface.upsert_node(&LayoutContext::TEST_CONTEXT, entity, &Node::default(), None);
+        }
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            child,
+            &Node {
+                width: crate::Val::Px(10.25),
+                height: crate::Val::Px(10.25),
+                ..default()
+            },
+            None,
+        );
+        surface.update_children(a, [child].into_iter());
+        compute(&mut surface, a, resolution);
+        compute(&mut surface, b, resolution);
+
+        surface.update_children(b, [child].into_iter());
+        compute(&mut surface, a, resolution);
+        compute(&mut surface, b, resolution);
+        assert_eq!(surface.get_layout(a, false).unwrap().0.size.width, 0.0);
+        assert_eq!(surface.get_layout(b, false).unwrap().0.size.width, 10.25);
+        assert_matches_fresh_layout(&mut surface, b, resolution);
+
+        // Promotion must detach the child from b and invalidate b too.
+        compute(&mut surface, child, resolution);
+        compute(&mut surface, b, resolution);
+        assert_eq!(surface.get_layout(b, false).unwrap().0.size.width, 0.0);
+        assert_matches_fresh_layout(&mut surface, child, resolution);
+        let old_viewport = surface.get_or_insert_taffy_viewport_node(child);
+
+        // Demotion removes its viewport and cached resolution.
+        surface.update_children(a, [child].into_iter());
+        assert!(!surface.computed_viewports.contains_key(&child));
+        compute(&mut surface, a, resolution);
+        surface.try_remove_children(a);
+        compute(&mut surface, a, resolution);
+        compute(&mut surface, child, resolution);
+        assert_ne!(
+            surface.get_or_insert_taffy_viewport_node(child),
+            old_viewport
+        );
+        assert_eq!(surface.get_layout(a, false).unwrap().0.size.width, 0.0);
+        assert_matches_fresh_layout(&mut surface, child, resolution);
+
+        surface.remove_entities([child]);
+        assert!(!surface.computed_viewports.contains_key(&child));
+        surface.upsert_node(
+            &LayoutContext::TEST_CONTEXT,
+            child,
+            &Node {
+                width: crate::Val::Px(50.25),
+                ..default()
+            },
+            None,
+        );
+        compute(&mut surface, child, resolution);
+        assert_eq!(
+            surface.get_layout(child, false).unwrap().0.size.width,
+            50.25
+        );
+        assert_matches_fresh_layout(&mut surface, child, resolution);
+    }
 
     #[test]
     fn test_initialization() {
