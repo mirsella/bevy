@@ -8,7 +8,6 @@ use crate::{
 use bevy_a11y::{AccessibilityNode, AccessibilitySystems};
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::{
-    change_detection::DetectChanges,
     component::Component,
     hierarchy::ChildOf,
     lifecycle::HookContext,
@@ -17,9 +16,8 @@ use bevy_ecs::{
     reflect::ReflectComponent,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query},
-    world::{DeferredWorld, Ref},
+    world::DeferredWorld,
 };
-use bevy_math::Affine2;
 use bevy_reflect::prelude::ReflectDefault;
 
 use accesskit::{Affine, Node, Rect, Role};
@@ -44,41 +42,53 @@ fn calc_label(
 
 fn sync_bounds_and_transforms(
     mut accessible_nodes_query: Query<(
+        Entity,
         &mut AccessibilityNode,
-        Ref<ComputedNode>,
-        Ref<UiGlobalTransform>,
-        Option<&ChildOf>,
+        &ComputedNode,
+        &UiGlobalTransform,
     )>,
-    accessible_transform_query: Query<Ref<UiGlobalTransform>, With<AccessibilityNode>>,
+    accessible_transform_query: Query<&UiGlobalTransform, With<AccessibilityNode>>,
+    semantic_only_nodes: Query<&AccessibilityNode, Without<UiGlobalTransform>>,
+    parents: Query<&ChildOf>,
 ) {
-    for (mut accessible, node, ui_transform, maybe_child_of) in &mut accessible_nodes_query {
-        let maybe_parent_transform = maybe_child_of
-            .and_then(|child_of| accessible_transform_query.get(child_of.parent()).ok());
-
-        if !(node.is_changed()
-            || ui_transform.is_changed()
-            || maybe_parent_transform.is_some_and(|transform| transform.is_changed()))
-        {
-            continue;
+    for (entity, mut accessible, node, ui_transform) in &mut accessible_nodes_query {
+        // Semantic-only ancestors inherit their parent's UI coordinate space,
+        // with any explicit AccessKit transforms composed along the way.
+        let mut parent_transform = Affine::IDENTITY;
+        for parent in parents.iter_ancestors(entity) {
+            if let Ok(transform) = accessible_transform_query.get(parent) {
+                parent_transform = Affine::new(transform.affine().to_cols_array().map(f64::from))
+                    * parent_transform;
+                break;
+            }
+            if let Ok(node) = semantic_only_nodes.get(parent)
+                && let Some(transform) = node.transform()
+            {
+                parent_transform = *transform * parent_transform;
+            }
         }
-
-        accessible.set_bounds(Rect::new(
+        let bounds = Rect::new(
             -0.5 * node.size.x as f64,
             -0.5 * node.size.y as f64,
             0.5 * node.size.x as f64,
             0.5 * node.size.y as f64,
-        ));
+        );
 
-        // If the node has an accessible parent, its transform in the accessibility tree must be relative to the parent.
-        let transform = maybe_parent_transform
-            .and_then(|transform| transform.try_inverse())
-            .unwrap_or_default()
-            * ui_transform.affine();
+        let transform = parent_transform.inverse()
+            * Affine::new(ui_transform.affine().to_cols_array().map(f64::from));
 
-        if transform.is_finite() && transform != Affine2::IDENTITY {
-            accessible.set_transform(Affine::new(transform.to_cols_array().map(f64::from)));
-        } else {
-            accessible.clear_transform();
+        // Collapsed coordinate spaces have no usable relative transform.
+        let transform =
+            (transform.is_finite() && transform != Affine::IDENTITY).then_some(transform);
+        if accessible.bounds() != Some(bounds) {
+            accessible.set_bounds(bounds);
+        }
+        if accessible.transform() != transform.as_ref() {
+            if let Some(transform) = transform {
+                accessible.set_transform(transform);
+            } else {
+                accessible.clear_transform();
+            }
         }
     }
 }
@@ -229,5 +239,108 @@ impl Plugin for AccessibilityPlugin {
                 .in_set(UiSystems::PostLayout)
                 .before(AccessibilitySystems::Update),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_app::Update;
+    use bevy_ecs::change_detection::DetectChanges;
+
+    #[test]
+    fn bounds_follow_the_nearest_semantic_parent_across_layout_entities() {
+        let mut app = App::new();
+        app.add_systems(Update, sync_bounds_and_transforms);
+        let parent = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::TabList)),
+                UiGlobalTransform::from_xy(100., 200.),
+            ))
+            .id();
+        let layout = app.world_mut().spawn(ChildOf(parent)).id();
+        let tab = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::Tab)),
+                ComputedNode::default(),
+                UiGlobalTransform::from_xy(130., 240.),
+                ChildOf(layout),
+            ))
+            .id();
+        let transform = |app: &App| {
+            app.world()
+                .get::<AccessibilityNode>(tab)
+                .unwrap()
+                .transform()
+                .copied()
+        };
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+        let last_changed = app
+            .world()
+            .entity(tab)
+            .get_ref::<AccessibilityNode>()
+            .unwrap()
+            .last_changed();
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(tab)
+                .get_ref::<AccessibilityNode>()
+                .unwrap()
+                .last_changed(),
+            last_changed
+        );
+        // Adding/removing a semantic parent changes the relative transform even
+        // when none of the global UI transforms or bounds have changed.
+        app.world_mut().entity_mut(layout).insert((
+            AccessibilityNode::from(Node::new(Role::Group)),
+            UiGlobalTransform::from_xy(110., 210.),
+        ));
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((20., 30.))));
+        app.world_mut()
+            .entity_mut(layout)
+            .remove::<AccessibilityNode>();
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+        // A semantic-only group inherits the outer UI coordinate space, even
+        // though the group has no UI transform of its own.
+        app.world_mut()
+            .entity_mut(layout)
+            .remove::<UiGlobalTransform>()
+            .insert(AccessibilityNode::from(Node::new(Role::Group)));
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+        app.world_mut()
+            .get_mut::<AccessibilityNode>(layout)
+            .unwrap()
+            .set_transform(Affine::translate((10., 20.)) * Affine::scale(2.));
+        app.update();
+        assert_eq!(
+            transform(&app),
+            Some(Affine::translate((10., 10.)) * Affine::scale(0.5))
+        );
+        let mut group = Node::new(Role::Group);
+        group.set_transform(Affine::translate((4., 6.)));
+        let inner = app
+            .world_mut()
+            .spawn((AccessibilityNode::from(group), ChildOf(layout)))
+            .id();
+        app.world_mut().entity_mut(tab).insert(ChildOf(inner));
+        app.update();
+        assert_eq!(
+            transform(&app),
+            Some(Affine::translate((6., 4.)) * Affine::scale(0.5))
+        );
+
+        *app.world_mut()
+            .get_mut::<UiGlobalTransform>(parent)
+            .unwrap() =
+            UiGlobalTransform::from(bevy_math::Affine2::from_scale(bevy_math::Vec2::ZERO));
+        app.update();
+        assert_eq!(transform(&app), None);
     }
 }

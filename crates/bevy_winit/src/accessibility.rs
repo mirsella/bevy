@@ -193,13 +193,9 @@ fn should_update_accessibility_nodes(
 fn update_accessibility_nodes(
     focus: Option<Res<InputFocus>>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
-    nodes: Query<(
-        Entity,
-        &AccessibilityNode,
-        Option<&Children>,
-        Option<&ChildOf>,
-    )>,
-    node_entities: Query<Entity, With<AccessibilityNode>>,
+    nodes: Query<(Entity, &AccessibilityNode)>,
+    parents: Query<&ChildOf>,
+    children: Query<&Children>,
     _non_send_marker: NonSendMarker,
 ) {
     ACCESS_KIT_ADAPTERS.with_borrow_mut(|adapters| {
@@ -216,7 +212,8 @@ fn update_accessibility_nodes(
             // Don't panic if the focused entity does not currently exist
             // It's probably waiting to be spawned
             if let Some(focused_entity) = focus.get()
-                && !node_entities.contains(focused_entity)
+                && focused_entity != primary_window_id
+                && !nodes.contains(focused_entity)
             {
                 return;
             }
@@ -224,7 +221,8 @@ fn update_accessibility_nodes(
             adapter.update_if_active(|| {
                 update_adapter(
                     nodes,
-                    node_entities,
+                    parents,
+                    children,
                     primary_window,
                     primary_window_id,
                     focus,
@@ -235,23 +233,25 @@ fn update_accessibility_nodes(
 }
 
 fn update_adapter(
-    nodes: Query<(
-        Entity,
-        &AccessibilityNode,
-        Option<&Children>,
-        Option<&ChildOf>,
-    )>,
-    node_entities: Query<Entity, With<AccessibilityNode>>,
+    nodes: Query<(Entity, &AccessibilityNode)>,
+    parents: Query<&ChildOf>,
+    children: Query<&Children>,
     primary_window: &Window,
     primary_window_id: Entity,
     focus: Res<InputFocus>,
 ) -> TreeUpdate {
     let mut to_update = vec![];
     let mut window_children = vec![];
-    for (entity, node, children, child_of) in &nodes {
+    for (entity, node) in &nodes {
         let mut node = (**node).clone();
-        queue_node_for_update(entity, child_of, &node_entities, &mut window_children);
-        add_children_nodes(children, &node_entities, &mut node);
+        if !parents
+            .iter_ancestors(entity)
+            .any(|parent| nodes.contains(parent))
+        {
+            window_children.push(NodeId(entity.to_bits()));
+        }
+        node.clear_children();
+        add_children_nodes(entity, &children, &nodes, &mut node);
         let node_id = NodeId(entity.to_bits());
         to_update.push((node_id, node));
     }
@@ -297,35 +297,22 @@ fn window_node(label: Option<&str>, bounds: Rect) -> Node {
     node
 }
 
-#[inline]
-fn queue_node_for_update(
-    node_entity: Entity,
-    child_of: Option<&ChildOf>,
-    node_entities: &Query<Entity, With<AccessibilityNode>>,
-    window_children: &mut Vec<NodeId>,
-) {
-    let should_push = if let Some(child_of) = child_of {
-        !node_entities.contains(child_of.parent())
-    } else {
-        true
-    };
-    if should_push {
-        window_children.push(NodeId(node_entity.to_bits()));
-    }
-}
-
-#[inline]
 fn add_children_nodes(
-    children: Option<&Children>,
-    node_entities: &Query<Entity, With<AccessibilityNode>>,
+    entity: Entity,
+    hierarchy: &Query<&Children>,
+    nodes: &Query<(Entity, &AccessibilityNode)>,
     node: &mut Node,
 ) {
-    let Some(children) = children else {
+    let Ok(children) = hierarchy.get(entity) else {
         return;
     };
     for child in children {
-        if node_entities.contains(*child) {
+        if nodes.contains(*child) {
             node.push_child(NodeId(child.to_bits()));
+        } else {
+            // Layout-only entities must not split the semantic hierarchy or
+            // promote their descendants to the window in ECS iteration order.
+            add_children_nodes(*child, hierarchy, nodes, node);
         }
     }
 }
@@ -355,5 +342,74 @@ impl Plugin for AccessKitPlugin {
                 )
                     .in_set(AccessibilitySystems::Update),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    #[test]
+    fn semantic_children_bridge_layout_entities_in_scene_order() {
+        let mut world = World::new();
+        let root = world.spawn(AccessibilityNode(Node::new(Role::Group))).id();
+        let layout = world.spawn(ChildOf(root)).id();
+        let list = world
+            .spawn((AccessibilityNode(Node::new(Role::TabList)), ChildOf(layout)))
+            .id();
+        let row = world.spawn(ChildOf(list)).id();
+        let first = world
+            .spawn((AccessibilityNode(Node::new(Role::Tab)), ChildOf(row)))
+            .id();
+        let spacer = world.spawn(ChildOf(row)).id();
+        let second = world
+            .spawn((AccessibilityNode(Node::new(Role::Tab)), ChildOf(spacer)))
+            .id();
+        let panel = world
+            .spawn((
+                AccessibilityNode(Node::new(Role::TabPanel)),
+                ChildOf(layout),
+            ))
+            .id();
+        let layout = world.spawn(ChildOf(panel)).id();
+        let button = world
+            .spawn((AccessibilityNode(Node::new(Role::Button)), ChildOf(layout)))
+            .id();
+        let window = world.spawn(Window::default()).id();
+        world.insert_resource(InputFocus::default());
+        world
+            .resource_mut::<InputFocus>()
+            .set(window, bevy_input_focus::FocusCause::Navigated);
+        let update = world
+            .run_system_once(
+                move |nodes: Query<(Entity, &AccessibilityNode)>,
+                      parents: Query<&ChildOf>,
+                      children: Query<&Children>,
+                      focus: Res<InputFocus>| {
+                    update_adapter(nodes, parents, children, &Window::default(), window, focus)
+                },
+            )
+            .unwrap();
+        let children = |entity: Entity| {
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == NodeId(entity.to_bits()))
+                .unwrap()
+                .1
+                .children()
+        };
+        let ids = |entities: &[Entity]| {
+            entities
+                .iter()
+                .map(|entity| NodeId(entity.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(children(window), ids(&[root]));
+        assert_eq!(update.focus, NodeId(window.to_bits()));
+        assert_eq!(children(root), ids(&[list, panel]));
+        assert_eq!(children(list), ids(&[first, second]));
+        assert_eq!(children(panel), ids(&[button]));
     }
 }
