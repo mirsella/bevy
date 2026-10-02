@@ -52,7 +52,7 @@ fn update_clipping(
         Has<OverrideClip>,
     )>,
     entity: Entity,
-    mut maybe_inherited_clip: Option<CalculatedClip>,
+    maybe_inherited_clip: Option<&CalculatedClip>,
 ) {
     let Ok((node, computed_node, transform, maybe_calculated_clip, has_override_clip)) =
         node_query.get_mut(entity)
@@ -60,19 +60,19 @@ fn update_clipping(
         return;
     };
 
-    // If the UI node entity has an `OverrideClip` component, discard any inherited clip rect
-    if has_override_clip {
-        maybe_inherited_clip = None;
-    }
-
-    // If `display` is None, clip the entire node and all its descendants.
-    if node.display == Display::None {
-        maybe_inherited_clip = Some(CalculatedClip::FullyClipped);
-    }
+    // Hidden nodes clip themselves even when they override ancestor clipping.
+    let fully_clipped = CalculatedClip::FullyClipped;
+    let maybe_inherited_clip = if node.display == Display::None {
+        Some(&fully_clipped)
+    } else if has_override_clip {
+        None
+    } else {
+        maybe_inherited_clip
+    };
 
     // Update this node's CalculatedClip component
     if let Some(mut calculated_clip) = maybe_calculated_clip {
-        if let Some(inherited_clip) = maybe_inherited_clip.as_ref() {
+        if let Some(inherited_clip) = maybe_inherited_clip {
             // Replace the previous calculated clip with the inherited clipping rect
             if *calculated_clip != *inherited_clip {
                 *calculated_clip = inherited_clip.clone();
@@ -81,38 +81,33 @@ fn update_clipping(
             // No inherited clipping rect, remove the component
             commands.entity(entity).remove::<CalculatedClip>();
         }
-    } else if let Some(inherited_clip) = maybe_inherited_clip.as_ref() {
+    } else if let Some(inherited_clip) = maybe_inherited_clip {
         // No previous calculated clip, add a new CalculatedClip component with the inherited clipping rect
         commands.entity(entity).try_insert(inherited_clip.clone());
     }
 
-    // Calculate new clip rectangle for children nodes
-    let children_clip = if maybe_inherited_clip
-        .as_ref()
-        .is_some_and(CalculatedClip::is_fully_clipped)
+    // Borrow unchanged inheritance through visible nodes. Only a clipping node
+    // needs an owned list to append its rectangle; siblings share that list.
+    let owned_children_clip;
+    let children_clip = if maybe_inherited_clip.is_some_and(CalculatedClip::is_fully_clipped)
         || node.overflow.is_visible()
     {
         // The current node doesn't clip, propagate the optional inherited clipping rect to any children
         maybe_inherited_clip
     } else if let Some(clip_from_world) = transform.try_inverse() {
-        let mut clip = maybe_inherited_clip.unwrap_or_default();
+        let mut clip = maybe_inherited_clip.cloned().unwrap_or_default();
         clip.push_rect(
             computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin),
             clip_from_world,
         );
-        Some(clip)
+        owned_children_clip = clip;
+        Some(&owned_children_clip)
     } else {
-        Some(CalculatedClip::FullyClipped)
+        Some(&fully_clipped)
     };
 
     for child in ui_children.iter_ui_children(entity) {
-        update_clipping(
-            commands,
-            ui_children,
-            node_query,
-            child,
-            children_clip.clone(),
-        );
+        update_clipping(commands, ui_children, node_query, child, children_clip);
     }
 }
 
@@ -195,6 +190,209 @@ mod tests {
     use bevy_ecs::hierarchy::ChildOf;
     use bevy_math::UVec2;
     use bevy_utils::default;
+
+    #[test]
+    fn clipping_preserves_heap_backed_inheritance_across_siblings() {
+        use super::update_clipping_system;
+        use crate::{CalculatedClip, ComputedNode, Overflow, OverrideClip};
+        use bevy_ecs::prelude::*;
+        use bevy_math::Vec2;
+
+        let mut world = World::new();
+        let mut ancestors: Vec<Entity> = Vec::new();
+        for size in [100., 80., 60.] {
+            let entity = world
+                .spawn((
+                    Node {
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    ComputedNode {
+                        size: Vec2::splat(size),
+                        ..default()
+                    },
+                ))
+                .id();
+            if let Some(&parent) = ancestors.last() {
+                world.entity_mut(parent).add_child(entity);
+            }
+            ancestors.push(entity);
+        }
+        let parent = *ancestors.last().unwrap();
+        let first = world.spawn((Node::default(), ChildOf(parent))).id();
+        let second = world.spawn((Node::default(), ChildOf(parent))).id();
+        let override_node = world
+            .spawn((Node::default(), OverrideClip, ChildOf(parent)))
+            .id();
+        let override_child = world.spawn((Node::default(), ChildOf(override_node))).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_clipping_system);
+
+        for _ in 0..3 {
+            schedule.run(&mut world);
+            let first_clip = world.get::<CalculatedClip>(first).unwrap();
+            let widths: Vec<_> = first_clip
+                .rects()
+                .unwrap()
+                .iter()
+                .map(|r| r.rect.width())
+                .collect();
+            assert_eq!(widths, [100., 80., 60.]);
+            assert_eq!(Some(first_clip), world.get::<CalculatedClip>(second));
+            assert_eq!(
+                world
+                    .get::<CalculatedClip>(parent)
+                    .unwrap()
+                    .rects()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(world.get::<CalculatedClip>(ancestors[0]).is_none());
+            assert!(world.get::<CalculatedClip>(override_node).is_none());
+            assert!(world.get::<CalculatedClip>(override_child).is_none());
+        }
+    }
+
+    #[test]
+    fn clipping_tracks_bypassed_geometry_and_inherited_inputs() {
+        use super::update_clipping_system;
+        use crate::{
+            CalculatedClip, ComputedNode, Display, Overflow, OverflowClipMargin, OverrideClip,
+            UiGlobalTransform,
+        };
+        use bevy_ecs::{change_detection::DetectChangesMut, prelude::*};
+        use bevy_math::{Affine2, Vec2};
+        let mut world = World::new();
+        let root = world
+            .spawn((
+                Node {
+                    overflow: Overflow::clip(),
+                    overflow_clip_margin: OverflowClipMargin::content_box().with_margin(2.),
+                    ..default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.),
+                    ..default()
+                },
+            ))
+            .id();
+        let child = world.spawn(Node::default()).id();
+        let grandchild = world.spawn(Node::default()).id();
+        world.entity_mut(root).add_child(child);
+        world.entity_mut(child).add_child(grandchild);
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_clipping_system);
+        schedule.run(&mut world);
+        schedule.run(&mut world); // Observe deferred CalculatedClip insertion.
+        assert_eq!(
+            world.get::<CalculatedClip>(child),
+            world.get::<CalculatedClip>(grandchild)
+        );
+
+        // Clipping must observe geometry fields that deliberately bypass ticks.
+        for field in 0..6 {
+            let before = world.get::<CalculatedClip>(grandchild).unwrap().clone();
+            let mut node = world.get_mut::<ComputedNode>(root).unwrap();
+            let node = node.bypass_change_detection();
+            match field {
+                0 => node.border.min_inset.x += 3.,
+                1 => node.padding.min_inset.y += 4.,
+                2 => node.scrollbar_size.x += 5.,
+                3 => node.size.x += 20.,
+                4 => node.inverse_scale_factor = 0.5,
+                5 => node.border.max_inset.y += 6.,
+                _ => unreachable!(),
+            }
+            schedule.run(&mut world);
+            let after = world.get::<CalculatedClip>(grandchild).unwrap();
+            assert_ne!(*after, before, "geometry field {field}");
+            assert_eq!(Some(after), world.get::<CalculatedClip>(child));
+        }
+
+        let before = world.get::<CalculatedClip>(child).unwrap().clone();
+        world
+            .entity_mut(root)
+            .insert(UiGlobalTransform::from(Affine2::from_translation(
+                Vec2::new(9., 7.),
+            )));
+        schedule.run(&mut world);
+        assert_ne!(*world.get::<CalculatedClip>(child).unwrap(), before);
+        let before = world.get::<CalculatedClip>(child).unwrap().clone();
+        world.get_mut::<Node>(root).unwrap().overflow_clip_margin =
+            OverflowClipMargin::border_box();
+        schedule.run(&mut world);
+        assert_ne!(*world.get::<CalculatedClip>(child).unwrap(), before);
+
+        world.entity_mut(child).insert(OverrideClip);
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(child).is_none());
+        assert!(world.get::<CalculatedClip>(grandchild).is_none());
+        world.entity_mut(child).remove::<OverrideClip>();
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(grandchild).is_some());
+        world.get_mut::<Node>(root).unwrap().display = Display::None;
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<CalculatedClip>(grandchild),
+            Some(&CalculatedClip::FullyClipped)
+        );
+        world.get_mut::<Node>(root).unwrap().display = Display::Flex;
+        schedule.run(&mut world);
+        assert!(!world
+            .get::<CalculatedClip>(grandchild)
+            .unwrap()
+            .is_fully_clipped());
+        world.get_mut::<Node>(root).unwrap().overflow = Overflow::visible();
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(grandchild).is_none());
+        world.get_mut::<Node>(root).unwrap().overflow = Overflow::clip();
+        schedule.run(&mut world);
+        world.entity_mut(child).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(child).is_none());
+        assert!(world.get::<CalculatedClip>(grandchild).is_none());
+        world.entity_mut(root).add_child(child);
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(grandchild).is_some());
+        world.entity_mut(grandchild).remove::<CalculatedClip>();
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(grandchild).is_some());
+    }
+
+    #[cfg(feature = "ghost_nodes")]
+    #[test]
+    fn clipping_tracks_ghost_root_promotion() {
+        use super::update_clipping_system;
+        use crate::{experimental::GhostNode, CalculatedClip, Display};
+        use bevy_ecs::prelude::*;
+        let mut world = World::new();
+        let child = world.spawn(Node::default()).id();
+        let ghost = world.spawn(GhostNode).add_child(child).id();
+        let root = world
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .add_child(ghost)
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_clipping_system);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<CalculatedClip>(child),
+            Some(&CalculatedClip::FullyClipped)
+        );
+        world.entity_mut(ghost).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(child).is_none());
+        world.entity_mut(root).add_child(ghost);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<CalculatedClip>(child),
+            Some(&CalculatedClip::FullyClipped)
+        );
+    }
 
     fn setup_test_app() -> App {
         let mut app = App::new();

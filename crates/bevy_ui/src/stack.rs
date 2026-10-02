@@ -1,11 +1,13 @@
 //! This module contains the systems that update the stored UI nodes stack
 
+#[cfg(feature = "ghost_nodes")]
+use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
-    GlobalZIndex, ZIndex,
+    GlobalZIndex, Node, ZIndex,
 };
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{entity::EntityHashSet, prelude::*};
+use bevy_ecs::{entity::EntityHashSet, prelude::*, system::SystemParam};
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use core::ops::Range;
@@ -46,6 +48,35 @@ impl ChildBufferCache {
     }
 }
 
+#[doc(hidden)]
+#[derive(SystemParam)]
+pub struct UiStackChanges<'w, 's> {
+    // Unfiltered hierarchy changes include entities entering or leaving the UI.
+    changed: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            Added<Node>,
+            Changed<Children>,
+            Changed<ChildOf>,
+            Changed<ZIndex>,
+            Changed<GlobalZIndex>,
+        )>,
+    >,
+    removed_nodes: RemovedComponents<'w, 's, Node>,
+    removed_children: RemovedComponents<'w, 's, Children>,
+    removed_parents: RemovedComponents<'w, 's, ChildOf>,
+    #[cfg(feature = "ghost_nodes")]
+    added_ghosts: Query<'w, 's, (), Added<GhostNode>>,
+    #[cfg(feature = "ghost_nodes")]
+    removed_ghosts: RemovedComponents<'w, 's, GhostNode>,
+    removed_z: RemovedComponents<'w, 's, ZIndex>,
+    removed_global_z: RemovedComponents<'w, 's, GlobalZIndex>,
+    removed_index: RemovedComponents<'w, 's, ComputedStackIndex>,
+    roots: Local<'s, Vec<(Entity, (i32, i32))>>,
+}
+
 /// Generates the render stack for UI nodes.
 ///
 /// Create a list of root nodes from parentless entities and entities with a `GlobalZIndex` component.
@@ -65,9 +96,8 @@ pub fn ui_stack_system(
     ui_children: UiChildren,
     zindex_query: Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
     mut update_query: Query<&mut ComputedStackIndex>,
+    mut changes: UiStackChanges,
 ) {
-    ui_stack.partition.clear();
-    ui_stack.uinodes.clear();
     visited_root_nodes.clear();
 
     for (id, maybe_global_zindex, maybe_zindex) in root_node_query.iter_many(ui_root_nodes.iter()) {
@@ -95,6 +125,38 @@ pub fn ui_stack_system(
         ));
     }
 
+    // Query iteration order breaks equal-z root ties, and can change when an
+    // unrelated component moves a root between archetypes. Compare the unsorted
+    // candidates, rather than silently retaining a different paint/hit order.
+    let dirty = !changes.changed.is_empty()
+        || !changes.removed_nodes.is_empty()
+        || !changes.removed_children.is_empty()
+        || !changes.removed_parents.is_empty()
+        || !changes.removed_z.is_empty()
+        || !changes.removed_global_z.is_empty()
+        || !changes.removed_index.is_empty()
+        || ui_stack.is_changed()
+        || *changes.roots != *root_nodes
+        || update_query.iter_mut().any(|index| index.is_changed());
+    changes.removed_nodes.clear();
+    changes.removed_children.clear();
+    changes.removed_parents.clear();
+    changes.removed_z.clear();
+    changes.removed_global_z.clear();
+    changes.removed_index.clear();
+    #[cfg(feature = "ghost_nodes")]
+    let dirty = {
+        let dirty = dirty || !changes.added_ghosts.is_empty() || !changes.removed_ghosts.is_empty();
+        changes.removed_ghosts.clear();
+        dirty
+    };
+    if !dirty {
+        root_nodes.clear();
+        return;
+    }
+    changes.roots.clone_from(&root_nodes);
+    ui_stack.partition.clear();
+    ui_stack.uinodes.clear();
     root_nodes.sort_by_key(|(_, z)| *z);
 
     for (root_entity, _) in root_nodes.drain(..) {
@@ -159,6 +221,113 @@ mod tests {
 
     #[derive(Component, PartialEq, Debug, Clone)]
     struct Label(&'static str);
+
+    #[test]
+    fn cached_stack_tracks_order_membership_and_removals() {
+        use crate::{ComputedStackIndex, UiTransform, Val2};
+        use bevy_ecs::prelude::*;
+        let mut world = World::new();
+        world.init_resource::<UiStack>();
+        let root = world.spawn(Node::default()).id();
+        let a = world.spawn(Node::default()).id();
+        let b = world.spawn(Node::default()).id();
+        world.entity_mut(root).add_children(&[a, b]);
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, a, b]);
+        let tick = world.get_resource_ref::<UiStack>().unwrap().last_changed();
+        world.get_mut::<UiTransform>(a).unwrap().translation = Val2::px(5., 2.);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get_resource_ref::<UiStack>().unwrap().last_changed(),
+            tick
+        );
+
+        world.entity_mut(a).insert(ZIndex(1));
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, b, a]);
+        world.get_mut::<ZIndex>(a).unwrap().0 = -1;
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, a, b]);
+        world.entity_mut(a).remove::<ZIndex>();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, a, b]);
+        world.entity_mut(root).replace_children(&[b, a]);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, b, a]);
+        world.entity_mut(a).insert(GlobalZIndex(-1));
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [a, root, b]);
+        assert_eq!(world.resource::<UiStack>().partition, [0..1, 1..3]);
+        world.get_mut::<GlobalZIndex>(a).unwrap().0 = 1;
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, b, a]);
+        assert_eq!(world.resource::<UiStack>().partition, [0..2, 2..3]);
+        world.entity_mut(a).remove::<GlobalZIndex>();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, b, a]);
+        world.entity_mut(a).remove::<ComputedStackIndex>();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, b]);
+        world.entity_mut(a).insert(ComputedStackIndex::default());
+        world.entity_mut(b).despawn();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, a]);
+    }
+
+    #[test]
+    fn cached_stack_preserves_query_order_ties_and_root_promotion() {
+        use bevy_ecs::{prelude::*, system::RunSystemOnce};
+        let mut world = World::new();
+        world.init_resource::<UiStack>();
+        let a = world.spawn(Node::default()).id();
+        let b = world.spawn(Node::default()).id();
+        let c = world.spawn(Node::default()).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+        schedule.run(&mut world);
+        // Moving an equal-z root to another archetype must match a fresh build.
+        world.entity_mut(a).insert(Label("moved"));
+        schedule.run(&mut world);
+        let cached = world.resource::<UiStack>().uinodes.clone();
+        world.run_system_once(ui_stack_system).unwrap();
+        assert_eq!(world.resource::<UiStack>().uinodes, cached);
+        world.entity_mut(a).add_children(&[b, c]);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [a, b, c]);
+        world.entity_mut(b).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().partition.len(), 2);
+        assert!(world.resource::<UiStack>().uinodes.contains(&b));
+        world.entity_mut(c).insert(GlobalZIndex(3));
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes.last(), Some(&c));
+    }
+
+    #[cfg(feature = "ghost_nodes")]
+    #[test]
+    fn cached_stack_tracks_ghost_root_changes() {
+        use crate::experimental::GhostNode;
+        let mut world = World::new();
+        world.init_resource::<UiStack>();
+        let child = world.spawn(Node::default()).id();
+        let ghost = world.spawn(GhostNode).add_child(child).id();
+        let root = world.spawn(Node::default()).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().partition.len(), 2);
+        world.entity_mut(root).add_child(ghost);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, child]);
+        world.entity_mut(ghost).remove::<GhostNode>();
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root]);
+        world.entity_mut(ghost).insert(GhostNode);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [root, child]);
+    }
 
     fn node_with_global_and_local_zindex(
         name: &'static str,
