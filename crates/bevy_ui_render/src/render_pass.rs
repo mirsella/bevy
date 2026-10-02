@@ -1,6 +1,7 @@
 use core::ops::Range;
 
-use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
+use crate::UiViewTarget;
+use crate::{ui_mesh::UiMesh, ImageNodeBindGroups, UiBatch, UiVertex};
 
 use crate::{SrgbUiCompositeBindGroup, SrgbUiCompositePipelineId, SrgbUiTexture, UiCameraView};
 use bevy_color::LinearRgba;
@@ -221,52 +222,29 @@ impl CachedRenderPipelinePhaseItem for TransparentUi {
     }
 }
 
-pub type DrawUi = (
-    SetItemPipeline,
-    SetUiViewBindGroup<0>,
-    SetUiTextureBindGroup<1>,
-    DrawUiNode,
-);
+pub type DrawUi = (SetItemPipeline, DrawUiNode);
 
-pub struct SetUiViewBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiViewBindGroup<I> {
-    type Param = SRes<UiMeta>;
+pub struct DrawUiNode;
+impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
+    type Param = (SRes<UiMesh<UiVertex>>, SRes<ImageNodeBindGroups>);
     type ViewQuery = Read<ViewUniformOffset>;
-    type ItemQuery = ();
+    type ItemQuery = Read<UiBatch>;
 
     fn render<'w>(
         _item: &P,
         view_uniform: &'w ViewUniformOffset,
-        _entity: Option<()>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(view_bind_group) = ui_meta.into_inner().view_bind_group.as_ref() else {
-            return RenderCommandResult::Failure("view_bind_group not available");
-        };
-        pass.set_bind_group(I, view_bind_group, &[view_uniform.offset]);
-        RenderCommandResult::Success
-    }
-}
-pub struct SetUiTextureBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<I> {
-    type Param = SRes<ImageNodeBindGroups>;
-    type ViewQuery = ();
-    type ItemQuery = Read<UiBatch>;
-
-    #[inline]
-    fn render<'w>(
-        _item: &P,
-        _view: (),
         batch: Option<&'w UiBatch>,
-        image_bind_groups: SystemParamItem<'w, '_, Self::Param>,
+        (ui_meta, image_bind_groups): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let image_bind_groups = image_bind_groups.into_inner();
         let Some(batch) = batch else {
             return RenderCommandResult::Skip;
         };
-
+        let ui_meta = ui_meta.into_inner();
+        let image_bind_groups = image_bind_groups.into_inner();
+        let Some(view_bind_group) = ui_meta.view_bind_group.as_ref() else {
+            return RenderCommandResult::Failure("view_bind_group not available");
+        };
         let Some(bind_group) = image_bind_groups.values.get(&batch.image) else {
             error!(
                 "Skipping UI draw: missing bind group for image {:?}",
@@ -275,29 +253,6 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<I>
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(I, bind_group, &[]);
-        RenderCommandResult::Success
-    }
-}
-
-pub struct DrawUiNode;
-impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
-    type Param = SRes<UiMeta>;
-    type ViewQuery = ();
-    type ItemQuery = Read<UiBatch>;
-
-    #[inline]
-    fn render<'w>(
-        _item: &P,
-        _view: (),
-        batch: Option<&'w UiBatch>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(batch) = batch else {
-            return RenderCommandResult::Skip;
-        };
-        let ui_meta = ui_meta.into_inner();
         let Some(vertices) = ui_meta.vertices.buffer() else {
             return RenderCommandResult::Failure("missing vertices to draw ui");
         };
@@ -305,14 +260,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
             return RenderCommandResult::Failure("missing indices to draw ui");
         };
 
-        // Store the vertices
+        pass.set_bind_group(0, view_bind_group, &[view_uniform.offset]);
+        pass.set_bind_group(1, bind_group, &[]);
         pass.set_vertex_buffer(0, vertices.slice(..));
-        // Define how to "connect" the vertices
         pass.set_index_buffer(
             indices.slice(..),
             bevy_render::render_resource::IndexFormat::Uint32,
         );
-        // Draw the vertices
         pass.draw_indexed(batch.range.clone(), 0, 0..1);
         RenderCommandResult::Success
     }

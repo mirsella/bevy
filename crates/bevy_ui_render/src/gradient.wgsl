@@ -1,8 +1,5 @@
 #import bevy_render::view::View
-#import bevy_ui::ui_node::{
-    draw_uinode_background,
-    draw_uinode_border,
-}
+#import bevy_ui::ui_node::draw_uinode
 
 #import bevy_render::color_operations::{
     convert_to_linear_rgba,
@@ -23,18 +20,11 @@
 
 const TAU: f32 = 2. * PI;
 
-const RIGHT_VERTEX = 2u;
-const BOTTOM_VERTEX = 4u;
 // must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
 const RADIAL: u32 = 16u;
 const FILL_START: u32 = 32u;
 const FILL_END: u32 = 64u;
 const CONIC: u32 = 128u;
-const BORDER_LEFT: u32 = 256u;
-const BORDER_TOP: u32 = 512u;
-const BORDER_RIGHT: u32 = 1024u;
-const BORDER_BOTTOM: u32 = 2048u;
-const BORDER_ANY: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
 
 fn enabled(flags: u32, mask: u32) -> bool {
     return (flags & mask) != 0u;
@@ -43,7 +33,6 @@ fn enabled(flags: u32, mask: u32) -> bool {
 @group(0) @binding(0) var<uniform> view: View;
 
 struct GradientVertexOutput {
-    @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) size: vec2<f32>,
     @location(2) @interpolate(flat) flags: u32,
     @location(3) @interpolate(flat) radius: vec4<f32>,
@@ -64,27 +53,25 @@ struct GradientVertexOutput {
 @vertex
 fn vertex(
     @location(0) vertex_position: vec3<f32>,
-    @location(1) vertex_uv: vec2<f32>,
-    @location(2) flags: u32,
+    @location(1) flags: u32,
 
     // x: top left, y: top right, z: bottom right, w: bottom left.
-    @location(3) radius: vec4<f32>,
+    @location(2) radius: vec4<f32>,
 
     // x: left, y: top, z: right, w: bottom.
-    @location(4) border: vec4<f32>,
-    @location(5) size: vec2<f32>,
-    @location(6) point: vec2<f32>,
-    @location(7) @interpolate(flat) g_start: vec2<f32>,
-    @location(8) @interpolate(flat) dir: vec2<f32>,
-    @location(9) @interpolate(flat) start_color: vec4<f32>,
-    @location(10) @interpolate(flat) start_len: f32,
-    @location(11) @interpolate(flat) end_len: f32,
-    @location(12) @interpolate(flat) end_color: vec4<f32>,
-    @location(13) @interpolate(flat) hint: f32
+    @location(3) border: vec4<f32>,
+    @location(4) size: vec2<f32>,
+    @location(5) point: vec2<f32>,
+    @location(6) @interpolate(flat) g_start: vec2<f32>,
+    @location(7) @interpolate(flat) dir: vec2<f32>,
+    @location(8) @interpolate(flat) start_color: vec4<f32>,
+    @location(9) @interpolate(flat) start_len: f32,
+    @location(10) @interpolate(flat) end_len: f32,
+    @location(11) @interpolate(flat) end_color: vec4<f32>,
+    @location(12) @interpolate(flat) hint: f32
 ) -> GradientVertexOutput {
     var out: GradientVertexOutput;
     out.position = view.clip_from_world * vec4(vertex_position, 1.0);
-    out.uv = vertex_uv;
     out.size = size;
     out.flags = flags;
     out.radius = radius;
@@ -122,11 +109,7 @@ fn fragment(in: GradientVertexOutput) -> @location(0) vec4<f32> {
         in.flags
     );
 
-    if enabled(in.flags, BORDER_ANY) {
-        return draw_uinode_border(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
-    } else {
-        return draw_uinode_background(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
-    }
+    return draw_uinode(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
 }
 
 fn rem_euclid(a: f32, b: f32) -> f32 {

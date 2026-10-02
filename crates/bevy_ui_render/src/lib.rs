@@ -15,6 +15,7 @@ pub mod render_pass;
 mod text;
 pub mod ui_material;
 mod ui_material_pipeline;
+mod ui_mesh;
 pub mod ui_texture_slice_pipeline;
 
 #[cfg(feature = "bevy_ui_debug")]
@@ -50,7 +51,7 @@ use bevy_render::{
     render_asset::RenderAssets,
     render_phase::{
         sort_phase_system, AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
-        ViewSortedRenderPhases,
+        SortedPhaseItems, ViewSortedRenderPhases,
     },
     render_resource::*,
     renderer::{RenderDevice, RenderQueue},
@@ -82,9 +83,10 @@ pub use render_pass::*;
 pub use ui_material_pipeline::*;
 use ui_texture_slice_pipeline::UiTextureSlicerPlugin;
 
-use crate::clipping::clip_polygon;
+use crate::clipping::{clip_polygon, rect_without_hole, rounded_inner_rect};
 use crate::shader_flags::INVERT;
 use crate::text::{calculate_text_scroll_clip, extract_preedit_underlines, extract_text_cursor};
+use crate::ui_mesh::UiMesh;
 
 pub mod prelude {
     #[cfg(feature = "bevy_ui_debug")]
@@ -225,7 +227,7 @@ impl Plugin for UiRenderPlugin {
             .init_gpu_resource::<SpecializedRenderPipelines<UiPipeline>>()
             .init_gpu_resource::<SpecializedRenderPipelines<SrgbUiCompositePipeline>>()
             .init_gpu_resource::<ImageNodeBindGroups>()
-            .init_gpu_resource::<UiMeta>()
+            .init_gpu_resource::<UiMesh<UiVertex>>()
             .init_resource::<ExtractedUiNodes>()
             .allow_ambiguous_resource::<ExtractedUiNodes>()
             .init_resource::<DrawFunctions<TransparentUi>>()
@@ -368,6 +370,8 @@ pub enum NodeType {
     Viewport,
     Inverted,
     Border(u32), // shader flags
+    /// The node's background color, which can be covered by its own gradient.
+    Background,
 }
 
 pub enum ExtractedUiItem {
@@ -406,12 +410,15 @@ pub struct ExtractedGlyph {
 pub struct ExtractedUiNodes {
     pub uinodes: Vec<ExtractedUiNode>,
     pub glyphs: Vec<ExtractedGlyph>,
+    /// Nodes with an opaque covering gradient whose render pipeline is ready this frame.
+    pub(crate) covered_backgrounds: HashSet<MainEntity>,
 }
 
 impl ExtractedUiNodes {
     pub fn clear(&mut self) {
         self.uinodes.clear();
         self.glyphs.clear();
+        self.covered_backgrounds.clear();
     }
 }
 
@@ -452,6 +459,7 @@ pub fn extract_uinode_background_colors(
             || (background_color.is_fully_transparent()
                 && maybe_outer_color.is_none_or(|outer| outer.is_fully_transparent()))
             || uinode.is_empty()
+            || clipping::rect_is_clipped(clip, transform.into(), uinode.size())
         {
             continue;
         }
@@ -460,7 +468,21 @@ pub fn extract_uinode_background_colors(
             continue;
         };
 
-        if !background_color.is_fully_transparent() {
+        for (color, border, node_type) in [
+            (
+                Some(background_color.0),
+                uinode.border(),
+                NodeType::Background,
+            ),
+            (
+                maybe_outer_color.map(|outer| outer.0),
+                BorderRect::ZERO,
+                NodeType::Inverted,
+            ),
+        ] {
+            let Some(color) = color.filter(|color| !color.is_fully_transparent()) else {
+                continue;
+            };
             extracted_uinodes.uinodes.push(ExtractedUiNode {
                 render_entity: commands.spawn(TemporaryRenderEntity).id(),
                 z_order: stack_index.0 as f32 + stack_z_offsets::BACKGROUND_COLOR,
@@ -469,7 +491,7 @@ pub fn extract_uinode_background_colors(
                 extracted_camera_entity,
                 transform: transform.into(),
                 item: ExtractedUiItem::Node {
-                    color: background_color.0.into(),
+                    color: color.into(),
                     rect: Rect {
                         min: Vec2::ZERO,
                         max: uinode.size,
@@ -477,36 +499,9 @@ pub fn extract_uinode_background_colors(
                     atlas_scaling: None,
                     flip_x: false,
                     flip_y: false,
-                    border: uinode.border(),
+                    border,
                     border_radius: uinode.border_radius(),
-                    node_type: NodeType::Rect,
-                },
-                main_entity: entity.into(),
-            });
-        }
-
-        if let Some(outer_color) = maybe_outer_color
-            && !outer_color.0.is_fully_transparent()
-        {
-            extracted_uinodes.uinodes.push(ExtractedUiNode {
-                render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                z_order: stack_index.0 as f32 + stack_z_offsets::BACKGROUND_COLOR,
-                clip: clip.cloned(),
-                image: AssetId::default(),
-                extracted_camera_entity,
-                transform: transform.into(),
-                item: ExtractedUiItem::Node {
-                    color: outer_color.0.into(),
-                    rect: Rect {
-                        min: Vec2::ZERO,
-                        max: uinode.size,
-                    },
-                    atlas_scaling: None,
-                    flip_x: false,
-                    flip_y: false,
-                    border: BorderRect::ZERO,
-                    border_radius: uinode.border_radius(),
-                    node_type: NodeType::Inverted,
+                    node_type,
                 },
                 main_entity: entity.into(),
             });
@@ -576,6 +571,12 @@ pub fn extract_uinode_images(
             visual_box.size()
         };
 
+        let image_transform =
+            Affine2::from(*transform) * Affine2::from_translation(visual_box.center());
+        if clipping::rect_is_clipped(clip, image_transform, size) {
+            continue;
+        }
+
         let atlas_rect = image
             .texture_atlas
             .as_ref()
@@ -611,7 +612,7 @@ pub fn extract_uinode_images(
             clip: clip.cloned(),
             image: image.image.id(),
             extracted_camera_entity,
-            transform: Affine2::from(*transform) * Affine2::from_translation(visual_box.center()),
+            transform: image_transform,
             item: ExtractedUiItem::Node {
                 color: image.color.into(),
                 rect,
@@ -672,6 +673,7 @@ pub fn extract_uinode_borders(
         // Don't extract borders with zero width along all edges
         if computed_node.border() != BorderRect::ZERO
             && let Some(border_color) = maybe_border_color
+            && !clipping::rect_is_clipped(maybe_clip, transform.into(), computed_node.size())
         {
             let border_colors = [
                 border_color.left.to_linear(),
@@ -738,6 +740,9 @@ pub fn extract_uinode_borders(
         if let Some(outline) = maybe_outline.filter(|outline| !outline.color.is_fully_transparent())
         {
             let outline_size = computed_node.outlined_node_size();
+            if clipping::rect_is_clipped(maybe_clip, transform.into(), outline_size) {
+                continue;
+            }
             extracted_uinodes.uinodes.push(ExtractedUiNode {
                 z_order: stack_index.0 as f32 + stack_z_offsets::BORDER,
                 render_entity: commands.spawn(TemporaryRenderEntity).id(),
@@ -1568,7 +1573,7 @@ pub fn extract_text_decorations(
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct UiVertex {
+pub struct UiVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
     pub color: [f32; 4],
@@ -1590,23 +1595,6 @@ struct UiVertex {
     pub effect_params: [f32; 4],
 }
 
-#[derive(Resource)]
-pub struct UiMeta {
-    vertices: RawBufferVec<UiVertex>,
-    indices: RawBufferVec<u32>,
-    view_bind_group: Option<BindGroup>,
-}
-
-impl Default for UiMeta {
-    fn default() -> Self {
-        Self {
-            vertices: RawBufferVec::new(BufferUsages::VERTEX),
-            indices: RawBufferVec::new(BufferUsages::INDEX),
-            view_bind_group: None,
-        }
-    }
-}
-
 pub(crate) const QUAD_VERTEX_POSITIONS: [Vec2; 4] = [
     Vec2::new(-0.5, -0.5),
     Vec2::new(0.5, -0.5),
@@ -1618,6 +1606,45 @@ pub(crate) const QUAD_VERTEX_POSITIONS: [Vec2; 4] = [
 pub struct UiBatch {
     pub range: Range<u32>,
     pub image: AssetId<Image>,
+}
+
+impl UiBatch {
+    fn append(
+        items: &mut SortedPhaseItems<TransparentUi>,
+        first: &mut Option<usize>,
+        batches: &mut Vec<(Entity, Self)>,
+        item_index: usize,
+        image: AssetId<Image>,
+        range: Range<u32>,
+    ) {
+        if let Some(first) = *first
+            && items[first].batch_range.end == item_index as u32
+        {
+            let batch = &mut batches.last_mut().unwrap().1;
+            // Fully clipped nodes need neither a texture change nor a new draw.
+            if range.is_empty() {
+                items[first].batch_range.end += 1;
+                return;
+            }
+            // Untextured vertices can share any texture binding.
+            if batch.image == image
+                || batch.image == AssetId::default()
+                || image == AssetId::default()
+            {
+                if batch.image == AssetId::default() {
+                    batch.image = image;
+                }
+                batch.range.end = range.end;
+                items[first].batch_range.end += 1;
+                return;
+            }
+        }
+        if !range.is_empty() {
+            batches.push((items[item_index].entity(), Self { range, image }));
+            items[item_index].batch_range = item_index as u32..item_index as u32 + 1;
+            *first = Some(item_index);
+        }
+    }
 }
 
 /// The values here should match the values for the constants in `ui.wgsl`
@@ -1713,7 +1740,7 @@ pub fn prepare_uinodes(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut ui_meta: ResMut<UiMeta>,
+    mut ui_meta: ResMut<UiMesh<UiVertex>>,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     view_uniforms: Res<ViewUniforms>,
     ui_pipeline: Res<UiPipeline>,
@@ -1747,90 +1774,25 @@ pub fn prepare_uinodes(
             &BindGroupEntries::single(view_binding),
         ));
 
-        // Buffer indexes
-        let mut vertices_index = 0;
-        let mut indices_index = 0;
-
         for ui_phase in phases.values_mut() {
-            let mut batch_item_index = 0;
-            let mut batch_image_handle = None;
+            let mut first = None;
 
             for item_index in 0..ui_phase.items.len() {
-                let item = &mut ui_phase.items[item_index];
+                let item = &ui_phase.items[item_index];
                 let Some(extracted_uinode) = extracted_uinodes
                     .uinodes
                     .get(item.index)
                     .filter(|n| item.entity() == n.render_entity)
                 else {
-                    batch_image_handle = None;
                     continue;
                 };
 
-                let mut existing_batch = batches.last_mut();
-
-                if batch_image_handle.is_none()
-                    || existing_batch.is_none()
-                    || (batch_image_handle != Some(AssetId::default())
-                        && extracted_uinode.image != AssetId::default()
-                        && batch_image_handle != Some(extracted_uinode.image))
-                {
-                    if let Some(gpu_image) = gpu_images.get(extracted_uinode.image) {
-                        batch_item_index = item_index;
-                        batch_image_handle = Some(extracted_uinode.image);
-
-                        let new_batch = UiBatch {
-                            range: vertices_index..vertices_index,
-                            image: extracted_uinode.image,
-                        };
-
-                        batches.push((item.entity(), new_batch));
-
-                        image_bind_groups
-                            .values
-                            .entry(extracted_uinode.image)
-                            .or_insert_with(|| {
-                                render_device.create_bind_group(
-                                    "ui_material_bind_group",
-                                    &pipeline_cache
-                                        .get_bind_group_layout(&ui_pipeline.image_layout),
-                                    &BindGroupEntries::sequential((
-                                        &gpu_image.texture_view,
-                                        &gpu_image.sampler,
-                                    )),
-                                )
-                            });
-
-                        existing_batch = batches.last_mut();
-                    } else {
-                        continue;
-                    }
-                } else if batch_image_handle == Some(AssetId::default())
-                    && extracted_uinode.image != AssetId::default()
-                {
-                    if let Some(ref mut existing_batch) = existing_batch
-                        && let Some(gpu_image) = gpu_images.get(extracted_uinode.image)
-                    {
-                        batch_image_handle = Some(extracted_uinode.image);
-                        existing_batch.1.image = extracted_uinode.image;
-
-                        image_bind_groups
-                            .values
-                            .entry(extracted_uinode.image)
-                            .or_insert_with(|| {
-                                render_device.create_bind_group(
-                                    "ui_material_bind_group",
-                                    &pipeline_cache
-                                        .get_bind_group_layout(&ui_pipeline.image_layout),
-                                    &BindGroupEntries::sequential((
-                                        &gpu_image.texture_view,
-                                        &gpu_image.sampler,
-                                    )),
-                                )
-                            });
-                    } else {
-                        continue;
-                    }
-                }
+                let Some(image) = gpu_images.get(extracted_uinode.image) else {
+                    // Asset loading and GPU uploads can lag behind UI extraction.
+                    // Retry next frame without batching across this skipped item.
+                    continue;
+                };
+                let start = ui_meta.indices.len() as u32;
                 match &extracted_uinode.item {
                     ExtractedUiItem::Node {
                         atlas_scaling,
@@ -1852,21 +1814,10 @@ pub fn prepare_uinodes(
 
                         let transform = extracted_uinode.transform;
 
-                        let points = QUAD_VERTEX_POSITIONS.map(|pos| pos * rect_size);
-                        let positions = points.map(|pos| transform.transform_point2(pos));
-
                         let uvs = if flags == shader_flags::UNTEXTURED {
                             [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]
                         } else {
                             let mut uinode_rect = *rect;
-                            let Some(image) = gpu_images.get(extracted_uinode.image) else {
-                                tracing::error!(
-                                    "Skipping UI node draw: missing GPU image {:?}",
-                                    extracted_uinode.image
-                                );
-                                batch_image_handle = None;
-                                continue;
-                            };
                             // Rescale atlases. This is done here because we need texture data that might not be available in Extract.
                             let atlas_extent = atlas_scaling
                                 .map(|scaling| image.size_2d().as_vec2() * scaling)
@@ -1900,60 +1851,58 @@ pub fn prepare_uinodes(
                             _ => {}
                         }
 
-                        let vertices = clip_polygon(
-                            extracted_uinode.clip.as_ref(),
-                            &[
-                                (positions[0], (uvs[0], points[0])),
-                                (positions[1], (uvs[1], points[1])),
-                                (positions[2], (uvs[2], points[2])),
-                                (positions[3], (uvs[3], points[3])),
-                            ],
-                            |a, b, t| (a.0.lerp(b.0, t), a.1.lerp(b.1, t)),
-                        );
-                        if vertices.is_empty() {
-                            continue;
-                        }
-
-                        for &(position, (uv, point)) in &vertices {
-                            ui_meta.vertices.push(UiVertex {
-                                position: position.extend(0.).into(),
-                                uv: uv.into(),
-                                color,
-                                flags,
-                                radius: (*border_radius).into(),
-                                border: [
-                                    border.min_inset.x,
-                                    border.min_inset.y,
-                                    border.max_inset.x,
-                                    border.max_inset.y,
-                                ],
-                                size: rect_size.into(),
-                                point: point.into(),
-                                shadow_color: [0.0; 4],
-                                outline_color: [0.0; 4],
-                                effect_params: [0.0; 4],
+                        // Borders have zero coverage in the interior. Opaque gradients can
+                        // also cover a background interior, but keep both antialiased edges.
+                        let omit_interior = matches!(node_type, NodeType::Border(_))
+                            || (matches!(node_type, NodeType::Background)
+                                && extracted_uinodes
+                                    .covered_backgrounds
+                                    .contains(&extracted_uinode.main_entity));
+                        let hole = if omit_interior {
+                            rounded_inner_rect(rect_size, *border, *border_radius)
+                        } else {
+                            None
+                        };
+                        for part in rect_without_hole(rect_size, hole) {
+                            let corners = [0, 1, 2, 3].map(|i| {
+                                let pos = QUAD_VERTEX_POSITIONS[i];
+                                let point = part.center() + pos * part.size();
+                                let uv = if hole.is_none() {
+                                    uvs[i]
+                                } else {
+                                    uvs[0]
+                                        + (point / rect_size + Vec2::splat(0.5)) * (uvs[2] - uvs[0])
+                                };
+                                (transform.transform_point2(point), (uv, point))
                             });
+                            let vertices = clip_polygon(
+                                extracted_uinode.clip.as_ref(),
+                                &corners,
+                                |a, b, t| (a.0.lerp(b.0, t), a.1.lerp(b.1, t)),
+                            );
+                            ui_meta.push_triangle_fan(vertices.iter().map(
+                                |&(position, (uv, point))| UiVertex {
+                                    position: position.extend(0.).into(),
+                                    uv: uv.into(),
+                                    color,
+                                    flags,
+                                    radius: (*border_radius).into(),
+                                    border: [
+                                        border.min_inset.x,
+                                        border.min_inset.y,
+                                        border.max_inset.x,
+                                        border.max_inset.y,
+                                    ],
+                                    size: rect_size.into(),
+                                    point: point.into(),
+                                    shadow_color: [0.0; 4],
+                                    outline_color: [0.0; 4],
+                                    effect_params: [0.0; 4],
+                                },
+                            ));
                         }
-
-                        for i in 1..vertices.len() as u32 - 1 {
-                            ui_meta.indices.push(indices_index);
-                            ui_meta.indices.push(indices_index + i);
-                            ui_meta.indices.push(indices_index + i + 1);
-                        }
-
-                        vertices_index += 3 * (vertices.len() as u32 - 2);
-                        indices_index += vertices.len() as u32;
                     }
                     ExtractedUiItem::Glyphs { range } => {
-                        let Some(image) = gpu_images.get(extracted_uinode.image) else {
-                            tracing::error!(
-                                "Skipping UI glyph draw: missing GPU image {:?}",
-                                extracted_uinode.image
-                            );
-                            batch_image_handle = None;
-                            continue;
-                        };
-
                         let atlas_extent = image.size_2d().as_vec2();
 
                         for glyph in &extracted_uinodes.glyphs[range.clone()] {
@@ -2016,54 +1965,120 @@ pub fn prepare_uinodes(
                                 ],
                                 Vec2::lerp,
                             );
-                            if vertices.is_empty() {
-                                continue;
-                            }
-
-                            for vertex in &vertices {
-                                ui_meta.vertices.push(UiVertex {
-                                    position: vertex.0.extend(0.).into(),
-                                    uv: vertex.1.into(),
-                                    color,
-                                    flags,
-                                    radius: [0.0; 4],
-                                    border: [0.0; 4],
-                                    size: rect_size.into(),
-                                    point: [0.0; 2],
-                                    shadow_color,
-                                    outline_color,
-                                    effect_params,
-                                });
-                            }
-
-                            for i in 1..vertices.len() as u32 - 1 {
-                                ui_meta.indices.push(indices_index);
-                                ui_meta.indices.push(indices_index + i);
-                                ui_meta.indices.push(indices_index + i + 1);
-                            }
-
-                            vertices_index += 3 * (vertices.len() as u32 - 2);
-                            indices_index += vertices.len() as u32;
+                            ui_meta.push_triangle_fan(vertices.iter().map(|vertex| UiVertex {
+                                position: vertex.0.extend(0.).into(),
+                                uv: vertex.1.into(),
+                                color,
+                                flags,
+                                radius: [0.0; 4],
+                                border: [0.0; 4],
+                                size: rect_size.into(),
+                                point: [0.0; 2],
+                                shadow_color,
+                                outline_color,
+                                effect_params,
+                            }));
                         }
                     }
                 }
-                let Some(existing_batch) = existing_batch else {
-                    tracing::error!(
-                        "Skipping UI draw: missing batch for image {:?}",
-                        extracted_uinode.image
-                    );
-                    batch_image_handle = None;
-                    continue;
-                };
-                existing_batch.1.range.end = vertices_index;
-                ui_phase.items[batch_item_index].batch_range_mut().end += 1;
+                UiBatch::append(
+                    &mut ui_phase.items,
+                    &mut first,
+                    &mut batches,
+                    item_index,
+                    extracted_uinode.image,
+                    start..ui_meta.indices.len() as u32,
+                );
             }
         }
 
+        for (_, batch) in &batches {
+            image_bind_groups
+                .values
+                .entry(batch.image)
+                .or_insert_with(|| {
+                    let image = gpu_images
+                        .get(batch.image)
+                        .expect("UI batches only contain GPU-ready images");
+                    render_device.create_bind_group(
+                        "ui_material_bind_group",
+                        &pipeline_cache.get_bind_group_layout(&ui_pipeline.image_layout),
+                        &BindGroupEntries::sequential((&image.texture_view, &image.sampler)),
+                    )
+                });
+        }
         ui_meta.vertices.write_buffer(&render_device, &render_queue);
         ui_meta.indices.write_buffer(&render_device, &render_queue);
         *previous_len = batches.len();
         commands.try_insert_batch(batches);
     }
     extracted_uinodes.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_render::render_phase::DrawFunctionId;
+
+    #[test]
+    fn image_batches_preserve_order_and_ignore_clipped_textures() {
+        let mut images = Assets::<Image>::default();
+        let a = images.add(Image::default());
+        let b = images.add(Image::default());
+        let white = AssetId::default();
+        let mut items: SortedPhaseItems<_> = (0..10)
+            .map(|index| {
+                let entity = Entity::from_raw_u32(index as u32).unwrap();
+                let item = TransparentUi {
+                    sort_key: FloatOrd(index as f32),
+                    entity: (entity, entity.into()),
+                    pipeline: CachedRenderPipelineId::new(0),
+                    draw_function: DrawFunctionId(0),
+                    batch_range: 0..0,
+                    extra_index: PhaseItemExtraIndex::None,
+                    index,
+                    indexed: true,
+                };
+                (item.entity, item)
+            })
+            .collect();
+        let mut batches = Vec::new();
+        let mut first = None;
+        for (index, image, range) in [
+            (0, b.id(), 0..0),
+            (1, white, 0..6),
+            (2, a.id(), 6..12),
+            (3, white, 12..18),
+            (4, b.id(), 18..18),
+            (5, a.id(), 18..24),
+            (6, b.id(), 24..30),
+            // Item 7 has a pending image or belongs to another preparer.
+            (8, b.id(), 30..36),
+        ] {
+            UiBatch::append(&mut items, &mut first, &mut batches, index, image, range);
+        }
+        assert_eq!(batches.len(), 3);
+        // A new view cannot merge with the preceding view's last draw.
+        first = None;
+        UiBatch::append(&mut items, &mut first, &mut batches, 9, b.id(), 36..42);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, batch)| (batch.image, batch.range.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (a.id(), 0..24),
+                (b.id(), 24..30),
+                (b.id(), 30..36),
+                (b.id(), 36..42)
+            ]
+        );
+        assert_eq!(
+            items
+                .values()
+                .map(|item| item.batch_range.clone())
+                .collect::<Vec<_>>(),
+            [0..0, 1..6, 0..0, 0..0, 0..0, 0..0, 6..7, 0..0, 8..9, 9..10]
+        );
+    }
 }

@@ -6,21 +6,16 @@ use core::{
 
 use super::shader_flags::BORDER_ALL;
 use crate::clipping::clip_polygon;
+use crate::ui_mesh::{DrawUiMesh, UiMesh};
 use crate::*;
 use bevy_asset::*;
 use bevy_color::{ColorToComponents, Hsla, Hsva, LinearRgba, Oklaba, Oklcha, Srgba};
-use bevy_ecs::{
-    prelude::Component,
-    system::{
-        lifetimeless::{Read, SRes},
-        *,
-    },
-};
+use bevy_ecs::system::*;
+use bevy_math::Affine2;
 use bevy_math::{
     ops::{cos, sin},
     FloatOrd, Rect, Vec2,
 };
-use bevy_math::{Affine2, Vec2Swizzles};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
     render_phase::*,
@@ -52,7 +47,7 @@ impl Plugin for GradientPlugin {
                 .add_render_command::<TransparentUi, DrawGradientFns>()
                 .init_resource::<ExtractedGradients>()
                 .init_resource::<ExtractedColorStops>()
-                .init_gpu_resource::<GradientMeta>()
+                .init_gpu_resource::<UiMesh<UiGradientVertex>>()
                 .init_gpu_resource::<SpecializedRenderPipelines<GradientPipeline>>()
                 .add_systems(RenderStartup, init_gradient_pipeline)
                 .add_systems(
@@ -68,28 +63,6 @@ impl Plugin for GradientPlugin {
                         prepare_gradient.in_set(RenderSystems::PrepareBindGroups),
                     ),
                 );
-        }
-    }
-}
-
-#[derive(Component)]
-pub struct GradientBatch {
-    pub range: Range<u32>,
-}
-
-#[derive(Resource)]
-pub struct GradientMeta {
-    vertices: RawBufferVec<UiGradientVertex>,
-    indices: RawBufferVec<u32>,
-    view_bind_group: Option<BindGroup>,
-}
-
-impl Default for GradientMeta {
-    fn default() -> Self {
-        Self {
-            vertices: RawBufferVec::new(BufferUsages::VERTEX),
-            indices: RawBufferVec::new(BufferUsages::INDEX),
-            view_bind_group: None,
         }
     }
 }
@@ -151,8 +124,6 @@ impl SpecializedRenderPipeline for GradientPipeline {
             vec![
                 // position
                 VertexFormat::Float32x3,
-                // uv
-                VertexFormat::Float32x2,
                 // flags
                 VertexFormat::Uint32,
                 // radius
@@ -225,9 +196,9 @@ pub enum ResolvedGradient {
 }
 
 pub struct ExtractedGradient {
-    pub stack_index: u32,
+    pub z_order: f32,
     pub transform: Affine2,
-    pub rect: Rect,
+    pub size: Vec2,
     pub clip: Option<CalculatedClip>,
     pub extracted_camera_entity: Entity,
     /// range into `ExtractedColorStops`
@@ -352,9 +323,9 @@ pub fn extract_gradients(
         )>,
     >,
     camera_map: Extract<UiCameraMap>,
+    mut sorted_stops: Local<Vec<(LinearRgba, f32, f32)>>,
 ) {
     let mut camera_mapper = camera_map.get_mapper();
-    let mut sorted_stops = vec![];
 
     for (
         entity,
@@ -368,8 +339,10 @@ pub fn extract_gradients(
         (gradient, gradient_border),
     ) in &gradients_query
     {
-        // Skip invisible images
-        if !inherited_visibility.get() {
+        if !inherited_visibility.get()
+            || uinode.is_empty()
+            || clipping::rect_is_clipped(clip, transform.into(), uinode.size())
+        {
             continue;
         }
 
@@ -377,13 +350,20 @@ pub fn extract_gradients(
             continue;
         };
 
-        for (gradients, node_type) in [
-            (gradient.map(|g| &g.0), NodeType::Rect),
-            (gradient_border.map(|g| &g.0), NodeType::Border(BORDER_ALL)),
-        ]
-        .iter()
-        .filter_map(|(g, n)| g.map(|g| (g, *n)))
-        {
+        for (gradients, node_type, z_offset) in [
+            (
+                gradient.map(|g| &g.0),
+                NodeType::Rect,
+                stack_z_offsets::GRADIENT,
+            ),
+            (
+                gradient_border.map(|g| &g.0),
+                NodeType::Border(BORDER_ALL),
+                stack_z_offsets::BORDER_GRADIENT,
+            ),
+        ] {
+            let Some(gradients) = gradients else { continue };
+            let z_order = stack_index.0 as f32 + z_offset;
             for gradient in gradients.iter() {
                 if gradient.is_empty() {
                     continue;
@@ -391,13 +371,7 @@ pub fn extract_gradients(
                 if let Some(color) = gradient.get_single() {
                     // With a single color stop there's no gradient, fill the node with the color
                     extracted_uinodes.uinodes.push(ExtractedUiNode {
-                        z_order: stack_index.0 as f32
-                            + match node_type {
-                                NodeType::Rect | NodeType::Viewport | NodeType::Inverted => {
-                                    stack_z_offsets::GRADIENT
-                                }
-                                NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
-                            },
+                        z_order,
                         image: AssetId::default(),
                         clip: clip.cloned(),
                         extracted_camera_entity,
@@ -420,15 +394,14 @@ pub fn extract_gradients(
                     });
                     continue;
                 }
-                match gradient {
+                let range_start = extracted_color_stops.0.len();
+                let (resolved_gradient, color_space) = match gradient {
                     Gradient::Linear(LinearGradient {
                         color_space,
                         angle,
                         stops,
                     }) => {
                         let length = compute_gradient_line_length(*angle, uinode.size);
-
-                        let range_start = extracted_color_stops.0.len();
 
                         compute_color_stops(
                             stops,
@@ -439,24 +412,7 @@ pub fn extract_gradients(
                             &mut extracted_color_stops.0,
                         );
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.cloned(),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Linear { angle: *angle },
-                            color_space: *color_space,
-                        });
+                        (ResolvedGradient::Linear { angle: *angle }, *color_space)
                     }
                     Gradient::Radial(RadialGradient {
                         color_space,
@@ -479,7 +435,6 @@ pub fn extract_gradients(
 
                         let length = size.x;
 
-                        let range_start = extracted_color_stops.0.len();
                         compute_color_stops(
                             stops,
                             target.scale_factor(),
@@ -489,24 +444,7 @@ pub fn extract_gradients(
                             &mut extracted_color_stops.0,
                         );
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.cloned(),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Radial { center: c, size },
-                            color_space: *color_space,
-                        });
+                        (ResolvedGradient::Radial { center: c, size }, *color_space)
                     }
                     Gradient::Conic(ConicGradient {
                         color_space,
@@ -519,8 +457,6 @@ pub fn extract_gradients(
                             uinode.size,
                             target.physical_size().as_vec2(),
                         );
-                        let range_start = extracted_color_stops.0.len();
-
                         // sort the explicit stops
                         sorted_stops.extend(stops.iter().filter_map(|stop| {
                             stop.angle.map(|angle| {
@@ -545,29 +481,30 @@ pub fn extract_gradients(
                             TAU,
                         );
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.cloned(),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Conic {
+                        (
+                            ResolvedGradient::Conic {
                                 start: *start,
                                 center: g_start,
                             },
-                            color_space: *color_space,
-                        });
+                            *color_space,
+                        )
                     }
-                }
+                };
+                extracted_gradients.items.push(ExtractedGradient {
+                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
+                    z_order,
+                    transform: transform.into(),
+                    stops_range: range_start..extracted_color_stops.0.len(),
+                    size: uinode.size,
+                    clip: clip.cloned(),
+                    extracted_camera_entity,
+                    main_entity: entity.into(),
+                    node_type,
+                    border_radius: uinode.border_radius,
+                    border: uinode.border,
+                    resolved_gradient,
+                    color_space,
+                });
             }
         }
     }
@@ -578,11 +515,13 @@ pub fn extract_gradients(
     reason = "it's a system that needs a lot of them"
 )]
 pub fn queue_gradient(
-    extracted_gradients: ResMut<ExtractedGradients>,
+    extracted_gradients: Res<ExtractedGradients>,
+    extracted_color_stops: Res<ExtractedColorStops>,
+    mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     gradients_pipeline: Res<GradientPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<GradientPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
+    render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -590,7 +529,7 @@ pub fn queue_gradient(
     let draw_function = draw_functions.read().id::<DrawGradientFns>();
     for (index, gradient) in extracted_gradients.items.iter().enumerate() {
         let Ok((default_camera_view, ui_anti_alias)) =
-            render_views.get_mut(gradient.extracted_camera_entity)
+            render_views.get(gradient.extracted_camera_entity)
         else {
             continue;
         };
@@ -614,19 +553,31 @@ pub fn queue_gradient(
             },
         );
 
+        // Only cut out a background when its covering gradient can actually draw.
+        // Linear gradients extend their first/last stops across the whole node.
+        if matches!(gradient.node_type, NodeType::Rect)
+            && matches!(gradient.resolved_gradient, ResolvedGradient::Linear { angle } if angle.is_finite())
+            && extracted_color_stops.0[gradient.stops_range.clone()]
+                .iter()
+                .all(|(color, point, hint)| {
+                    color.is_fully_opaque()
+                        && point.is_finite()
+                        && hint.is_finite()
+                        && *hint > 0.
+                        && *hint < 1.
+                })
+            && pipeline_cache.get_render_pipeline(pipeline).is_some()
+        {
+            extracted_uinodes
+                .covered_backgrounds
+                .insert(gradient.main_entity);
+        }
+
         transparent_phase.add_transient(TransparentUi {
             draw_function,
             pipeline,
             entity: (gradient.render_entity, gradient.main_entity),
-            sort_key: FloatOrd(
-                gradient.stack_index as f32
-                    + match gradient.node_type {
-                        NodeType::Rect | NodeType::Viewport | NodeType::Inverted => {
-                            stack_z_offsets::GRADIENT
-                        }
-                        NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
-                    },
-            ),
+            sort_key: FloatOrd(gradient.z_order),
             batch_range: 0..0,
             extra_index: PhaseItemExtraIndex::None,
             index,
@@ -637,9 +588,8 @@ pub fn queue_gradient(
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct UiGradientVertex {
+pub struct UiGradientVertex {
     position: [f32; 3],
-    uv: [f32; 2],
     flags: u32,
     radius: [f32; 4],
     border: [f32; 4],
@@ -693,7 +643,7 @@ pub fn prepare_gradient(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut ui_meta: ResMut<GradientMeta>,
+    mut ui_meta: ResMut<UiMesh<UiGradientVertex>>,
     mut extracted_gradients: ResMut<ExtractedGradients>,
     mut extracted_color_stops: ResMut<ExtractedColorStops>,
     view_uniforms: Res<ViewUniforms>,
@@ -702,7 +652,7 @@ pub fn prepare_gradient(
     mut previous_len: Local<usize>,
 ) {
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
-        let mut batches: Vec<(Entity, GradientBatch)> = Vec::with_capacity(*previous_len);
+        let mut batches = Vec::with_capacity(*previous_len);
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();
@@ -712,11 +662,8 @@ pub fn prepare_gradient(
             &BindGroupEntries::single(view_binding),
         ));
 
-        // Buffer indexes
-        let mut vertices_index = 0;
-        let mut indices_index = 0;
-
         for ui_phase in phases.values_mut() {
+            let mut first = None;
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
                 if let Some(gradient) = extracted_gradients
@@ -724,17 +671,11 @@ pub fn prepare_gradient(
                     .get(item.index)
                     .filter(|n| item.entity() == n.render_entity)
                 {
-                    *item.batch_range_mut() = item_index as u32..item_index as u32 + 1;
-                    let uinode_rect = gradient.rect;
-
-                    let rect_size = uinode_rect.size();
+                    let start = ui_meta.indices.len() as u32;
+                    let rect_size = gradient.size;
 
                     // Specify the corners of the node
                     let corner_points = QUAD_VERTEX_POSITIONS.map(|pos| pos * rect_size);
-                    let positions =
-                        corner_points.map(|pos| gradient.transform.transform_point2(pos));
-
-                    let uvs = { [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y] };
 
                     let mut flags = if let NodeType::Border(borders) = gradient.node_type {
                         borders
@@ -766,28 +707,22 @@ pub fn prepare_gradient(
 
                     let vertices = clip_polygon(
                         gradient.clip.as_ref(),
-                        &[
-                            (positions[0], (uvs[0], corner_points[0])),
-                            (positions[1], (uvs[1], corner_points[1])),
-                            (positions[2], (uvs[2], corner_points[2])),
-                            (positions[3], (uvs[3], corner_points[3])),
-                        ],
-                        |a, b, t| (a.0.lerp(b.0, t), a.1.lerp(b.1, t)),
+                        &corner_points
+                            .map(|point| (gradient.transform.transform_point2(point), point)),
+                        Vec2::lerp,
                     );
                     if vertices.is_empty() {
                         continue;
                     }
-                    let segment_index_count = 3 * (vertices.len() as u32 - 2);
-
                     let range = gradient.stops_range.start..gradient.stops_range.end - 1;
-                    let mut segment_count = 0;
 
                     for stop_index in range {
+                        let has_segments = ui_meta.indices.len() as u32 > start;
                         let mut start_stop = extracted_color_stops.0[stop_index];
                         let end_stop = extracted_color_stops.0[stop_index + 1];
                         if start_stop.1 == end_stop.1 {
                             if stop_index == gradient.stops_range.end - 2 {
-                                if 0 < segment_count {
+                                if has_segments {
                                     start_stop.0 = LinearRgba::NONE;
                                 }
                             } else {
@@ -799,7 +734,7 @@ pub fn prepare_gradient(
                         let end_color = convert_color_to_space(end_stop.0, gradient.color_space);
                         let mut stop_flags = flags;
                         if 0. < start_stop.1
-                            && (stop_index == gradient.stops_range.start || segment_count == 0)
+                            && (stop_index == gradient.stops_range.start || !has_segments)
                         {
                             stop_flags |= shader_flags::FILL_START;
                         }
@@ -807,24 +742,18 @@ pub fn prepare_gradient(
                             stop_flags |= shader_flags::FILL_END;
                         }
 
-                        for &(position, (uv, point)) in &vertices {
-                            ui_meta.vertices.push(UiGradientVertex {
+                        ui_meta.push_triangle_fan(vertices.iter().map(|&(position, point)| {
+                            UiGradientVertex {
                                 position: position.extend(0.).into(),
-                                uv: uv.into(),
                                 flags: stop_flags,
-                                radius: [
-                                    gradient.border_radius.top_left,
-                                    gradient.border_radius.top_right,
-                                    gradient.border_radius.bottom_right,
-                                    gradient.border_radius.bottom_left,
-                                ],
+                                radius: gradient.border_radius.into(),
                                 border: [
                                     gradient.border.min_inset.x,
                                     gradient.border.min_inset.y,
                                     gradient.border.max_inset.x,
                                     gradient.border.max_inset.y,
                                 ],
-                                size: rect_size.xy().into(),
+                                size: rect_size.into(),
                                 g_start,
                                 g_dir,
                                 point: point.into(),
@@ -833,30 +762,17 @@ pub fn prepare_gradient(
                                 end_len: end_stop.1,
                                 end_color,
                                 hint: start_stop.2,
-                            });
-                        }
-
-                        for i in 1..vertices.len() as u32 - 1 {
-                            ui_meta.indices.push(indices_index);
-                            ui_meta.indices.push(indices_index + i);
-                            ui_meta.indices.push(indices_index + i + 1);
-                        }
-                        indices_index += vertices.len() as u32;
-                        segment_count += 1;
+                            }
+                        }));
                     }
 
-                    if 0 < segment_count {
-                        let vertices_count = segment_index_count * segment_count;
-
-                        batches.push((
-                            item.entity(),
-                            GradientBatch {
-                                range: vertices_index..(vertices_index + vertices_count),
-                            },
-                        ));
-
-                        vertices_index += vertices_count;
-                    }
+                    ui_meta.finish_batch(
+                        &mut ui_phase.items,
+                        &mut first,
+                        item_index,
+                        start,
+                        &mut batches,
+                    );
                 }
             }
         }
@@ -869,60 +785,4 @@ pub fn prepare_gradient(
     extracted_color_stops.0.clear();
 }
 
-pub type DrawGradientFns = (SetItemPipeline, SetGradientViewBindGroup<0>, DrawGradient);
-
-pub struct SetGradientViewBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetGradientViewBindGroup<I> {
-    type Param = SRes<GradientMeta>;
-    type ViewQuery = Read<ViewUniformOffset>;
-    type ItemQuery = ();
-
-    fn render<'w>(
-        _item: &P,
-        view_uniform: &'w ViewUniformOffset,
-        _entity: Option<()>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(view_bind_group) = ui_meta.into_inner().view_bind_group.as_ref() else {
-            return RenderCommandResult::Failure("view_bind_group not available");
-        };
-        pass.set_bind_group(I, view_bind_group, &[view_uniform.offset]);
-        RenderCommandResult::Success
-    }
-}
-
-pub struct DrawGradient;
-impl<P: PhaseItem> RenderCommand<P> for DrawGradient {
-    type Param = SRes<GradientMeta>;
-    type ViewQuery = ();
-    type ItemQuery = Read<GradientBatch>;
-
-    #[inline]
-    fn render<'w>(
-        _item: &P,
-        _view: (),
-        batch: Option<&'w GradientBatch>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(batch) = batch else {
-            return RenderCommandResult::Skip;
-        };
-        let ui_meta = ui_meta.into_inner();
-        let Some(vertices) = ui_meta.vertices.buffer() else {
-            return RenderCommandResult::Failure("missing vertices to draw ui");
-        };
-        let Some(indices) = ui_meta.indices.buffer() else {
-            return RenderCommandResult::Failure("missing indices to draw ui");
-        };
-
-        // Store the vertices
-        pass.set_vertex_buffer(0, vertices.slice(..));
-        // Define how to "connect" the vertices
-        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        // Draw the vertices
-        pass.draw_indexed(batch.range.clone(), 0, 0..1);
-        RenderCommandResult::Success
-    }
-}
+pub type DrawGradientFns = (SetItemPipeline, DrawUiMesh<UiGradientVertex>);

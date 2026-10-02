@@ -1,20 +1,17 @@
 //! Box shadows rendering
 
-use core::{hash::Hash, ops::Range};
+use core::hash::Hash;
 
+use crate::{
+    clipping::{rect_without_hole, rounded_inner_rect},
+    ui_mesh::{DrawUiMesh, UiMesh},
+};
 use bevy_app::prelude::*;
 use bevy_asset::*;
 use bevy_camera::visibility::InheritedVisibility;
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
 use bevy_ecs::prelude::*;
-use bevy_ecs::{
-    prelude::Component,
-    system::{
-        lifetimeless::{Read, SRes},
-        *,
-    },
-};
-use bevy_math::{vec2, Affine2, FloatOrd, Vec2};
+use bevy_math::{vec2, Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
 use bevy_render::{
@@ -27,8 +24,9 @@ use bevy_render::{
 use bevy_render::{GpuResourceAppExt, RenderApp, RenderStartup};
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_ui::{
-    BoxShadow, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-    ComputedUiTargetCamera, ResolvedBorderRadius, UiGlobalTransform, Val,
+    BackgroundColor, BoxShadow, CalculatedClip, ComputedNode, ComputedStackIndex,
+    ComputedUiRenderTargetInfo, ComputedUiTargetCamera, ResolvedBorderRadius, UiGlobalTransform,
+    Val,
 };
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
@@ -52,7 +50,7 @@ impl Plugin for BoxShadowPlugin {
             render_app
                 .add_render_command::<TransparentUi, DrawBoxShadows>()
                 .init_resource::<ExtractedBoxShadows>()
-                .init_gpu_resource::<BoxShadowMeta>()
+                .init_gpu_resource::<UiMesh<BoxShadowVertex>>()
                 .init_gpu_resource::<SpecializedRenderPipelines<BoxShadowPipeline>>()
                 .add_systems(RenderStartup, init_box_shadow_pipeline)
                 .add_systems(
@@ -72,7 +70,7 @@ impl Plugin for BoxShadowPlugin {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct BoxShadowVertex {
+pub struct BoxShadowVertex {
     position: [f32; 3],
     uvs: [f32; 2],
     vertex_color: [f32; 4],
@@ -80,30 +78,6 @@ struct BoxShadowVertex {
     radius: [f32; 4],
     blur: f32,
     bounds: [f32; 2],
-}
-
-#[derive(Component)]
-pub struct UiShadowsBatch {
-    pub range: Range<u32>,
-    pub camera: Entity,
-}
-
-/// Contains the vertices and bind groups to be sent to the GPU
-#[derive(Resource)]
-pub struct BoxShadowMeta {
-    vertices: RawBufferVec<BoxShadowVertex>,
-    indices: RawBufferVec<u32>,
-    view_bind_group: Option<BindGroup>,
-}
-
-impl Default for BoxShadowMeta {
-    fn default() -> Self {
-        Self {
-            vertices: RawBufferVec::new(BufferUsages::VERTEX),
-            indices: RawBufferVec::new(BufferUsages::INDEX),
-            view_bind_group: None,
-        }
-    }
 }
 
 #[derive(Resource)]
@@ -187,6 +161,8 @@ pub struct ExtractedBoxShadow {
     pub stack_index: u32,
     pub transform: Affine2,
     pub bounds: Vec2,
+    /// Interior covered by the node's opaque background, in shadow-local coordinates.
+    pub opaque_rect: Option<Rect>,
     pub clip: Option<CalculatedClip>,
     pub extracted_camera_entity: Entity,
     pub color: LinearRgba,
@@ -214,6 +190,7 @@ pub fn extract_shadows(
             &UiGlobalTransform,
             &InheritedVisibility,
             &BoxShadow,
+            Option<&BackgroundColor>,
             Option<&CalculatedClip>,
             &ComputedUiTargetCamera,
             &ComputedUiRenderTargetInfo,
@@ -223,8 +200,18 @@ pub fn extract_shadows(
 ) {
     let mut mapping = camera_map.get_mapper();
 
-    for (entity, uinode, stack_index, transform, visibility, box_shadow, clip, camera, target) in
-        &box_shadow_query
+    for (
+        entity,
+        uinode,
+        stack_index,
+        transform,
+        visibility,
+        box_shadow,
+        background,
+        clip,
+        camera,
+        target,
+    ) in &box_shadow_query
     {
         // Skip if no visible shadows
         if !visibility.get() || box_shadow.is_empty() || uinode.is_empty() {
@@ -237,6 +224,7 @@ pub fn extract_shadows(
 
         let ui_physical_viewport_size = target.physical_size().as_vec2();
         let scale_factor = target.scale_factor();
+        let opaque_rect = opaque_background_rect(uinode, background);
 
         for drop_shadow in box_shadow.iter() {
             if drop_shadow.color.is_fully_transparent() {
@@ -264,6 +252,12 @@ pub fn extract_shadows(
                 continue;
             }
 
+            let transform = Affine2::from(transform) * Affine2::from_translation(offset);
+            let bounds = shadow_size + 6. * blur_radius;
+            if crate::clipping::rect_is_clipped(clip, transform, bounds) {
+                continue;
+            }
+
             let radius = ResolvedBorderRadius {
                 top_left: uinode.border_radius.top_left * spread_ratio,
                 top_right: uinode.border_radius.top_right * spread_ratio,
@@ -274,9 +268,13 @@ pub fn extract_shadows(
             extracted_box_shadows.box_shadows.push(ExtractedBoxShadow {
                 render_entity: commands.spawn(TemporaryRenderEntity).id(),
                 stack_index: stack_index.0,
-                transform: Affine2::from(transform) * Affine2::from_translation(offset),
+                transform,
                 color: drop_shadow.color.into(),
-                bounds: shadow_size + 6. * blur_radius,
+                bounds,
+                opaque_rect: opaque_rect.map(|rect| Rect {
+                    min: rect.min - offset,
+                    max: rect.max - offset,
+                }),
                 clip: clip.cloned(),
                 extracted_camera_entity,
                 radius,
@@ -288,16 +286,28 @@ pub fn extract_shadows(
     }
 }
 
+/// The background covers only the inside of the border. Stay clear of rounded corners and
+/// the half-pixel antialiasing band in `background_coverage`, including during transforms.
+fn opaque_background_rect(
+    node: &ComputedNode,
+    background: Option<&BackgroundColor>,
+) -> Option<Rect> {
+    if !background.is_some_and(|background| background.is_fully_opaque()) {
+        return None;
+    }
+    rounded_inner_rect(node.size(), node.border(), node.border_radius())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "it's a system that needs a lot of them"
 )]
 pub fn queue_shadows(
-    extracted_box_shadows: ResMut<ExtractedBoxShadows>,
+    extracted_box_shadows: Res<ExtractedBoxShadows>,
     box_shadow_pipeline: Res<BoxShadowPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BoxShadowPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
+    render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -306,7 +316,7 @@ pub fn queue_shadows(
     for (index, extracted_shadow) in extracted_box_shadows.box_shadows.iter().enumerate() {
         let entity = extracted_shadow.render_entity;
         let Ok((default_camera_view, shadow_samples)) =
-            render_views.get_mut(extracted_shadow.extracted_camera_entity)
+            render_views.get(extracted_shadow.extracted_camera_entity)
         else {
             continue;
         };
@@ -348,7 +358,7 @@ pub fn prepare_shadows(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut ui_meta: ResMut<BoxShadowMeta>,
+    mut ui_meta: ResMut<UiMesh<BoxShadowVertex>>,
     mut extracted_shadows: ResMut<ExtractedBoxShadows>,
     view_uniforms: Res<ViewUniforms>,
     box_shadow_pipeline: Res<BoxShadowPipeline>,
@@ -356,7 +366,7 @@ pub fn prepare_shadows(
     mut previous_len: Local<usize>,
 ) {
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
-        let mut batches: Vec<(Entity, UiShadowsBatch)> = Vec::with_capacity(*previous_len);
+        let mut batches = Vec::with_capacity(*previous_len);
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();
@@ -366,11 +376,8 @@ pub fn prepare_shadows(
             &BindGroupEntries::single(view_binding),
         ));
 
-        // Buffer indexes
-        let mut vertices_index = 0;
-        let mut indices_index = 0;
-
         for ui_phase in phases.values_mut() {
+            let mut first = None;
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
                 let Some(box_shadow) = extracted_shadows
@@ -381,35 +388,22 @@ pub fn prepare_shadows(
                     continue;
                 };
                 let rect_size = box_shadow.bounds;
+                let start = ui_meta.indices.len() as u32;
 
-                // Specify the corners of the node
-                let positions = QUAD_VERTEX_POSITIONS
-                    .map(|pos| box_shadow.transform.transform_point2(pos * rect_size));
+                for rect in rect_without_hole(rect_size, box_shadow.opaque_rect) {
+                    let corners = QUAD_VERTEX_POSITIONS.map(|pos| {
+                        let local = rect.center() + pos * rect.size();
+                        (
+                            box_shadow.transform.transform_point2(local),
+                            local / rect_size + Vec2::splat(0.5),
+                        )
+                    });
+                    let vertices = clip_polygon(box_shadow.clip.as_ref(), &corners, Vec2::lerp);
+                    if vertices.is_empty() {
+                        continue;
+                    }
 
-                let uvs = [
-                    Vec2::ZERO,
-                    Vec2::new(box_shadow.bounds.x, 0.),
-                    box_shadow.bounds,
-                    Vec2::new(0., box_shadow.bounds.y),
-                ]
-                .map(|pos| pos / box_shadow.bounds);
-
-                let vertices = clip_polygon(
-                    box_shadow.clip.as_ref(),
-                    &[
-                        (positions[0], uvs[0]),
-                        (positions[1], uvs[1]),
-                        (positions[2], uvs[2]),
-                        (positions[3], uvs[3]),
-                    ],
-                    Vec2::lerp,
-                );
-                if vertices.is_empty() {
-                    continue;
-                }
-
-                for vertex in &vertices {
-                    ui_meta.vertices.push(BoxShadowVertex {
+                    ui_meta.push_triangle_fan(vertices.iter().map(|vertex| BoxShadowVertex {
                         position: vertex.0.extend(0.).into(),
                         uvs: vertex.1.into(),
                         vertex_color: box_shadow.color.to_f32_array(),
@@ -417,31 +411,16 @@ pub fn prepare_shadows(
                         radius: box_shadow.radius.into(),
                         blur: box_shadow.blur_radius,
                         bounds: rect_size.into(),
-                    });
+                    }));
                 }
 
-                for i in 1..vertices.len() as u32 - 1 {
-                    ui_meta.indices.push(indices_index);
-                    ui_meta.indices.push(indices_index + i);
-                    ui_meta.indices.push(indices_index + i + 1);
-                }
-
-                let index_count = 3 * (vertices.len() as u32 - 2);
-
-                batches.push((
-                    item.entity(),
-                    UiShadowsBatch {
-                        range: vertices_index..vertices_index + index_count,
-                        camera: box_shadow.extracted_camera_entity,
-                    },
-                ));
-
-                vertices_index += index_count;
-                indices_index += vertices.len() as u32;
-
-                // shadows are sent to the gpu non-batched
-                *ui_phase.items[item_index].batch_range_mut() =
-                    item_index as u32..item_index as u32 + 1;
+                ui_meta.finish_batch(
+                    &mut ui_phase.items,
+                    &mut first,
+                    item_index,
+                    start,
+                    &mut batches,
+                );
             }
         }
         ui_meta.vertices.write_buffer(&render_device, &render_queue);
@@ -452,60 +431,47 @@ pub fn prepare_shadows(
     extracted_shadows.box_shadows.clear();
 }
 
-pub type DrawBoxShadows = (SetItemPipeline, SetBoxShadowViewBindGroup<0>, DrawBoxShadow);
+pub type DrawBoxShadows = (SetItemPipeline, DrawUiMesh<BoxShadowVertex>);
 
-pub struct SetBoxShadowViewBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetBoxShadowViewBindGroup<I> {
-    type Param = SRes<BoxShadowMeta>;
-    type ViewQuery = Read<ViewUniformOffset>;
-    type ItemQuery = ();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_color::Color;
 
-    fn render<'w>(
-        _item: &P,
-        view_uniform: &'w ViewUniformOffset,
-        _entity: Option<()>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(view_bind_group) = ui_meta.into_inner().view_bind_group.as_ref() else {
-            return RenderCommandResult::Failure("view_bind_group not available");
+    #[test]
+    fn only_fully_opaque_backgrounds_occlude_shadows() {
+        let node = ComputedNode {
+            size: vec2(200., 100.),
+            ..default()
         };
-        pass.set_bind_group(I, view_bind_group, &[view_uniform.offset]);
-        RenderCommandResult::Success
-    }
-}
+        assert!(opaque_background_rect(&node, None).is_none());
+        for alpha in [0., 0.5, 0.999] {
+            assert!(opaque_background_rect(
+                &node,
+                Some(&BackgroundColor(Color::srgba(1., 1., 1., alpha)))
+            )
+            .is_none());
+        }
+        let white = BackgroundColor(Color::WHITE);
+        assert_eq!(
+            opaque_background_rect(&node, Some(&white)),
+            Some(Rect::new(-99., -49., 99., 49.))
+        );
 
-pub struct DrawBoxShadow;
-impl<P: PhaseItem> RenderCommand<P> for DrawBoxShadow {
-    type Param = SRes<BoxShadowMeta>;
-    type ViewQuery = ();
-    type ItemQuery = Read<UiShadowsBatch>;
-
-    #[inline]
-    fn render<'w>(
-        _item: &P,
-        _view: (),
-        batch: Option<&'w UiShadowsBatch>,
-        ui_meta: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(batch) = batch else {
-            return RenderCommandResult::Skip;
+        let mut rounded = node;
+        rounded.border.min_inset = vec2(20., 2.);
+        rounded.border.max_inset = vec2(3., 8.);
+        rounded.border_radius = ResolvedBorderRadius {
+            top_left: 12.,
+            top_right: 9.,
+            bottom_left: 15.,
+            bottom_right: 4.,
         };
-        let ui_meta = ui_meta.into_inner();
-        let Some(vertices) = ui_meta.vertices.buffer() else {
-            return RenderCommandResult::Failure("missing vertices to draw ui");
-        };
-        let Some(indices) = ui_meta.indices.buffer() else {
-            return RenderCommandResult::Failure("missing indices to draw ui");
-        };
-
-        // Store the vertices
-        pass.set_vertex_buffer(0, vertices.slice(..));
-        // Define how to "connect" the vertices
-        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        // Draw the vertices
-        pass.draw_indexed(batch.range.clone(), 0, 0..1);
-        RenderCommandResult::Success
+        assert_eq!(
+            opaque_background_rect(&rounded, Some(&white)),
+            Some(Rect::new(-64., -32., 81., 26.))
+        );
+        rounded.border_radius.top_left = 50.;
+        assert!(opaque_background_rect(&rounded, Some(&white)).is_none());
     }
 }

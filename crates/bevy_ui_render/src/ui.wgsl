@@ -3,8 +3,6 @@
 #import bevy_render::view::View
 
 const TEXTURED = 1u;
-const RIGHT_VERTEX = 2u;
-const BOTTOM_VERTEX = 4u;
 // must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
 const BORDER_LEFT: u32 = 256u;
 const BORDER_TOP: u32 = 512u;
@@ -70,6 +68,11 @@ fn vertex(
     out.uv = vertex_uv;
     out.position = view.clip_from_world * vec4(vertex_position, 1.0);
     out.color = vertex_color;
+    // Solid nodes have one color across all vertices. Convert it here instead of
+    // repeating the gamma conversion for every covered pixel.
+    if !enabled(flags, TEXTURED) {
+        out.color = vec4(manual_srgb(vertex_color.rgb), vertex_color.a);
+    }
     out.flags = flags;
     out.radius = radius;
     out.size = size;
@@ -197,14 +200,13 @@ fn composite_text_layers(
     return vec4<f32>(rgb, alpha);
 }
 
-fn draw_uinode_border(
-    color: vec4<f32>,
+fn border_coverage(
     point: vec2<f32>,
     size: vec2<f32>,
     radius: vec4<f32>,
     border: vec4<f32>,
     flags: u32,
-) -> vec4<f32> {
+) -> f32 {
     // Signed distances. The magnitude is the distance of the point from the edge of the shape.
     // * Negative values indicate that the point is inside the shape.
     // * Zero values indicate the point is on the edge of the shape.
@@ -236,18 +238,16 @@ fn draw_uinode_border(
     let t = 1.0 - step(0.0, border_distance);
 #endif
 
-    // Blend mode ALPHA_BLENDING is used for UI elements, so we don't premultiply alpha here.
-    return vec4(manual_srgb(color.rgb), saturate(color.a * t * nearest_border));
+    return t * nearest_border;
 }
 
-fn draw_uinode_background(
-    color: vec4<f32>,
+fn background_coverage(
     point: vec2<f32>,
     size: vec2<f32>,
     radius: vec4<f32>,
     border: vec4<f32>,
     flags: u32,
-) -> vec4<f32> {
+) -> f32 {
     // When drawing the background only draw the internal area and not the border.
     let internal_distance = sd_inset_rounded_box(point, size, radius, border) * select(1., -1, enabled(flags, INVERT));
 
@@ -257,12 +257,46 @@ fn draw_uinode_background(
     let t = 1.0 - step(0.0, internal_distance);
 #endif
 
-    return vec4(manual_srgb(color.rgb), saturate(color.a * t));
+    return t;
+}
+
+fn node_coverage(
+    point: vec2<f32>,
+    size: vec2<f32>,
+    radius: vec4<f32>,
+    border: vec4<f32>,
+    flags: u32,
+) -> f32 {
+    if enabled(flags, BORDER_ANY) {
+        return border_coverage(point, size, radius, border, flags);
+    }
+    return background_coverage(point, size, radius, border, flags);
+}
+
+fn draw_uinode(
+    color: vec4<f32>,
+    point: vec2<f32>,
+    size: vec2<f32>,
+    radius: vec4<f32>,
+    border: vec4<f32>,
+    flags: u32,
+) -> vec4<f32> {
+    // ALPHA_BLENDING expects straight, rather than premultiplied, color.
+    return vec4(manual_srgb(color.rgb), saturate(color.a * node_coverage(point, size, radius, border, flags)));
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let base_sample = textureSample(sprite_texture, sprite_sampler, in.uv);
+    // Derivatives must be evaluated before the non-uniform branch. Explicit
+    // gradients preserve mip selection for images without sampling solid nodes.
+    let uv_dx = dpdx(in.uv);
+    let uv_dy = dpdy(in.uv);
+    if !enabled(in.flags, TEXTURED) {
+        let coverage = node_coverage(in.point, in.size, in.radius, in.border, in.flags);
+        return vec4(in.color.rgb, saturate(in.color.a * coverage));
+    }
+
+    let base_sample = textureSampleGrad(sprite_texture, sprite_sampler, in.uv, uv_dx, uv_dy);
 
     if enabled(in.flags, TEXT_GLYPH) {
         let fill_cov = base_sample.a;
@@ -304,13 +338,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         texture_color = vec4(texture_color.rgb / texture_color.a, texture_color.a);
     }
 
-    // Only use the color sampled from the texture if the `TEXTURED` flag is enabled. 
-    // This allows us to draw both textured and untextured shapes together in the same batch.
-    let color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
+    let color = in.color * texture_color;
 
-    if enabled(in.flags, BORDER_ANY) {
-        return draw_uinode_border(color, in.point, in.size, in.radius, in.border, in.flags);
-    } else {
-        return draw_uinode_background(color, in.point, in.size, in.radius, in.border, in.flags);
-    }
+    return draw_uinode(color, in.point, in.size, in.radius, in.border, in.flags);
 }
