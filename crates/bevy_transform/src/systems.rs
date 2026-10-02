@@ -527,7 +527,9 @@ mod parallel {
                     return;
                 }
 
-                *parent_transform = GlobalTransform::from(*transform);
+                // A descendant can dirty the tree without moving the root. Preserve
+                // its change tick so clean sibling subtrees can still be skipped.
+                parent_transform.set_if_neq(GlobalTransform::from(*transform));
 
                 // SAFETY: the parent entities passed into this function are taken from iterating
                 // over the root entity query. Queries iterate over disjoint entities, preventing
@@ -823,6 +825,106 @@ mod test {
     use crate::systems::*;
 
     #[test]
+    fn child_motion_does_not_mark_unchanged_root_global_transform() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
+        for optimization in [
+            StaticTransformOptimizations::Enabled,
+            StaticTransformOptimizations::Disabled,
+        ] {
+            let mut app = App::new();
+            app.insert_resource(optimization).add_systems(
+                Update,
+                (
+                    mark_dirty_trees,
+                    sync_simple_transforms,
+                    propagate_parent_transforms,
+                )
+                    .chain(),
+            );
+            let root = app
+                .world_mut()
+                .spawn(Transform::from_xyz(10.0, 0.0, 0.0))
+                .id();
+            let moving = app
+                .world_mut()
+                .spawn((Transform::from_xyz(0.0, 1.0, 0.0), ChildOf(root)))
+                .id();
+            let sibling = app
+                .world_mut()
+                .spawn((Transform::from_xyz(0.0, 0.0, 3.0), ChildOf(root)))
+                .id();
+            let leaf = app
+                .world_mut()
+                .spawn((Transform::from_xyz(4.0, 0.0, 0.0), ChildOf(sibling)))
+                .id();
+            app.update();
+            let root_tick = app
+                .world()
+                .entity(root)
+                .get_ref::<GlobalTransform>()
+                .unwrap()
+                .last_changed();
+            let sibling_tick = app
+                .world()
+                .entity(sibling)
+                .get_ref::<GlobalTransform>()
+                .unwrap()
+                .last_changed();
+            app.world_mut()
+                .get_mut::<Transform>(moving)
+                .unwrap()
+                .translation
+                .y = 2.0;
+            app.update();
+            assert_eq!(
+                app.world()
+                    .entity(root)
+                    .get_ref::<GlobalTransform>()
+                    .unwrap()
+                    .last_changed(),
+                root_tick
+            );
+            assert_eq!(
+                app.world()
+                    .entity(sibling)
+                    .get_ref::<GlobalTransform>()
+                    .unwrap()
+                    .last_changed(),
+                sibling_tick
+            );
+            assert_eq!(
+                *app.world().get::<GlobalTransform>(moving).unwrap(),
+                GlobalTransform::from_xyz(10.0, 2.0, 0.0)
+            );
+            assert_eq!(
+                *app.world().get::<GlobalTransform>(leaf).unwrap(),
+                GlobalTransform::from_xyz(14.0, 0.0, 3.0)
+            );
+
+            app.world_mut()
+                .get_mut::<Transform>(root)
+                .unwrap()
+                .translation
+                .x = 20.0;
+            app.update();
+            assert_eq!(
+                *app.world().get::<GlobalTransform>(moving).unwrap(),
+                GlobalTransform::from_xyz(20.0, 2.0, 0.0)
+            );
+            assert_eq!(
+                *app.world().get::<GlobalTransform>(leaf).unwrap(),
+                GlobalTransform::from_xyz(24.0, 0.0, 3.0)
+            );
+            app.world_mut().entity_mut(moving).remove::<ChildOf>();
+            app.update();
+            assert_eq!(
+                *app.world().get::<GlobalTransform>(moving).unwrap(),
+                GlobalTransform::from_xyz(0.0, 2.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
     fn correct_parent_removed() {
         ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
@@ -925,6 +1027,7 @@ mod test {
 
     #[test]
     fn did_propagate_command_buffer() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
 
         let mut schedule = Schedule::default();
@@ -1164,6 +1267,7 @@ mod test {
 
     #[test]
     fn global_transform_should_not_be_overwritten_after_reparenting() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let translation = Vec3::ONE;
         let mut world = World::new();
 

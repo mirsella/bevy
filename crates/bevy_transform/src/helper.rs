@@ -96,6 +96,7 @@ mod tests {
 
     #[test]
     fn match_transform_propagation_systems() {
+        bevy_tasks::ComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
         // Single transform
         match_transform_propagation_systems_inner(vec![Transform::from_translation(Vec3::X)
             .with_rotation(Quat::from_rotation_y(TAU / 4.))
