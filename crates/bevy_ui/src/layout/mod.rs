@@ -7,18 +7,19 @@ use crate::{
     Node, Outline, OverflowAxis, ScrollPosition,
 };
 #[cfg(feature = "ghost_nodes")]
-use bevy_ecs::query::With;
+use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
-    entity::Entity,
+    entity::{Entity, EntityHashMap},
     hierarchy::Children,
     lifecycle::RemovedComponents,
-    query::Added,
-    system::{Query, ResMut},
+    query::{Added, Changed, Or, With},
+    system::{Local, ParamSet, Query, ResMut},
     world::Ref,
 };
 
 use bevy_math::{Affine2, Vec2};
+use bevy_platform::collections::hash_map::Entry;
 use bevy_sprite::BorderRect;
 use thiserror::Error;
 use ui_surface::UiSurface;
@@ -73,6 +74,12 @@ pub enum LayoutError {
     TaffyError(taffy::tree::TaffyError),
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static LAYOUT_SOLVES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static GEOMETRY_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
 pub fn ui_layout_system(
     mut ui_surface: ResMut<UiSurface>,
@@ -84,17 +91,36 @@ pub fn ui_layout_system(
         &mut ContentSize,
         Ref<ComputedUiRenderTargetInfo>,
     )>,
-    added_node_query: Query<(), Added<Node>>,
-    mut node_update_query: Query<(
-        &mut ComputedNode,
-        &UiTransform,
-        &mut UiGlobalTransform,
-        &Node,
-        Option<&LayoutConfig>,
-        Option<&Outline>,
-        Option<&ScrollPosition>,
-        Option<&IgnoreScroll>,
+    mut geometry_queries: ParamSet<(
+        Query<(
+            &mut ComputedNode,
+            &UiTransform,
+            &mut UiGlobalTransform,
+            &Node,
+            Option<&LayoutConfig>,
+            Option<&Outline>,
+            Option<&ScrollPosition>,
+            Option<&IgnoreScroll>,
+        )>,
+        Query<
+            Entity,
+            (
+                With<Node>,
+                Or<(
+                    Changed<Node>,
+                    Changed<ComputedUiRenderTargetInfo>,
+                    Changed<UiTransform>,
+                    Changed<LayoutConfig>,
+                    Changed<Outline>,
+                    Changed<ScrollPosition>,
+                    Changed<IgnoreScroll>,
+                    Changed<ComputedNode>,
+                    Changed<UiGlobalTransform>,
+                )>,
+            ),
+        >,
     )>,
+    added_node_query: Query<(), Added<Node>>,
     mut buffer_query: Query<&mut ComputedTextBlock>,
     mut font_system: ResMut<FontCx>,
     mut removed_children: RemovedComponents<Children>,
@@ -102,7 +128,17 @@ pub fn ui_layout_system(
     #[cfg(feature = "ghost_nodes")] mut removed_ghost_nodes: RemovedComponents<GhostNode>,
     #[cfg(feature = "ghost_nodes")] added_ghost_node_query: Query<Entity, Added<GhostNode>>,
     #[cfg(feature = "ghost_nodes")] ghost_node_query: Query<(), With<GhostNode>>,
+    #[cfg(feature = "ghost_nodes")] mut dirty_ghost_children: Local<EntityHashSet>,
+    mut removed_geometry: (
+        RemovedComponents<LayoutConfig>,
+        RemovedComponents<Outline>,
+        RemovedComponents<ScrollPosition>,
+        RemovedComponents<IgnoreScroll>,
+    ),
+    mut dirty_geometry: Local<EntityHashMap<bool>>,
 ) {
+    // Public UiSurface methods can change layout independently of component inputs.
+    let surface_changed = ui_surface.is_changed();
     // Sync Node and ContentSize to Taffy for all nodes
     node_query
         .iter_mut()
@@ -120,34 +156,28 @@ pub fn ui_layout_system(
             }
         });
 
-    // update and remove children
-    #[cfg(not(feature = "ghost_nodes"))]
-    {
-        for entity in removed_children.read() {
-            ui_surface.try_remove_children(entity);
-        }
-    }
-
     #[cfg(feature = "ghost_nodes")]
     {
-        // Collect the closest non-ghost ancestors of entities that had `GhostNode` added or removed since last layout update.
-        ui_surface.dirty_ghost_children_scratch.clear();
+        // Collect the closest non-ghost ancestors whose visible child list changed
+        // when a node became or stopped being a ghost.
+        dirty_ghost_children.clear();
         for entity in added_ghost_node_query
             .iter()
             .chain(removed_ghost_nodes.read())
         {
             if let Some(parent) = ui_children.get_parent(entity) {
-                ui_surface.dirty_ghost_children_scratch.insert(parent);
+                dirty_ghost_children.insert(parent);
             }
         }
+    }
 
-        for entity in removed_children.read() {
-            ui_surface.try_remove_children(entity);
-            if ghost_node_query.contains(entity)
-                && let Some(parent) = ui_children.get_parent(entity)
-            {
-                ui_surface.dirty_ghost_children_scratch.insert(parent);
-            }
+    for entity in removed_children.read() {
+        ui_surface.try_remove_children(entity);
+        #[cfg(feature = "ghost_nodes")]
+        if ghost_node_query.contains(entity)
+            && let Some(parent) = ui_children.get_parent(entity)
+        {
+            dirty_ghost_children.insert(parent);
         }
     }
 
@@ -158,66 +188,112 @@ pub fn ui_layout_system(
             .filter(|entity| !node_query.contains(*entity)),
     );
 
-    for ui_root_entity in ui_root_node_query.iter() {
-        fn update_children_recursively(
-            ui_surface: &mut UiSurface,
-            ui_children: &UiChildren,
-            added_node_query: &Query<(), Added<Node>>,
-            entity: Entity,
-        ) {
-            let children_changed = ui_children.is_changed(entity)
-                || ui_children
-                    .iter_ui_children(entity)
-                    .any(|child| added_node_query.contains(child));
-            #[cfg(feature = "ghost_nodes")]
-            let children_changed =
-                children_changed || ui_surface.dirty_ghost_children_scratch.contains(&entity);
+    // Synchronize every root's hierarchy before solving any root. A node moved
+    // between roots must be detached from its old parent before either solve.
+    fn update_children_recursively(
+        ui_surface: &mut UiSurface,
+        ui_children: &UiChildren,
+        added_node_query: &Query<(), Added<Node>>,
+        #[cfg(feature = "ghost_nodes")] dirty_ghost_children: &EntityHashSet,
+        entity: Entity,
+    ) {
+        let children_changed = ui_children.is_changed(entity)
+            || ui_children
+                .iter_ui_children(entity)
+                .any(|child| added_node_query.contains(child));
+        #[cfg(feature = "ghost_nodes")]
+        let children_changed = children_changed || dirty_ghost_children.contains(&entity);
 
-            if ui_surface.entity_to_taffy.contains_key(&entity)
-                && (added_node_query.contains(entity) || children_changed)
-            {
-                ui_surface.update_children(entity, ui_children.iter_ui_children(entity));
-            }
-
-            for child in ui_children.iter_ui_children(entity) {
-                update_children_recursively(ui_surface, ui_children, added_node_query, child);
-            }
+        if ui_surface.entity_to_taffy.contains_key(&entity)
+            && (added_node_query.contains(entity) || children_changed)
+        {
+            ui_surface.update_children(entity, ui_children.iter_ui_children(entity));
         }
 
-        update_children_recursively(
-            &mut ui_surface,
-            &ui_children,
-            &added_node_query,
-            ui_root_entity,
-        );
+        for child in ui_children.iter_ui_children(entity) {
+            update_children_recursively(
+                ui_surface,
+                ui_children,
+                added_node_query,
+                #[cfg(feature = "ghost_nodes")]
+                dirty_ghost_children,
+                child,
+            );
+        }
+    }
 
-        let (_, _, _, computed_target) = node_query.get(ui_root_entity).unwrap();
+    // Without any of these changes, the recursive pass can only walk the tree:
+    // none of its calls to update_children can run.
+    let hierarchy_changed = !added_node_query.is_empty() || ui_children.has_changed_children();
+    #[cfg(feature = "ghost_nodes")]
+    let hierarchy_changed = hierarchy_changed || !dirty_ghost_children.is_empty();
+    if hierarchy_changed {
+        for ui_root_entity in ui_root_node_query.iter() {
+            update_children_recursively(
+                &mut ui_surface,
+                &ui_children,
+                &added_node_query,
+                #[cfg(feature = "ghost_nodes")]
+                &dirty_ghost_children,
+                ui_root_entity,
+            );
+        }
+    }
 
-        ui_surface.compute_layout(
+    dirty_geometry.clear();
+    for mut entity in geometry_queries
+        .p1()
+        .iter()
+        .chain(removed_geometry.0.read())
+        .chain(removed_geometry.1.read())
+        .chain(removed_geometry.2.read())
+        .chain(removed_geometry.3.read())
+    {
+        // True marks a changed node and its subtree; false marks the path to it.
+        // Include external output edits so cached geometry is repaired as well.
+        if dirty_geometry.insert(entity, true) == Some(true) {
+            continue;
+        }
+        while let Some(parent) = ui_children.get_parent(entity) {
+            let Entry::Vacant(entry) = dirty_geometry.entry(parent) else {
+                break;
+            };
+            entry.insert(false);
+            entity = parent;
+        }
+    }
+
+    for ui_root_entity in ui_root_node_query.iter() {
+        let (_, _, _, target) = node_query.get(ui_root_entity).unwrap();
+
+        let layout_changed = ui_surface.compute_layout(
             ui_root_entity,
-            computed_target.physical_size,
+            target.physical_size,
             &mut buffer_query,
             &mut font_system,
         );
 
         update_uinode_geometry_recursive(
             ui_root_entity,
-            &mut ui_surface,
+            &ui_surface,
+            &dirty_geometry,
+            layout_changed || surface_changed,
             true,
-            computed_target.physical_size().as_vec2(),
+            target.physical_size.as_vec2(),
             Affine2::IDENTITY,
-            &mut node_update_query,
+            &mut geometry_queries.p0(),
             &ui_children,
-            computed_target.scale_factor.recip(),
+            target.scale_factor.recip(),
             Vec2::ZERO,
             Vec2::ZERO,
         );
     }
 
-    // Returns the combined bounding box of the node and any of its overflowing children.
     fn update_uinode_geometry_recursive(
         entity: Entity,
-        ui_surface: &mut UiSurface,
+        ui_surface: &UiSurface,
+        dirty_geometry: &EntityHashMap<bool>,
+        update_subtree: bool,
         inherited_use_rounding: bool,
         target_size: Vec2,
         mut inherited_transform: Affine2,
@@ -236,6 +312,16 @@ pub fn ui_layout_system(
         parent_size: Vec2,
         parent_scroll_position: Vec2,
     ) {
+        let update_subtree = if update_subtree {
+            true
+        } else {
+            match dirty_geometry.get(&entity) {
+                Some(&changed) => changed,
+                None => return,
+            }
+        };
+        #[cfg(test)]
+        GEOMETRY_VISITS.with(|visits| visits.set(visits.get() + 1));
         if let Ok((
             mut node,
             transform,
@@ -338,6 +424,10 @@ pub fn ui_layout_system(
                     // Clamp outline offsets to at least the length of the node's shorter side
                     // Negative offset outlines can be useful to create thing like in-set focus indicators
                     .max(-0.5 * node.size.min_element());
+            } else {
+                let node = node.bypass_change_detection();
+                node.outline_width = 0.;
+                node.outline_offset = 0.;
             }
 
             node.bypass_change_detection().scrollbar_size =
@@ -372,6 +462,8 @@ pub fn ui_layout_system(
                 update_uinode_geometry_recursive(
                     child_uinode,
                     ui_surface,
+                    dirty_geometry,
+                    update_subtree,
                     use_rounding,
                     target_size,
                     inherited_transform,
@@ -475,6 +567,482 @@ mod tests {
     }
 
     #[test]
+    fn clean_geometry_is_reused_and_external_output_edits_are_repaired() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn(Node::default())
+            .with_child(Node::default())
+            .id();
+        let child = app.world().get::<Children>(root).unwrap()[0];
+        app.world_mut().spawn(Node::default());
+        app.update();
+        app.update();
+        super::GEOMETRY_VISITS.with(|visits| visits.set(0));
+        app.update();
+        super::GEOMETRY_VISITS.with(|visits| assert_eq!(visits.get(), 0));
+
+        let expected = *app.world().get::<ComputedNode>(child).unwrap();
+        let transform = *app.world().get::<UiGlobalTransform>(child).unwrap();
+        app.world_mut().get_mut::<ComputedNode>(child).unwrap().size = Vec2::splat(999.);
+        *app.world_mut().get_mut::<UiGlobalTransform>(child).unwrap() =
+            UiGlobalTransform::from_translation(Vec2::splat(123.));
+        app.update();
+        super::GEOMETRY_VISITS.with(|visits| assert_eq!(visits.get(), 2));
+        assert_eq!(*app.world().get::<ComputedNode>(child).unwrap(), expected);
+        assert_eq!(
+            *app.world().get::<UiGlobalTransform>(child).unwrap(),
+            transform
+        );
+    }
+
+    #[test]
+    fn geometry_updates_only_dirty_branches_and_matches_full_traversal() {
+        let mut app = setup_ui_test_app();
+        let root = app.world_mut().spawn(Node::default()).id();
+        let branches: Vec<_> = (0..2)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((Node::default(), ChildOf(root)))
+                    .with_child(Node {
+                        width: Val::Px(33.25),
+                        height: Val::Px(20.25),
+                        ..default()
+                    })
+                    .id()
+            })
+            .collect();
+        let child = app.world().get::<Children>(branches[0]).unwrap()[0];
+        let other_child = app.world().get::<Children>(branches[1]).unwrap()[0];
+        let entities = [root, branches[0], child, branches[1], other_child];
+        app.update();
+        app.update();
+
+        for step in 0..5 {
+            match step {
+                0 => {
+                    app.world_mut()
+                        .get_mut::<UiTransform>(child)
+                        .unwrap()
+                        .translation = Val2::px(7., 9.);
+                }
+                1 => {
+                    app.world_mut()
+                        .entity_mut(branches[0])
+                        .insert(LayoutConfig {
+                            use_rounding: false,
+                        });
+                }
+                2 => {
+                    app.world_mut()
+                        .entity_mut(branches[0])
+                        .remove::<LayoutConfig>();
+                }
+                3 => {
+                    // Both a parent and descendant are dirty, regardless of query iteration order.
+                    app.world_mut()
+                        .get_mut::<UiTransform>(branches[0])
+                        .unwrap()
+                        .translation = Val2::px(3., 4.);
+                    app.world_mut().get_mut::<ComputedNode>(child).unwrap().size =
+                        Vec2::splat(999.);
+                }
+                4 => {
+                    app.world_mut()
+                        .get_mut::<UiTransform>(root)
+                        .unwrap()
+                        .translation = Val2::px(1., 2.);
+                }
+                _ => unreachable!(),
+            }
+            super::GEOMETRY_VISITS.with(|visits| visits.set(0));
+            super::LAYOUT_SOLVES.with(|solves| solves.set(0));
+            app.update();
+            super::GEOMETRY_VISITS
+                .with(|visits| assert_eq!(visits.get(), if step == 4 { 5 } else { 3 }));
+            super::LAYOUT_SOLVES.with(|solves| assert_eq!(solves.get(), 0));
+            let geometry = |app: &App| {
+                entities.map(|entity| {
+                    (
+                        *app.world().get::<ComputedNode>(entity).unwrap(),
+                        *app.world().get::<UiGlobalTransform>(entity).unwrap(),
+                    )
+                })
+            };
+            let incremental = geometry(&app);
+            app.world_mut().resource_mut::<UiSurface>().set_changed();
+            app.update();
+            assert_eq!(incremental, geometry(&app), "step {step}");
+        }
+    }
+
+    #[test]
+    fn non_ui_child_churn_does_not_dirty_layout_tree() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn(Node::default())
+            .with_child(Node::default())
+            .id();
+        app.update();
+        app.update();
+        let before = *app.world().get::<ComputedNode>(root).unwrap();
+        let non_ui_child = app.world_mut().spawn_empty().id();
+        app.world_mut().entity_mut(root).add_child(non_ui_child);
+        super::LAYOUT_SOLVES.with(|solves| solves.set(0));
+        app.update();
+        super::LAYOUT_SOLVES.with(|solves| assert_eq!(solves.get(), 0));
+        assert_eq!(*app.world().get::<ComputedNode>(root).unwrap(), before);
+
+        app.world_mut().entity_mut(non_ui_child).remove::<ChildOf>();
+        super::LAYOUT_SOLVES.with(|solves| solves.set(0));
+        app.update();
+        super::LAYOUT_SOLVES.with(|solves| assert_eq!(solves.get(), 0));
+        assert_eq!(*app.world().get::<ComputedNode>(root).unwrap(), before);
+    }
+
+    #[test]
+    fn ui_plugin_repairs_stack_and_clipping_outputs() {
+        use crate::{UiPlugin, UiStack};
+        use bevy_asset::{AssetApp, AssetPlugin};
+        use bevy_image::{Image, TextureAtlasLayout};
+
+        let mut app = App::new();
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            bevy_time::TimePlugin,
+            bevy_input::InputPlugin,
+            AssetPlugin::default(),
+            bevy_text::TextPlugin,
+            UiPlugin,
+        ))
+        .init_asset::<Image>()
+        .init_asset::<TextureAtlasLayout>();
+        #[cfg(feature = "bevy_picking")]
+        app.add_plugins((bevy_picking::PickingPlugin, bevy_picking::InteractionPlugin));
+
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    computed: ComputedCameraValues {
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::new(TARGET_WIDTH, TARGET_HEIGHT),
+                            scale_factor: 1.,
+                        }),
+                        ..default()
+                    },
+                    ..default()
+                },
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.),
+                    height: Val::Px(100.),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                UiTargetCamera(camera),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(150.),
+                    height: Val::Px(150.),
+                    flex_shrink: 0.,
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+
+        app.update();
+        assert!(app.world().get::<CalculatedClip>(child).is_some());
+        assert_eq!(app.world().resource::<UiStack>().uinodes, [root, child]);
+
+        let stack_tick = app
+            .world()
+            .get_resource_ref::<UiStack>()
+            .unwrap()
+            .last_changed();
+        for _ in 0..5 {
+            app.update();
+            assert_eq!(
+                app.world()
+                    .get_resource_ref::<UiStack>()
+                    .unwrap()
+                    .last_changed(),
+                stack_tick
+            );
+        }
+
+        app.world_mut()
+            .get_mut::<crate::ComputedStackIndex>(child)
+            .unwrap()
+            .0 = 99;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<crate::ComputedStackIndex>(child)
+                .unwrap()
+                .0,
+            1
+        );
+        assert_ne!(
+            app.world()
+                .get_resource_ref::<UiStack>()
+                .unwrap()
+                .last_changed(),
+            stack_tick
+        );
+
+        app.world_mut().entity_mut(child).remove::<CalculatedClip>();
+        app.update();
+        assert!(app.world().get::<CalculatedClip>(child).is_some());
+        app.world_mut().get_mut::<Node>(root).unwrap().overflow = Overflow::visible();
+        app.update();
+        assert!(app.world().get::<CalculatedClip>(child).is_none());
+    }
+
+    #[test]
+    fn layout_reparents_and_promotes_roots_in_one_frame() {
+        let mut app = setup_ui_test_app();
+        let root_a = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(100.),
+                ..default()
+            })
+            .id();
+        let root_b = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(300.),
+                ..default()
+            })
+            .id();
+        let child = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        app.world_mut().entity_mut(root_a).add_child(child);
+        app.update();
+        app.update();
+        assert_eq!(app.world().get::<ComputedNode>(child).unwrap().size.x, 100.);
+        app.world_mut().entity_mut(root_b).add_child(child);
+        app.update();
+        assert_eq!(app.world().get::<ComputedNode>(child).unwrap().size.x, 300.);
+        app.world_mut().entity_mut(child).remove::<ChildOf>();
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size.x,
+            TARGET_WIDTH as f32
+        );
+        app.world_mut().entity_mut(root_a).add_child(child);
+        app.update();
+        assert_eq!(app.world().get::<ComputedNode>(child).unwrap().size.x, 100.);
+    }
+
+    #[test]
+    fn geometry_inputs_update_without_taffy_style_changes() {
+        use bevy_math::BVec2;
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.),
+                    height: Val::Px(100.),
+                    overflow: Overflow::scroll(),
+                    ..default()
+                },
+                ScrollPosition(Vec2::ZERO),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(200.25),
+                height: Val::Px(200.25),
+                flex_shrink: 0.,
+                ..default()
+            })
+            .id();
+        app.world_mut().entity_mut(root).add_child(child);
+        app.update();
+        app.update();
+        let original = *app.world().get::<UiGlobalTransform>(child).unwrap();
+        app.world_mut()
+            .get_mut::<UiTransform>(root)
+            .unwrap()
+            .translation = Val2::px(7., 9.);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<UiGlobalTransform>(child)
+                .unwrap()
+                .translation,
+            original.translation + Vec2::new(7., 9.)
+        );
+
+        app.world_mut().get_mut::<ScrollPosition>(root).unwrap().0 = Vec2::splat(20.);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(root)
+                .unwrap()
+                .scroll_position,
+            Vec2::splat(20.)
+        );
+        let scrolled = *app.world().get::<UiGlobalTransform>(child).unwrap();
+        app.world_mut()
+            .entity_mut(child)
+            .insert(IgnoreScroll(BVec2::TRUE));
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<UiGlobalTransform>(child)
+                .unwrap()
+                .translation,
+            scrolled.translation + Vec2::splat(20.)
+        );
+        app.world_mut().entity_mut(child).remove::<IgnoreScroll>();
+        app.update();
+        assert_eq!(
+            *app.world().get::<UiGlobalTransform>(child).unwrap(),
+            scrolled
+        );
+        app.world_mut().entity_mut(root).remove::<ScrollPosition>();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(root)
+                .unwrap()
+                .scroll_position,
+            Vec2::ZERO
+        );
+
+        app.world_mut().entity_mut(root).insert(LayoutConfig {
+            use_rounding: false,
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size,
+            Vec2::splat(200.25)
+        );
+        app.world_mut().entity_mut(root).remove::<LayoutConfig>();
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size,
+            Vec2::splat(200.)
+        );
+
+        app.world_mut().entity_mut(child).insert(Outline {
+            width: Val::Px(3.),
+            offset: Val::Px(2.),
+            ..default()
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(child)
+                .unwrap()
+                .outline_width,
+            3.
+        );
+        app.world_mut().get_mut::<Outline>(child).unwrap().width = Val::Px(5.);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(child)
+                .unwrap()
+                .outline_width,
+            5.
+        );
+        app.world_mut().entity_mut(child).remove::<Outline>();
+        app.update();
+        let computed = app.world().get::<ComputedNode>(child).unwrap();
+        assert_eq!((computed.outline_width, computed.outline_offset), (0., 0.));
+    }
+
+    #[test]
+    fn geometry_tracks_target_resize_scale_and_hidden_reopening() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                ..default()
+            })
+            .id();
+        let child = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(10.),
+                height: Val::Px(10.),
+                ..default()
+            })
+            .id();
+        app.world_mut().entity_mut(root).add_child(child);
+        app.update();
+        app.update();
+        app.world_mut().resource_mut::<UiScale>().0 = 2.;
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size,
+            Vec2::splat(20.)
+        );
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(child)
+                .unwrap()
+                .inverse_scale_factor,
+            0.5
+        );
+        let world = app.world_mut();
+        world
+            .query::<&mut Camera>()
+            .single_mut(world)
+            .unwrap()
+            .viewport
+            .as_mut()
+            .unwrap()
+            .physical_size = UVec2::new(400, 300);
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(root).unwrap().size,
+            Vec2::new(400., 300.)
+        );
+        app.world_mut().get_mut::<Node>(root).unwrap().display = Display::None;
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size,
+            Vec2::ZERO
+        );
+        app.world_mut()
+            .get_mut::<UiTransform>(child)
+            .unwrap()
+            .translation = Val2::px(12., 0.);
+        app.update();
+        app.world_mut().get_mut::<Node>(root).unwrap().display = Display::Flex;
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size,
+            Vec2::splat(20.)
+        );
+    }
+
+    #[test]
     fn ui_nodes_with_percent_100_dimensions_should_fill_their_parent() {
         let mut app = setup_ui_test_app();
 
@@ -501,7 +1069,7 @@ mod tests {
 
         app.update();
 
-        let mut ui_surface = app.world_mut().resource_mut::<UiSurface>();
+        let ui_surface = app.world().resource::<UiSurface>();
 
         for ui_entity in [ui_root, ui_child] {
             let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
@@ -894,7 +1462,7 @@ mod tests {
                 .single(world)
                 .expect("missing MovingUiNode");
             assert_eq!(expected_camera_entity, target_camera_entity);
-            let mut ui_surface = world.resource_mut::<UiSurface>();
+            let ui_surface = world.resource::<UiSurface>();
 
             let layout = ui_surface
                 .get_layout(ui_node_entity, true)
@@ -1000,7 +1568,7 @@ mod tests {
         app.update();
         let world = app.world_mut();
 
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
 
         // the node should takes its size from the fixed size measure func
@@ -1037,7 +1605,7 @@ mod tests {
 
         app.update();
         let world = app.world_mut();
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         let layout = ui_surface.get_layout(ui_node, true).unwrap().0;
 
         assert_eq!(layout.border.left, 2.0);
@@ -1076,7 +1644,7 @@ mod tests {
             .id();
 
         app.update();
-        let mut ui_surface = app.world_mut().resource_mut::<UiSurface>();
+        let ui_surface = app.world().resource::<UiSurface>();
         let layout = ui_surface.get_layout(ui_node, true).unwrap().0;
 
         assert_eq!(layout.border.left, 2.);
@@ -1104,7 +1672,7 @@ mod tests {
         app.update();
         let world = app.world_mut();
 
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         let ui_node = ui_surface.entity_to_taffy[&ui_entity];
 
         // a node with a content size should have taffy context
@@ -1122,7 +1690,7 @@ mod tests {
         app.update();
         let world = app.world_mut();
 
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         // a node with a cleared content size should not have taffy context
         assert!(ui_surface.taffy.get_node_context(ui_node.id).is_none());
 
@@ -1144,7 +1712,7 @@ mod tests {
 
         app.update();
         let world = app.world_mut();
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         let ui_node = ui_surface.entity_to_taffy[&ui_entity];
         assert!(ui_surface.taffy.get_node_context(ui_node.id).is_some());
         let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
@@ -1155,7 +1723,7 @@ mod tests {
 
         app.update();
         let world = app.world_mut();
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         assert!(ui_surface.taffy.get_node_context(ui_node.id).is_some());
         let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
         assert_eq!(layout.size.width, content_size.x);
@@ -1169,7 +1737,7 @@ mod tests {
 
         app.update();
         let world = app.world_mut();
-        let mut ui_surface = world.resource_mut::<UiSurface>();
+        let ui_surface = world.resource::<UiSurface>();
         assert!(ui_surface.taffy.get_node_context(ui_node.id).is_none());
         let layout = ui_surface.get_layout(ui_entity, true).unwrap().0;
         assert_eq!(layout.size.width, 0.);
@@ -1371,14 +1939,13 @@ mod tests {
             4
         );
 
-        // Should be two viewport nodes tracked in the root to viewport node map.
-        assert_eq!(
-            world
-                .resource_mut::<UiSurface>()
-                .root_entity_to_viewport_node
-                .len(),
-            2
-        );
+        let surface = world.resource::<UiSurface>();
+        assert!(surface.entity_to_taffy[&ui_root_entity_1]
+            .viewport
+            .is_some());
+        assert!(surface.entity_to_taffy[&ui_root_entity_2]
+            .viewport
+            .is_some());
 
         // Parent `ui_root_entity_2` onto `ui_root_entity_1` so now only `ui_root_entity_1` is a
         // UI root entity.
@@ -1397,18 +1964,13 @@ mod tests {
             3
         );
 
-        // The entry for `ui_root_entity_2` should have been removed from `root_entity_to_viewport_node`
-        assert_eq!(
-            world
-                .resource_mut::<UiSurface>()
-                .root_entity_to_viewport_node
-                .len(),
-            1
-        );
-        assert!(world
-            .resource_mut::<UiSurface>()
-            .root_entity_to_viewport_node
-            .contains_key(&ui_root_entity_1));
+        let surface = world.resource::<UiSurface>();
+        assert!(surface.entity_to_taffy[&ui_root_entity_1]
+            .viewport
+            .is_some());
+        assert!(surface.entity_to_taffy[&ui_root_entity_2]
+            .viewport
+            .is_none());
     }
 
     #[cfg(feature = "ghost_nodes")]
@@ -1462,7 +2024,7 @@ mod tests {
             let ui_surface = world.resource::<UiSurface>();
             assert!(compare_taffy_children(ui_surface, root, &[child]));
             assert!(compare_taffy_parent(ui_surface, child, Some(root)));
-            assert!(!ui_surface.root_entity_to_viewport_node.contains_key(&child));
+            assert!(ui_surface.entity_to_taffy[&child].viewport.is_none());
 
             world.entity_mut(ghost).detach_all_children();
 
@@ -1475,15 +2037,11 @@ mod tests {
             // root taffy node.
             assert!(compare_taffy_children(ui_surface, root, &[]));
 
-            let viewport_node = ui_surface
-                .root_entity_to_viewport_node
-                .get(&child)
-                .copied()
-                .expect(
-                    "detached child should become a UI root and have an associated viewport node",
-                );
+            let viewport_node = ui_surface.entity_to_taffy[&child].viewport.expect(
+                "detached child should become a UI root and have an associated viewport node",
+            );
             let taffy_child = ui_surface.entity_to_taffy[&child].id;
-            assert_eq!(ui_surface.taffy.parent(taffy_child), Some(viewport_node));
+            assert_eq!(ui_surface.taffy.parent(taffy_child), Some(viewport_node.id));
         }
 
         #[test]
@@ -1536,7 +2094,7 @@ mod tests {
             let ui_surface = world.resource::<UiSurface>();
             assert!(compare_taffy_children(ui_surface, root, &[]));
             assert!(compare_taffy_parent(ui_surface, child, None));
-            assert!(!ui_surface.root_entity_to_viewport_node.contains_key(&child));
+            assert!(ui_surface.entity_to_taffy[&child].viewport.is_none());
         }
     }
 }

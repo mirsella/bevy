@@ -2,32 +2,41 @@ use core::fmt;
 use core::ops::{Deref, DerefMut};
 
 use bevy_platform::collections::hash_map::Entry;
-use taffy::TaffyTree;
+use taffy::{TaffyTree, TraversePartialTree};
 
-#[cfg(feature = "ghost_nodes")]
-use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::{
+    change_detection::Mut,
     entity::{Entity, EntityHashMap},
     prelude::Resource,
 };
 use bevy_math::{UVec2, Vec2};
 use bevy_utils::default;
 
-use crate::{layout::convert, LayoutContext, LayoutError, Measure, MeasureArgs, Node, NodeMeasure};
+use crate::{
+    layout::convert, widget::TextMeasure, LayoutContext, LayoutError, Measure, MeasureArgs, Node,
+    NodeMeasure,
+};
 use bevy_text::FontCx;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct LayoutNode {
     // Implicit "viewport" node if this `LayoutNode` corresponds to a root UI node entity
-    pub(super) viewport_id: Option<taffy::NodeId>,
+    pub(super) viewport: Option<ViewportNode>,
     // The id of the node in the taffy tree
     pub(super) id: taffy::NodeId,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) struct ViewportNode {
+    pub id: taffy::NodeId,
+    // The last successful solve belongs to this viewport's lifetime.
+    computed_resolution: Option<UVec2>,
 }
 
 impl From<taffy::NodeId> for LayoutNode {
     fn from(value: taffy::NodeId) -> Self {
         LayoutNode {
-            viewport_id: None,
+            viewport: None,
             id: value,
         }
     }
@@ -58,15 +67,9 @@ impl<T> DerefMut for UiTree<T> {
 
 #[derive(Resource)]
 pub struct UiSurface {
-    pub root_entity_to_viewport_node: EntityHashMap<taffy::NodeId>,
     pub(super) entity_to_taffy: EntityHashMap<LayoutNode>,
     pub(super) taffy: UiTree<NodeMeasure>,
-    // Last successful solve per root. Include the generational viewport ID so a
-    // recreated viewport can never reuse the previous viewport's rounded layout.
-    computed_viewports: EntityHashMap<(taffy::NodeId, UVec2)>,
     taffy_children_scratch: Vec<taffy::NodeId>,
-    #[cfg(feature = "ghost_nodes")]
-    pub(super) dirty_ghost_children_scratch: EntityHashSet,
 }
 
 fn _assert_send_sync_ui_surface_impl_safe() {
@@ -78,16 +81,10 @@ fn _assert_send_sync_ui_surface_impl_safe() {
 
 impl fmt::Debug for UiSurface {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut debug = f.debug_struct("UiSurface");
-        debug
+        f.debug_struct("UiSurface")
             .field("entity_to_taffy", &self.entity_to_taffy)
-            .field("taffy_children_scratch", &self.taffy_children_scratch);
-        #[cfg(feature = "ghost_nodes")]
-        debug.field(
-            "dirty_ghost_children_scratch",
-            &self.dirty_ghost_children_scratch,
-        );
-        debug.finish()
+            .field("taffy_children_scratch", &self.taffy_children_scratch)
+            .finish()
     }
 }
 
@@ -95,13 +92,9 @@ impl Default for UiSurface {
     fn default() -> Self {
         let taffy: UiTree<NodeMeasure> = UiTree(TaffyTree::new());
         Self {
-            root_entity_to_viewport_node: Default::default(),
             entity_to_taffy: Default::default(),
             taffy,
-            computed_viewports: Default::default(),
             taffy_children_scratch: Vec::new(),
-            #[cfg(feature = "ghost_nodes")]
-            dirty_ghost_children_scratch: EntityHashSet::new(),
         }
     }
 }
@@ -158,15 +151,21 @@ impl UiSurface {
         for child in children {
             if let Some(taffy_node) = self.entity_to_taffy.get_mut(&child) {
                 self.taffy_children_scratch.push(taffy_node.id);
-                if let Some(viewport_id) = taffy_node.viewport_id.take() {
-                    self.taffy.remove(viewport_id).ok();
-                    self.root_entity_to_viewport_node.remove(&child);
-                    self.computed_viewports.remove(&child);
+                if let Some(viewport) = taffy_node.viewport.take() {
+                    self.taffy.remove(viewport.id).unwrap();
                 }
             }
         }
 
         let taffy_node = self.entity_to_taffy.get(&entity).unwrap();
+        // Keep root demotion bookkeeping above, even when the child list matches.
+        if self
+            .taffy
+            .child_ids(taffy_node.id)
+            .eq(self.taffy_children_scratch.iter().copied())
+        {
+            return;
+        }
         self.taffy
             .set_children(taffy_node.id, &self.taffy_children_scratch)
             .unwrap();
@@ -188,11 +187,10 @@ impl UiSurface {
 
     /// Gets or inserts an implicit taffy viewport node corresponding to the given UI root entity
     pub fn get_or_insert_taffy_viewport_node(&mut self, ui_root_entity: Entity) -> taffy::NodeId {
-        *self
-            .root_entity_to_viewport_node
-            .entry(ui_root_entity)
-            .or_insert_with(|| {
-                let root_node = self.entity_to_taffy.get_mut(&ui_root_entity).unwrap();
+        let root_node = self.entity_to_taffy.get_mut(&ui_root_entity).unwrap();
+        root_node
+            .viewport
+            .get_or_insert_with(|| {
                 let implicit_root = self
                     .taffy
                     .new_leaf(taffy::style::Style {
@@ -213,31 +211,44 @@ impl UiSurface {
                 self.taffy
                     .set_children(implicit_root, &[root_node.id])
                     .unwrap();
-                root_node.viewport_id = Some(implicit_root);
-                implicit_root
+                ViewportNode {
+                    id: implicit_root,
+                    computed_resolution: None,
+                }
             })
+            .id
     }
 
     /// Compute the layout for the given implicit taffy viewport node.
     /// Reuses the rounded layout when both the tree and viewport are unchanged.
     /// Changes to a measurement must be submitted through `update_node_context`
     /// or `upsert_node`, as required by Taffy's layout cache.
-    pub fn compute_layout<'a>(
+    /// Returns whether the layout was recomputed.
+    pub fn compute_layout(
         &mut self,
         ui_root_entity: Entity,
         render_target_resolution: UVec2,
-        buffer_query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
-        font_system: &'a mut FontCx,
-    ) {
+        buffer_query: &mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
+        font_system: &mut FontCx,
+    ) -> bool {
         let implicit_viewport_node = self.get_or_insert_taffy_viewport_node(ui_root_entity);
-        if self.computed_viewports.get(&ui_root_entity)
-            == Some(&(implicit_viewport_node, render_target_resolution))
+        let viewport = self
+            .entity_to_taffy
+            .get_mut(&ui_root_entity)
+            .unwrap()
+            .viewport
+            .as_mut()
+            .unwrap();
+        if viewport.computed_resolution == Some(render_target_resolution)
             && !self.taffy.dirty(implicit_viewport_node).unwrap()
         {
             // Taffy caches the solve, but still traverses the entire tree to round
             // it on every compute_layout_with_measure call.
-            return;
+            return false;
         }
+
+        #[cfg(test)]
+        super::LAYOUT_SOLVES.with(|solves| solves.set(solves.get() + 1));
 
         let available_space = taffy::geometry::Size {
             width: taffy::style::AvailableSpace::Definite(render_target_resolution.x as f32),
@@ -256,14 +267,18 @@ impl UiSurface {
                  -> taffy::Size<f32> {
                     context
                         .map(|ctx| {
-                            let buffer = get_text_buffer(
-                                crate::widget::TextMeasure::needs_buffer(
+                            let buffer = if let NodeMeasure::Text(text) = ctx
+                                && TextMeasure::needs_buffer(
                                     known_dimensions.height,
                                     available_space.width,
-                                ),
-                                ctx,
-                                buffer_query,
-                            );
+                                ) {
+                                buffer_query
+                                    .get_mut(text.info.entity)
+                                    .ok()
+                                    .map(Mut::into_inner)
+                            } else {
+                                None
+                            };
                             let size = ctx.measure(MeasureArgs {
                                 known_width: known_dimensions.width,
                                 known_height: known_dimensions.height,
@@ -282,10 +297,8 @@ impl UiSurface {
                 },
             )
             .unwrap();
-        self.computed_viewports.insert(
-            ui_root_entity,
-            (implicit_viewport_node, render_target_resolution),
-        );
+        viewport.computed_resolution = Some(render_target_resolution);
+        true
     }
 
     /// Removes each entity from the internal map and then removes their associated nodes from taffy
@@ -297,12 +310,10 @@ impl UiSurface {
                     self.taffy.mark_dirty(parent).unwrap();
                 }
                 self.taffy.remove(node.id).unwrap();
-                if let Some(viewport_node) = node.viewport_id {
-                    self.taffy.remove(viewport_node).ok();
+                if let Some(viewport) = node.viewport {
+                    self.taffy.remove(viewport.id).unwrap();
                 }
             }
-            self.root_entity_to_viewport_node.remove(&entity);
-            self.computed_viewports.remove(&entity);
         }
     }
 
@@ -334,24 +345,6 @@ impl UiSurface {
             Vec2::new(unrounded.size.width, unrounded.size.height),
         ))
     }
-}
-
-pub fn get_text_buffer<'a>(
-    needs_buffer: bool,
-    ctx: &mut NodeMeasure,
-    query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
-) -> Option<&'a mut bevy_text::ComputedTextBlock> {
-    // We avoid a query lookup whenever the buffer is not required.
-    if !needs_buffer {
-        return None;
-    }
-    let NodeMeasure::Text(crate::widget::TextMeasure { info }) = ctx else {
-        return None;
-    };
-    let Ok(computed) = query.get_mut(info.entity) else {
-        return None;
-    };
-    Some(computed.into_inner())
 }
 
 #[cfg(test)]
@@ -464,9 +457,15 @@ mod tests {
         surface.upsert_node(&LayoutContext::TEST_CONTEXT, root, &node, None);
         compute(&mut surface, root, resolution);
 
-        // Recreate the viewport while retaining the old cache entry, then make
-        // it clean at another resolution. Identity must prevent an early return.
-        let old_viewport = surface.root_entity_to_viewport_node.remove(&root).unwrap();
+        // A recreated viewport has no previous solve, even if Taffy is clean.
+        let old_viewport = surface
+            .entity_to_taffy
+            .get_mut(&root)
+            .unwrap()
+            .viewport
+            .take()
+            .unwrap()
+            .id;
         surface.taffy.remove(old_viewport).unwrap();
         let viewport = surface.get_or_insert_taffy_viewport_node(root);
         assert_ne!(viewport, old_viewport);
@@ -552,7 +551,7 @@ mod tests {
             ..default()
         };
         let measure = |width| {
-            NodeMeasure::Text(crate::widget::TextMeasure {
+            NodeMeasure::Text(TextMeasure {
                 info: bevy_text::TextMeasureInfo {
                     min: Vec2::new(width, 10.0),
                     max: Vec2::new(width, 10.0),
@@ -619,7 +618,7 @@ mod tests {
 
         // Demotion removes its viewport and cached resolution.
         surface.update_children(a, [child].into_iter());
-        assert!(!surface.computed_viewports.contains_key(&child));
+        assert!(surface.entity_to_taffy[&child].viewport.is_none());
         compute(&mut surface, a, resolution);
         surface.try_remove_children(a);
         compute(&mut surface, a, resolution);
@@ -632,7 +631,7 @@ mod tests {
         assert_matches_fresh_layout(&mut surface, child, resolution);
 
         surface.remove_entities([child]);
-        assert!(!surface.computed_viewports.contains_key(&child));
+        assert!(!surface.entity_to_taffy.contains_key(&child));
         surface.upsert_node(
             &LayoutContext::TEST_CONTEXT,
             child,

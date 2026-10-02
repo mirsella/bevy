@@ -76,6 +76,13 @@ pub struct UiChildren<'w, 's> {
     parents_query: Query<'w, 's, &'static ChildOf>,
 }
 
+impl UiChildren<'_, '_> {
+    /// Conservative check that includes changes outside the UI hierarchy.
+    pub(crate) fn has_changed_children(&self) -> bool {
+        !self.changed_children_query.is_empty()
+    }
+}
+
 #[cfg(feature = "ghost_nodes")]
 impl<'w, 's> UiChildren<'w, 's> {
     /// Iterates the children of `entity`, skipping over [`GhostNode`].

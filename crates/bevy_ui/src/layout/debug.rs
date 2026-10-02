@@ -14,13 +14,16 @@ pub fn print_ui_layout_tree(ui_surface: &UiSurface) {
         .iter()
         .map(|(entity, node)| (node.id, *entity))
         .collect();
-    for (&entity, &viewport_node) in &ui_surface.root_entity_to_viewport_node {
+    for (&entity, node) in &ui_surface.entity_to_taffy {
+        let Some(viewport) = node.viewport else {
+            continue;
+        };
         let mut out = String::new();
         print_node(
             ui_surface,
             &taffy_to_entity,
             entity,
-            viewport_node,
+            viewport.id,
             false,
             String::new(),
             &mut out,

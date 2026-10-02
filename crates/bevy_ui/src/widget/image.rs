@@ -196,6 +196,9 @@ pub struct ImageNodeSize {
     ///
     /// This field is updated automatically by [`update_image_content_size_system`]
     size: UVec2,
+    /// Inputs to the measure last installed by this system. Tint and UV changes do not
+    /// affect layout, even though they mark the whole `ImageNode` as changed.
+    measure: Option<ImageMeasure>,
 }
 
 impl ImageNodeSize {
@@ -206,7 +209,7 @@ impl ImageNodeSize {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 /// Used to calculate the size of UI image nodes
 pub struct ImageMeasure {
     /// The size of the image's texture
@@ -318,46 +321,216 @@ pub fn update_image_content_size_system(
     mut query: Query<
         (
             &mut ContentSize,
-            Ref<ImageNode>,
+            &ImageNode,
             &mut ImageNodeSize,
-            Ref<ComputedUiRenderTargetInfo>,
+            &ComputedUiRenderTargetInfo,
         ),
         UpdateImageFilter,
     >,
 ) {
     for (mut content_size, image, mut image_size, computed_target) in &mut query {
-        if !matches!(image.image_mode, NodeImageMode::Auto)
-            || image.image.id() == TRANSPARENT_IMAGE_HANDLE.id()
-        {
-            if image.is_changed() {
-                // Remove any existing measure.
-                content_size.clear();
-            }
-            continue;
-        }
-
-        if let Some(size) =
-            image
-                .rect
-                .map(|rect| rect.size().as_uvec2())
-                .or_else(|| match &image.texture_atlas {
-                    Some(atlas) => atlas.texture_rect(&atlases).map(|t| t.size()),
-                    None => textures.get(&image.image).map(Image::size),
-                })
-        {
-            // Update only if size or scale factor has changed to avoid needless layout calculations
-            if size != image_size.size
-                || computed_target.is_changed()
-                || content_size.is_added()
-                || image.is_changed()
+        let measure =
+            if matches!(image.image_mode, NodeImageMode::Auto)
+                && image.image.id() != TRANSPARENT_IMAGE_HANDLE.id()
             {
-                image_size.size = size;
-                content_size.set(NodeMeasure::Image(ImageMeasure {
-                    // multiply the image size by the scale factor to get the physical size
+                let Some(size) = image.rect.map(|rect| rect.size().as_uvec2()).or_else(|| {
+                    match &image.texture_atlas {
+                        Some(atlas) => atlas.texture_rect(&atlases).map(|t| t.size()),
+                        None => textures.get(&image.image).map(Image::size),
+                    }
+                }) else {
+                    // Keep the previous measurement until the new asset is available.
+                    continue;
+                };
+                if size != image_size.size {
+                    image_size.size = size;
+                }
+                Some(ImageMeasure {
                     size: size.as_vec2() * computed_target.scale_factor(),
                     visual_box: image.visual_box,
-                }));
+                })
+            } else {
+                None
+            };
+        if image_size.measure != measure || (measure.is_some() && content_size.is_added()) {
+            image_size.measure = measure;
+            match measure {
+                Some(measure) => content_size.set(NodeMeasure::Image(measure)),
+                None => content_size.clear(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_app::{App, Update};
+
+    #[test]
+    fn stretch_image_preserves_custom_content_measure() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<TextureAtlasLayout>>()
+            .add_systems(Update, update_image_content_size_system);
+        let entity = app
+            .world_mut()
+            .spawn((
+                ImageNode {
+                    image_mode: NodeImageMode::Stretch,
+                    ..ImageNode::solid_color(Color::WHITE)
+                },
+                ContentSize::fixed_size(Vec2::splat(42.)),
+            ))
+            .id();
+        app.update();
+        let content = app.world().get::<ContentSize>(entity).unwrap();
+        assert!(
+            matches!(&content.measure, Some(NodeMeasure::Fixed(measure)) if measure.size == Vec2::splat(42.))
+        );
+    }
+
+    #[test]
+    fn image_measure_observes_late_assets_resizes_and_atlas_edits() {
+        fn image(width: u32, height: u32) -> Image {
+            let mut image = Image::default();
+            let mut size = image.texture_descriptor.size;
+            size.width = width;
+            size.height = height;
+            image.resize(size);
+            image
+        }
+        fn measure(app: &App, entity: Entity) -> Option<Vec2> {
+            match &app.world().get::<ContentSize>(entity).unwrap().measure {
+                Some(NodeMeasure::Image(measure)) => Some(measure.size),
+                None => None,
+                _ => panic!("expected an image measure"),
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<TextureAtlasLayout>>()
+            .add_systems(Update, update_image_content_size_system);
+        let handle = app.world().resource::<Assets<Image>>().reserve_handle();
+        let entity = app.world_mut().spawn(ImageNode::new(handle.clone())).id();
+        app.update();
+        assert_eq!(measure(&app, entity), None);
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .insert(handle.id(), image(20, 10))
+            .unwrap();
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(20., 10.)));
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .get_mut(&handle)
+            .unwrap()
+            .resize(image(40, 30).texture_descriptor.size);
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(40., 30.)));
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .remove(handle.id());
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(40., 30.)));
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .insert(handle.id(), image(60, 50))
+            .unwrap();
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(60., 50.)));
+
+        let atlas = app
+            .world()
+            .resource::<Assets<TextureAtlasLayout>>()
+            .reserve_handle();
+        app.world_mut()
+            .get_mut::<ImageNode>(entity)
+            .unwrap()
+            .texture_atlas = Some(TextureAtlas {
+            layout: atlas.clone(),
+            index: 0,
+        });
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(60., 50.)));
+        let mut layout = TextureAtlasLayout::new_empty(UVec2::splat(128));
+        layout.add_texture(bevy_math::URect::new(0, 0, 12, 8));
+        app.world_mut()
+            .resource_mut::<Assets<TextureAtlasLayout>>()
+            .insert(atlas.id(), layout)
+            .unwrap();
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(12., 8.)));
+        app.world_mut()
+            .resource_mut::<Assets<TextureAtlasLayout>>()
+            .get_mut(&atlas)
+            .unwrap()
+            .textures[0] = bevy_math::URect::new(2, 3, 8, 7);
+        app.update();
+        assert_eq!(measure(&app, entity), Some(Vec2::new(6., 4.)));
+    }
+
+    #[test]
+    fn image_measure_changes_only_with_layout_inputs() {
+        #[derive(Resource, Default)]
+        struct Changes(Vec<bool>);
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .init_resource::<Assets<TextureAtlasLayout>>()
+            .init_resource::<Changes>()
+            .add_systems(
+                Update,
+                (
+                    update_image_content_size_system,
+                    |mut query: Query<&mut ContentSize>, mut changes: ResMut<Changes>| {
+                        let mut content = query.single_mut().unwrap();
+                        changes.0.push(content.is_changed());
+                        // Layout consumes the pending measure without changing its component tick.
+                        content.bypass_change_detection().measure.take();
+                    },
+                )
+                    .chain(),
+            );
+        let entity = app
+            .world_mut()
+            .spawn(ImageNode {
+                rect: Some(Rect::new(0., 0., 20., 10.)),
+                ..ImageNode::solid_color(Color::WHITE)
+            })
+            .id();
+        app.update();
+        app.world_mut().get_mut::<ImageNode>(entity).unwrap().color = Color::BLACK;
+        app.update();
+        app.world_mut()
+            .get_mut::<ImageNode>(entity)
+            .unwrap()
+            .visual_box = VisualBox::BorderBox;
+        app.update();
+        app.world_mut()
+            .get_mut::<ComputedUiRenderTargetInfo>(entity)
+            .unwrap()
+            .scale_factor = 2.;
+        app.update();
+        app.world_mut()
+            .get_mut::<ImageNode>(entity)
+            .unwrap()
+            .image_mode = NodeImageMode::Stretch;
+        app.update();
+        app.world_mut().get_mut::<ImageNode>(entity).unwrap().color = Color::WHITE;
+        app.update();
+        app.world_mut()
+            .get_mut::<ImageNode>(entity)
+            .unwrap()
+            .image_mode = NodeImageMode::Auto;
+        app.update();
+        app.world_mut()
+            .entity_mut(entity)
+            .remove::<ContentSize>()
+            .insert(ContentSize::default());
+        app.update();
+        assert_eq!(
+            app.world().resource::<Changes>().0,
+            [true, false, true, true, true, false, true, true]
+        );
     }
 }
