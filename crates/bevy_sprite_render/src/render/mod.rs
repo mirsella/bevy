@@ -12,7 +12,6 @@ use bevy_core_pipeline::{
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    entity::EntityHash,
     prelude::*,
     query::ROQueryItem,
     system::{lifetimeless::*, SystemParamItem},
@@ -30,7 +29,7 @@ use bevy_render::{
     render_phase::{
         CachedRenderPipelinePhaseItem, DrawFunctionId, DrawFunctions, PhaseItem,
         PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline, SortedPhaseItem,
-        TrackedRenderPass, ViewSortedRenderPhases,
+        SortedPhaseItems, TrackedRenderPass, ViewSortedRenderPhases,
     },
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
@@ -476,14 +475,11 @@ impl SortedPhaseItem for SrgbTransparent2d {
     }
 
     #[inline]
-    fn sort(items: &mut indexmap::IndexMap<(Entity, MainEntity), Self, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_by_key(|_, value| value.sort_key());
     }
 
-    fn recalculate_sort_keys(
-        _: &mut indexmap::IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        _: &ExtractedView,
-    ) {
+    fn recalculate_sort_keys(_: &mut SortedPhaseItems<Self>, _: &ExtractedView) {
         // Sort keys are precalculated for this phase.
     }
 

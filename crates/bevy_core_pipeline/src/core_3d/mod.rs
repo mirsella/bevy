@@ -43,14 +43,13 @@ use bevy_render::{
     texture::CachedTexture,
     view::{prepare_view_targets, NoIndirectDrawing, RetainedViewEntity},
 };
-use indexmap::IndexMap;
 pub use main_opaque_pass_3d_node::*;
 pub use main_transparent_pass_3d_node::*;
 
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::UntypedAssetId;
 use bevy_color::LinearRgba;
-use bevy_ecs::{entity::EntityHash, prelude::*};
+use bevy_ecs::prelude::*;
 use bevy_image::ToExtents;
 use bevy_log::warn;
 use bevy_math::{FloatOrd, Vec3};
@@ -61,8 +60,8 @@ use bevy_render::{
     prelude::Msaa,
     render_phase::{
         sort_phase_system, BinnedPhaseItem, CachedRenderPipelinePhaseItem, DrawFunctionId,
-        DrawFunctions, PhaseItem, PhaseItemExtraIndex, SortedPhaseItem, ViewBinnedRenderPhases,
-        ViewSortedRenderPhases,
+        DrawFunctions, PhaseItem, PhaseItemExtraIndex, SortedPhaseItem, SortedPhaseItems,
+        ViewBinnedRenderPhases, ViewSortedRenderPhases,
     },
     render_resource::{
         CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
@@ -433,14 +432,11 @@ impl SortedPhaseItem for Transparent3d {
     }
 
     #[inline]
-    fn sort(items: &mut IndexMap<(Entity, MainEntity), Transparent3d, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_by_key(|_, item| item.sort_key());
     }
 
-    fn recalculate_sort_keys(
-        items: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        view: &ExtractedView,
-    ) {
+    fn recalculate_sort_keys(items: &mut SortedPhaseItems<Self>, view: &ExtractedView) {
         // Determine the distance to the view for each phase item.
         let rangefinder = view.rangefinder3d();
         for item in items.values_mut() {

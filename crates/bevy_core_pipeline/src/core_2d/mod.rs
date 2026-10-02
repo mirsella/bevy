@@ -5,7 +5,6 @@ use core::ops::Range;
 
 use bevy_asset::UntypedAssetId;
 use bevy_camera::{Camera, Camera2d};
-use bevy_ecs::entity::EntityHash;
 use bevy_image::ToExtents;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
@@ -14,7 +13,6 @@ use bevy_render::{
     render_phase::PhaseItemBatchSetKey,
     view::{ExtractedView, RetainedViewEntity},
 };
-use indexmap::IndexMap;
 pub use main_opaque_pass_2d_node::*;
 pub use main_transparent_pass_2d_node::*;
 
@@ -30,8 +28,8 @@ use bevy_render::{
     extract_component::ExtractComponentPlugin,
     render_phase::{
         sort_phase_system, BinnedPhaseItem, CachedRenderPipelinePhaseItem, DrawFunctionId,
-        DrawFunctions, PhaseItem, PhaseItemExtraIndex, SortedPhaseItem, ViewBinnedRenderPhases,
-        ViewSortedRenderPhases,
+        DrawFunctions, PhaseItem, PhaseItemExtraIndex, SortedPhaseItem, SortedPhaseItems,
+        ViewBinnedRenderPhases, ViewSortedRenderPhases,
     },
     render_resource::{
         BindGroupId, CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat,
@@ -367,14 +365,11 @@ impl SortedPhaseItem for Transparent2d {
     }
 
     #[inline]
-    fn sort(items: &mut IndexMap<(Entity, MainEntity), Transparent2d, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_by_key(|_, item| item.sort_key());
     }
 
-    fn recalculate_sort_keys(
-        _: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        _: &ExtractedView,
-    ) {
+    fn recalculate_sort_keys(_: &mut SortedPhaseItems<Self>, _: &ExtractedView) {
         // Sort keys are precalculated for 2D phase items.
     }
 

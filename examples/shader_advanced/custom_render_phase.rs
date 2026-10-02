@@ -19,10 +19,7 @@ use bevy::pbr::{self, MeshPipelineSystems, SetMeshViewEmptyBindGroup, ViewKeyCac
 use bevy::{
     camera::MainPassResolutionOverride,
     core_pipeline::{core_3d::main_opaque_pass_3d, schedule::Core3d, Core3dSystems},
-    ecs::{
-        entity::EntityHash,
-        system::{lifetimeless::SRes, SystemParamItem},
-    },
+    ecs::system::{lifetimeless::SRes, SystemParamItem},
     math::FloatOrd,
     mesh::MeshVertexBufferLayoutRef,
     pbr::{
@@ -46,7 +43,7 @@ use bevy::{
         render_phase::{
             sort_phase_system, AddRenderCommand, CachedRenderPipelinePhaseItem, DrawFunctionId,
             DrawFunctions, PhaseItem, PhaseItemExtraIndex, SetItemPipeline, SortedPhaseItem,
-            SortedRenderPhasePlugin, ViewSortedRenderPhases,
+            SortedPhaseItems, SortedRenderPhasePlugin, ViewSortedRenderPhases,
         },
         render_resource::{
             CachedRenderPipelineId, ColorTargetState, ColorWrites, Face, FragmentState,
@@ -60,7 +57,6 @@ use bevy::{
         Extract, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
     },
 };
-use indexmap::IndexMap;
 use nonmax::NonMaxU32;
 
 const SHADER_ASSET_PATH: &str = "shaders/custom_stencil.wgsl";
@@ -319,14 +315,11 @@ impl SortedPhaseItem for Stencil3d {
     }
 
     #[inline]
-    fn sort(items: &mut IndexMap<(Entity, MainEntity), Stencil3d, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_by_key(|_, phase_item: &Stencil3d| phase_item.distance);
     }
 
-    fn recalculate_sort_keys(
-        items: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        view: &ExtractedView,
-    ) {
+    fn recalculate_sort_keys(items: &mut SortedPhaseItems<Self>, view: &ExtractedView) {
         // Determine the distance to the view for each phase item.
         let rangefinder = view.rangefinder3d();
         for item in items.values_mut() {

@@ -31,7 +31,10 @@ mod rangefinder;
 use bevy_app::{App, Plugin};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::entity::EntityHash;
-use bevy_platform::collections::{hash_map::Entry, HashMap};
+use bevy_platform::{
+    collections::{hash_map::Entry, HashMap},
+    hash::FixedHasher,
+};
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
 pub use draw::*;
@@ -1766,6 +1769,11 @@ impl UnbatchableBinnedEntityIndexSet {
     }
 }
 
+/// Storage for sorted phase items, keyed by both render-world and main-world entities.
+///
+/// The fixed hasher incorporates both entities in each key.
+pub type SortedPhaseItems<I> = IndexMap<(Entity, MainEntity), I, FixedHasher>;
+
 /// A collection of all items to be rendered that will be encoded to GPU
 /// commands for a single render phase for a single view.
 ///
@@ -1785,7 +1793,7 @@ where
     I: SortedPhaseItem,
 {
     /// The items within this [`SortedRenderPhase`].
-    pub items: IndexMap<(Entity, MainEntity), I, EntityHash>,
+    pub items: SortedPhaseItems<I>,
     /// Items within this render phase that will be automatically removed after
     /// this frame.
     pub transient_items: Vec<(Entity, MainEntity)>,
@@ -2104,7 +2112,7 @@ pub trait SortedPhaseItem: PhaseItem {
     ///
     /// It's advised to always profile for performance changes when changing this implementation.
     #[inline]
-    fn sort(items: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_unstable_by_key(|_, value| Self::sort_key(value));
     }
 
@@ -2115,10 +2123,7 @@ pub trait SortedPhaseItem: PhaseItem {
     /// 3D transparent phases that need to be depth sorted, it populates the
     /// `distance` field with the actual distance from the view. For other
     /// phases, this method is generally a no-op.
-    fn recalculate_sort_keys(
-        items: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        view: &ExtractedView,
-    );
+    fn recalculate_sort_keys(items: &mut SortedPhaseItems<Self>, view: &ExtractedView);
 
     /// Whether this phase item targets indexed meshes (those with both vertex
     /// and index buffers as opposed to just vertex buffers).
@@ -2232,9 +2237,200 @@ impl RenderBin {
 
 #[cfg(test)]
 mod tests {
+    use core::{hash::BuildHasher, ops::Range};
+
+    use bevy_ecs::entity::{Entity, EntityIndex};
+    use bevy_material::labels::DrawFunctionId;
     use proptest_derive::Arbitrary;
 
+    use crate::sync_world::MainEntity;
+
+    use super::{
+        PhaseItem, PhaseItemExtraIndex, SortedPhaseItem, SortedPhaseItems, ViewSortedRenderPhases,
+    };
+
     use crate::render_phase::GpuRenderBinnedMeshInstance;
+
+    struct MockSortedPhaseItem {
+        entity: Entity,
+        main_entity: MainEntity,
+        sort_key: u32,
+        value: u32,
+        batch_range: Range<u32>,
+        extra_index: PhaseItemExtraIndex,
+    }
+
+    impl PhaseItem for MockSortedPhaseItem {
+        fn entity(&self) -> Entity {
+            self.entity
+        }
+
+        fn main_entity(&self) -> MainEntity {
+            self.main_entity
+        }
+
+        fn draw_function(&self) -> DrawFunctionId {
+            unimplemented!("MockSortedPhaseItem is not rendered")
+        }
+
+        fn batch_range(&self) -> &Range<u32> {
+            &self.batch_range
+        }
+
+        fn batch_range_mut(&mut self) -> &mut Range<u32> {
+            &mut self.batch_range
+        }
+
+        fn extra_index(&self) -> PhaseItemExtraIndex {
+            self.extra_index.clone()
+        }
+
+        fn batch_range_and_extra_index_mut(
+            &mut self,
+        ) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
+            (&mut self.batch_range, &mut self.extra_index)
+        }
+    }
+
+    impl SortedPhaseItem for MockSortedPhaseItem {
+        type SortKey = u32;
+
+        fn sort_key(&self) -> Self::SortKey {
+            self.sort_key
+        }
+
+        fn sort(items: &mut SortedPhaseItems<Self>) {
+            items.sort_by_key(|_, item| item.sort_key);
+        }
+
+        fn recalculate_sort_keys(_: &mut SortedPhaseItems<Self>, _: &super::ExtractedView) {}
+
+        fn indexed(&self) -> bool {
+            false
+        }
+    }
+
+    fn entity(index: u32) -> Entity {
+        Entity::from_index(EntityIndex::from_raw_u32(index).unwrap())
+    }
+
+    fn main_entity(index: u32) -> MainEntity {
+        MainEntity::from(entity(index))
+    }
+
+    fn mock_item(
+        entity: Entity,
+        main_entity: MainEntity,
+        sort_key: u32,
+        value: u32,
+    ) -> MockSortedPhaseItem {
+        MockSortedPhaseItem {
+            entity,
+            main_entity,
+            sort_key,
+            value,
+            batch_range: 0..1,
+            extra_index: PhaseItemExtraIndex::None,
+        }
+    }
+
+    #[test]
+    fn sorted_phase_item_keys_hash_both_entities() {
+        let items = SortedPhaseItems::<()>::default();
+        let fixed_main_entity = main_entity(1000);
+        let mut hashes = (0..128)
+            .map(|index| items.hasher().hash_one((entity(index), fixed_main_entity)))
+            .collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 128);
+
+        let fixed_render_entity = entity(2000);
+        let mut hashes = (0..128)
+            .map(|index| {
+                items
+                    .hasher()
+                    .hash_one((fixed_render_entity, main_entity(index)))
+            })
+            .collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 128);
+    }
+
+    #[test]
+    fn sorted_phase_items_preserve_retained_and_transient_bookkeeping() {
+        let view = super::RetainedViewEntity::new(main_entity(100), None, 0);
+        let mut phases = ViewSortedRenderPhases::<MockSortedPhaseItem>::default();
+        phases.prepare_for_new_frame(view);
+
+        let shared_render_entity = entity(1);
+        let shared_main_entity = main_entity(10);
+        let other_render_entity = entity(2);
+        let other_main_entity = main_entity(11);
+        let phase = phases.get_mut(&view).unwrap();
+
+        phase.add_retained(mock_item(shared_render_entity, shared_main_entity, 30, 1));
+        phase.add_retained(mock_item(other_render_entity, shared_main_entity, 5, 2));
+        phase.add_retained(mock_item(shared_render_entity, other_main_entity, 5, 3));
+        phase.add_retained(mock_item(other_render_entity, shared_main_entity, 5, 20));
+        phase.add_transient(mock_item(other_render_entity, other_main_entity, 0, 4));
+
+        assert_eq!(phase.items.len(), 4);
+        assert_eq!(
+            phase.items[&(other_render_entity, shared_main_entity)].value,
+            20
+        );
+        phase.sort();
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [4, 20, 3, 1]
+        );
+
+        phases.prepare_for_new_frame(view);
+        let phase = phases.get_mut(&view).unwrap();
+        assert!(phase.transient_items.is_empty());
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [1, 20, 3]
+        );
+
+        phase.sort();
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [20, 3, 1]
+        );
+        phase.remove(shared_render_entity, other_main_entity);
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [20, 1]
+        );
+        phase.remove(other_render_entity, shared_main_entity);
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.value)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+    }
 
     /// A `proptest`-based randomized test for `RenderMultidrawableBatchSet`.
     ///

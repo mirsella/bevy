@@ -5,7 +5,6 @@ use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
 use crate::{SrgbUiCompositeBindGroup, SrgbUiCompositePipelineId, SrgbUiTexture, UiCameraView};
 use bevy_color::LinearRgba;
 use bevy_ecs::{
-    entity::EntityHash,
     prelude::*,
     system::{lifetimeless::*, SystemParamItem},
 };
@@ -22,7 +21,6 @@ use bevy_render::{
     sync_world::MainEntity,
     view::*,
 };
-use indexmap::IndexMap;
 use tracing::{error, warn};
 
 pub fn ui_pass(
@@ -202,14 +200,11 @@ impl SortedPhaseItem for TransparentUi {
     }
 
     #[inline]
-    fn sort(items: &mut IndexMap<(Entity, MainEntity), TransparentUi, EntityHash>) {
+    fn sort(items: &mut SortedPhaseItems<Self>) {
         items.sort_by_key(|_, value| value.sort_key());
     }
 
-    fn recalculate_sort_keys(
-        _: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
-        _: &ExtractedView,
-    ) {
+    fn recalculate_sort_keys(_: &mut SortedPhaseItems<Self>, _: &ExtractedView) {
         // Sort keys are precalculated for UI phase items.
     }
 
