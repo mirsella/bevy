@@ -15,7 +15,7 @@ crate-type = ["dylib"]
 zstd_c = ["dep:zstd-sys"]
 
 [dependencies]
-zstd-sys = { version = "2.1", git = "https://github.com/mirsella/zstd-rs", rev = "3584905375db2204148aab7f090750aa14d3a373", default-features = false, features = ["rust-dylib"], optional = true }
+zstd-sys = { version = "2.1", git = "https://github.com/mirsella/zstd-rs", rev = "1ccb2e0b9919736293897c4c69bb74758b0a3471", default-features = false, features = ["rust-dylib"], optional = true }
 bevy_internal = { path = "../bevy_internal", version = "0.19.1", default-features = false }
 
 [lints]

@@ -733,7 +733,7 @@ hotpatching = ["bevy_internal/hotpatching"]
 debug = ["bevy_internal/debug"]
 
 [patch.crates-io]
-zstd-sys = { git = "https://github.com/mirsella/zstd-rs", rev = "3584905375db2204148aab7f090750aa14d3a373" }
+zstd-sys = { git = "https://github.com/mirsella/zstd-rs", rev = "1ccb2e0b9919736293897c4c69bb74758b0a3471" }
 
 [dependencies]
 bevy_internal = { path = "crates/bevy_internal", version = "0.19.1", default-features = false }
