@@ -72,7 +72,17 @@ pub fn ui_pass(
         occlusion_query_set: None,
         multiview_mask: None,
     });
-    let pass_span = diagnostics.pass_span(&mut render_pass, "ui");
+    // Main-world camera identity survives temporary render-view recreation and separates
+    // cameras with the same order. Construct diagnostic labels only when recording.
+    let pass_span = diagnostics.map(|diagnostics| {
+        diagnostics.pass_span(
+            &mut render_pass,
+            format!(
+                "ui/camera_{}_{}/draw",
+                camera.order, *extracted_view.retained_view_entity.main_entity
+            ),
+        )
+    });
 
     if let Some(viewport) = camera.viewport.as_ref() {
         render_pass.set_camera_viewport(viewport);
@@ -82,11 +92,13 @@ pub fn ui_pass(
         error!("Error encountered while rendering the ui phase {err:?}");
     }
 
-    pass_span.end(&mut render_pass);
+    if let Some(pass_span) = pass_span {
+        pass_span.end(&mut render_pass);
+    }
 }
 
 pub fn srgb_ui_composite_pass(
-    view: ViewQuery<(&UiCameraView, &ViewTarget)>,
+    view: ViewQuery<(&UiCameraView, &ViewTarget, &ExtractedCamera)>,
     ui_view_query: Query<
         (
             &ExtractedView,
@@ -99,7 +111,7 @@ pub fn srgb_ui_composite_pass(
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let (ui_camera_view, target) = view.into_inner();
+    let (ui_camera_view, target, camera) = view.into_inner();
     let ui_view_entity = ui_camera_view.0;
 
     let Ok((extracted_view, composite_bind_group, pipeline_id)) = ui_view_query.get(ui_view_entity)
@@ -131,6 +143,7 @@ pub fn srgb_ui_composite_pass(
         return;
     };
 
+    let diagnostics = ctx.diagnostic_recorder();
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("srgb_ui_composite_pass"),
         color_attachments: &[Some(target.get_unsampled_color_attachment())],
@@ -139,10 +152,22 @@ pub fn srgb_ui_composite_pass(
         occlusion_query_set: None,
         multiview_mask: None,
     });
+    let pass_span = diagnostics.as_deref().map(|diagnostics| {
+        diagnostics.pass_span(
+            &mut render_pass,
+            format!(
+                "ui/camera_{}_{}/srgb_composite",
+                camera.order, *extracted_view.retained_view_entity.main_entity
+            ),
+        )
+    });
 
     render_pass.set_render_pipeline(pipeline);
     render_pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
     render_pass.draw(0..3, 0..1);
+    if let Some(pass_span) = pass_span {
+        pass_span.end(&mut render_pass);
+    }
 }
 
 pub struct TransparentUi {
