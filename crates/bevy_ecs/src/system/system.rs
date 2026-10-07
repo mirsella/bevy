@@ -230,8 +230,12 @@ pub(crate) fn check_system_change_tick(
     last_run: &mut Tick,
     check: CheckChangeTicks,
     system_name: DebugName,
+    has_run: bool,
 ) {
-    if last_run.check_tick(check) {
+    // New systems start at the oldest observable tick so their first run sees all changes.
+    // A run condition can keep that sentinel alive for a long time. Clamp it normally, but
+    // it does not mean the system has missed previously observed changes.
+    if last_run.check_tick(check) && has_run {
         let age = check.present_tick().relative_to(*last_run).get();
         warn!(
             "System '{system_name}' has not run for {age} ticks. \

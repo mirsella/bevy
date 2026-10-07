@@ -131,7 +131,7 @@ pub struct SparseBufferUpdateBindGroups {
     /// the bind group for that buffer goes away as well.
     bind_groups: WeakKeyHashMap<Weak<SparseBufferId>, SparseBufferUpdateBindGroup>,
     /// The ID of the update shader pipeline shared among all sparse buffers.
-    pipeline_id: CachedComputePipelineId,
+    pipeline_id: Option<CachedComputePipelineId>,
 }
 
 /// A single bind group for the sparse buffer update shader.
@@ -210,6 +210,10 @@ fn update_sparse_buffers(
     if sparse_buffer_update_jobs.is_empty() {
         return;
     }
+    let Some(pipeline_id) = sparse_buffer_update_bind_groups.pipeline_id else {
+        error!("sparse buffer update jobs were queued on an unsupported device");
+        return;
+    };
 
     // We need to create a command encoder since this pass isn't associated with
     // a view.
@@ -224,9 +228,7 @@ fn update_sparse_buffers(
 
     command_encoder.push_debug_group("sparse buffer update");
 
-    let Some(compute_pipeline) =
-        pipeline_cache.get_compute_pipeline(sparse_buffer_update_bind_groups.pipeline_id)
-    else {
+    let Some(compute_pipeline) = pipeline_cache.get_compute_pipeline(pipeline_id) else {
         return;
     };
 
@@ -841,11 +843,15 @@ impl FromWorld for SparseBufferUpdateBindGroups {
                 let pipeline_cache = world.resource::<PipelineCache>();
                 let sparse_buffer_update_pipelines =
                     world.resource::<SparseBufferUpdatePipelines>();
-                let pipeline_id = specialized_sparse_buffer_update_pipelines.specialize(
-                    pipeline_cache,
-                    sparse_buffer_update_pipelines,
-                    (),
-                );
+                // Unsupported devices use full buffer uploads. Do not queue a compute pipeline
+                // whose shader and bind group layout deliberately do not exist on that device.
+                let pipeline_id = sparse_buffer_update_pipelines.shader.as_ref().map(|_| {
+                    specialized_sparse_buffer_update_pipelines.specialize(
+                        pipeline_cache,
+                        sparse_buffer_update_pipelines,
+                        (),
+                    )
+                });
 
                 SparseBufferUpdateBindGroups {
                     bind_groups: WeakKeyHashMap::default(),

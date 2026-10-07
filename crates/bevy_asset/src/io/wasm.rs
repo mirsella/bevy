@@ -56,6 +56,18 @@ impl HttpWasmAssetReader {
 
 fn js_value_to_err(context: &str) -> impl FnOnce(JsValue) -> std::io::Error + '_ {
     move |value| {
+        // Error/DOMException fields are non-enumerable, so JSON.stringify commonly produces
+        // only "{}" and hides the actual network or abort reason.
+        if let Some(error) = value.dyn_ref::<js_sys::Error>() {
+            return std::io::Error::other(format!(
+                "Failed to {context}: {}: {}",
+                error.name(),
+                error.message()
+            ));
+        }
+        if let Some(message) = value.as_string() {
+            return std::io::Error::other(format!("Failed to {context}: {message}"));
+        }
         let message = match JSON::stringify(&value) {
             Ok(js_str) => format!("Failed to {context}: {js_str}"),
             Err(_) => {

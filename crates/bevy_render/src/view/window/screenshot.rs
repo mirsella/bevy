@@ -14,9 +14,7 @@ use crate::{
 };
 use alloc::{borrow::Cow, sync::Arc};
 use bevy_app::{First, Plugin, Update};
-use bevy_asset::{
-    embedded_asset, load_embedded_asset, AssetServer, Assets, Handle, RenderAssetUsages,
-};
+use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle, RenderAssetUsages};
 use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget};
 use bevy_derive::{Deref, DerefMut};
 use bevy_diagnostic::FrameCount;
@@ -24,7 +22,7 @@ use bevy_ecs::{
     entity::EntityHashMap, message::message_update_system, prelude::*, system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
-use bevy_log::{error, info, warn};
+use bevy_log::{debug, error, info, warn};
 use bevy_material::{
     bind_group_layout_entries::{binding_types::texture_2d, BindGroupLayoutEntries},
     descriptor::{
@@ -38,7 +36,7 @@ use bevy_reflect::Reflect;
 use bevy_shader::{Shader, ShaderCacheError};
 use bevy_tasks::AsyncComputeTaskPool;
 use bevy_utils::default;
-use bevy_window::{PrimaryWindow, Window, WindowRef};
+use bevy_window::{PrimaryWindow, WindowRef};
 use std::{
     path::Path,
     sync::{
@@ -96,10 +94,15 @@ pub struct Screenshot(pub RenderTarget);
 ///
 /// Rendering still occurs at the target's native resolution. The completed frame is resized on the
 /// GPU before readback, so this does not affect cameras, UI layout, or the presented image.
-/// Both dimensions must be nonzero and no larger than the render target.
-#[derive(Component, Deref, DerefMut, Reflect, Debug)]
+/// Dimensions are resolved against the render target at capture time.
+#[derive(Component, Clone, Copy, Reflect, Debug)]
 #[reflect(Component, Debug)]
-pub struct ScreenshotResolution(pub UVec2);
+pub enum ScreenshotResolution {
+    /// Nonzero dimensions no larger than the render target.
+    Exact(UVec2),
+    /// A finite scale in (0, 1], with dimensions rounded up.
+    Scale(f32),
+}
 
 /// A marker component that indicates that a screenshot is currently being captured.
 #[derive(Component, Default)]
@@ -144,7 +147,7 @@ struct ScreenshotPreparedState {
 
 struct RenderScreenshotTarget {
     target: NormalizedRenderTarget,
-    resolution: Option<UVec2>,
+    resolution: Option<ScreenshotResolution>,
     failed: bool,
     frame_count: u32,
 }
@@ -234,10 +237,15 @@ fn clear_screenshots(mut commands: Commands, screenshots: Query<Entity, With<Cap
 pub fn trigger_screenshots(
     mut commands: Commands,
     captured_screenshots: ResMut<CapturedScreenshots>,
+    requests: Query<(), With<Screenshot>>,
 ) {
     let captured_screenshots = captured_screenshots.lock().unwrap();
     while let Ok(capture) = captured_screenshots.try_recv() {
-        commands.entity(capture.entity).insert(Captured);
+        // The owner may cancel a request while GPU readback is in flight.
+        if !requests.contains(capture.entity) {
+            continue;
+        }
+        commands.entity(capture.entity).try_insert(Captured);
         commands.trigger(capture);
     }
 }
@@ -251,9 +259,6 @@ fn extract_screenshots(
             SystemState<(
                 Commands,
                 Query<Entity, With<PrimaryWindow>>,
-                Query<(Entity, &'static Window)>,
-                Res<Assets<Image>>,
-                Res<ManualTextureViews>,
                 Query<(Entity, &Screenshot, Option<&ScreenshotResolution>), Without<Capturing>>,
             )>,
         >,
@@ -273,7 +278,7 @@ fn extract_screenshots(
     }
     let frame_count = main_world.resource::<FrameCount>().0;
     let system_state = system_state.get_or_insert_with(|| SystemState::new(&mut main_world));
-    let (mut commands, primary_window, windows, images, manual_texture_views, screenshots) =
+    let (mut commands, primary_window, screenshots) =
         system_state.get_mut(&mut main_world).unwrap();
 
     seen_targets.clear();
@@ -281,12 +286,6 @@ fn extract_screenshots(
     let primary_window = primary_window.iter().next();
 
     for (entity, screenshot, resolution) in screenshots.iter() {
-        let resolution = resolution.map(|resolution| resolution.0);
-        if resolution.is_some_and(|resolution| resolution.x == 0 || resolution.y == 0) {
-            error!("Screenshot resolution must be nonzero, skipping entity {entity}");
-            commands.entity(entity).despawn();
-            continue;
-        }
         let render_target = screenshot.0.clone();
         let Some(render_target) = render_target.normalize(primary_window) else {
             warn!(
@@ -300,36 +299,18 @@ fn extract_screenshots(
             commands.entity(entity).despawn();
             continue;
         }
-        let Ok(info) =
-            render_target.get_render_target_info(windows.iter(), &images, &manual_texture_views)
-        else {
-            // The requested asset or window may become available on a later frame.
-            continue;
-        };
-        if let Some(resolution) = resolution
-            && (resolution.x > info.physical_size.x || resolution.y > info.physical_size.y)
-        {
-            error!(
-                "Screenshot resolution {resolution} exceeds render target size {}, skipping entity {entity}",
-                info.physical_size
-            );
-            commands.entity(entity).despawn();
-            continue;
-        }
         if !seen_targets.insert(render_target.clone()) {
-            warn!(
-                "Duplicate render target for screenshot, skipping entity {}: {:?}",
+            debug!(
+                "Another screenshot owns this render target this frame; deferring entity {}: {:?}",
                 entity, render_target
             );
-            // If we don't despawn the entity here, it will be captured again in the next frame
-            commands.entity(entity).despawn();
             continue;
         }
         targets.insert(
             entity,
             RenderScreenshotTarget {
                 target: render_target,
-                resolution,
+                resolution: resolution.copied(),
                 failed: false,
                 frame_count,
             },
@@ -375,9 +356,13 @@ fn prepare_screenshots(
             &images,
             &manual_texture_views,
         )) else {
-            warn!(target = ?request.target, "Unknown render target for screenshot, skipping");
+            // Suspended windows do not have an acquired surface. Retry when rendering resumes.
+            debug!(target = ?request.target, "Screenshot target is not available this frame");
             continue;
         };
+        if size.width == 0 || size.height == 0 {
+            continue;
+        }
         let pipeline_id = pipelines.specialize(&pipeline_cache, &screenshot_pipeline, view_format);
         pipeline_cache.block_on_render_pipeline(pipeline_id);
         match pipeline_cache.get_render_pipeline_state(pipeline_id) {
@@ -394,15 +379,34 @@ fn prepare_screenshots(
                 continue;
             }
         }
-        let output_size = request.resolution.map_or(size, |resolution| Extent3d {
+        let resolution = match request.resolution {
+            Some(ScreenshotResolution::Exact(resolution)) => Some(resolution),
+            Some(ScreenshotResolution::Scale(scale))
+                if scale.is_finite() && scale > 0.0 && scale <= 1.0 =>
+            {
+                Some(scaled_resolution(size, scale))
+            }
+            Some(ScreenshotResolution::Scale(_)) => {
+                error!("Screenshot scale must be in (0, 1]; cancelling entity {entity}");
+                request.failed = true;
+                continue;
+            }
+            None => None,
+        };
+        let output_size = resolution.map_or(size, |resolution| Extent3d {
             width: resolution.x,
             height: resolution.y,
             ..default()
         });
-        assert!(
-            output_size.width <= size.width && output_size.height <= size.height,
-            "screenshot resolution must not exceed the render target"
-        );
+        if output_size.width == 0
+            || output_size.height == 0
+            || output_size.width > size.width
+            || output_size.height > size.height
+        {
+            error!("Screenshot resolution must be nonzero and fit the current target; cancelling entity {entity}");
+            request.failed = true;
+            continue;
+        }
         let texture = render_device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot-capture-rendertarget"),
             size,
@@ -461,6 +465,13 @@ fn prepare_screenshots(
             OutputColorAttachment::new(texture_view, view_format),
         );
     }
+}
+
+fn scaled_resolution(size: Extent3d, scale: f32) -> UVec2 {
+    UVec2::new(
+        ((size.width as f32 * scale).ceil() as u32).clamp(1, size.width),
+        ((size.height as f32 * scale).ceil() as u32).clamp(1, size.height),
+    )
 }
 
 pub struct ScreenshotPlugin;
@@ -738,6 +749,7 @@ mod tests {
         texture::ManualTextureView,
     };
     use bevy_app::App;
+    use bevy_asset::Assets;
     use bevy_ecs::system::RunSystemOnce;
     use bevy_tasks::{block_on, TaskPool};
 
@@ -803,7 +815,7 @@ mod tests {
             },
         );
         if let Some(resolution) = resolution {
-            entity.insert(ScreenshotResolution(resolution));
+            entity.insert(ScreenshotResolution::Exact(resolution));
         }
         let entity = entity.id();
         app.sub_app_mut(RenderApp)
@@ -840,13 +852,20 @@ mod tests {
 
     #[test]
     fn screenshot_waits_for_shader_and_retries_original_request() {
-        for (resolution, synchronous) in [
-            (None, true),
-            (None, false),
-            (Some(UVec2::splat(2)), true),
-            (Some(UVec2::splat(2)), false),
+        for (resolution, scale, synchronous) in [
+            (None, None, true),
+            (None, None, false),
+            (Some(UVec2::splat(2)), None, true),
+            (Some(UVec2::splat(2)), None, false),
+            (None, Some(0.5), true),
+            (None, Some(0.5), false),
         ] {
             let (mut app, entity, shader) = setup(resolution, synchronous);
+            if let Some(scale) = scale {
+                app.world_mut()
+                    .entity_mut(entity)
+                    .insert(ScreenshotResolution::Scale(scale));
+            }
             let target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
             let original_view = app
                 .sub_app(RenderApp)
@@ -944,13 +963,57 @@ mod tests {
             }
             assert_eq!(
                 app.world().resource::<Captures>().0,
-                [(entity, resolution.unwrap_or(UVec2::splat(4)), capture_frame)]
+                [(
+                    entity,
+                    resolution.unwrap_or(UVec2::splat(if scale.is_some() { 2 } else { 4 })),
+                    capture_frame
+                )]
             );
             assert_ne!(capture_frame, creation_frame.wrapping_add(1));
             assert_ne!(capture_frame, app.world().resource::<FrameCount>().0);
             app.world_mut().run_system_once(clear_screenshots).unwrap();
             assert!(app.world().get_entity(entity).is_err());
         }
+    }
+
+    #[test]
+    fn scaled_capture_uses_the_current_portrait_target() {
+        let size = Extent3d {
+            width: 288,
+            height: 480,
+            depth_or_array_layers: 1,
+        };
+        assert_eq!(scaled_resolution(size, 0.5), UVec2::new(144, 240));
+        assert_eq!(
+            scaled_resolution(
+                Extent3d {
+                    width: 1,
+                    height: 3,
+                    ..size
+                },
+                0.5
+            ),
+            UVec2::new(1, 2)
+        );
+    }
+
+    #[test]
+    fn cancelled_readback_does_not_trigger_observers() {
+        let (mut app, entity, _) = setup(None, true);
+        app.world_mut().despawn(entity);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.world_mut()
+            .insert_resource(CapturedScreenshots(Arc::new(Mutex::new(rx))));
+        tx.send(ScreenshotCaptured {
+            entity,
+            image: Image::default(),
+            frame_count: 0,
+        })
+        .unwrap();
+        app.world_mut()
+            .run_system_once(trigger_screenshots)
+            .unwrap();
+        assert!(app.world().resource::<Captures>().0.is_empty());
     }
 
     #[test]

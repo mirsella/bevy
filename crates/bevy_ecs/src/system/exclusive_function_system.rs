@@ -136,6 +136,7 @@ where
 
             world.flush();
             self.system_meta.last_run = world.increment_change_tick();
+            self.system_meta.has_run = true;
 
             IntoResult::into_result(out)
         })
@@ -179,6 +180,7 @@ where
             &mut self.system_meta.last_run,
             check,
             self.system_meta.name.clone(),
+            self.system_meta.has_run,
         );
     }
 
