@@ -16,6 +16,8 @@
 //! - A picking backend only has one job: read [`PointerLocation`](crate::pointer::PointerLocation)
 //!   components and produce [`PointerHits`] events. In plain English, a backend is provided the
 //!   location of pointers, and is asked to provide a list of entities under those pointers.
+//!   Register it in [`crate::Picking`], in [`crate::PickingSystems::Backend`].
+//!   It may run more than once per frame to hit-test ordered input transitions.
 //!
 //! - The [`PointerHits`] events produced by a backend do **not** need to be sorted or filtered, all
 //!   that is needed is an unordered list of entities and their [`HitData`].
@@ -45,7 +47,7 @@ pub mod prelude {
     pub use super::{ray::RayMap, HitData, HitDataExtra, PointerHits};
     pub use crate::{
         pointer::{PointerId, PointerLocation},
-        Pickable, PickingSystems,
+        Pickable, Picking, PickingSystems,
     };
 }
 
@@ -85,9 +87,11 @@ impl<T: Send + Sync + fmt::Debug + Any + 'static> HitDataExtra for T {}
 /// Some backends may only support providing the topmost entity; this is a valid limitation. For
 /// example, a picking shader might only have data on the topmost rendered output from its buffer.
 ///
-/// Note that systems reading these messages in [`PreUpdate`](bevy_app::PreUpdate) will not report ordering
-/// ambiguities with picking backends. Take care to ensure such systems are explicitly ordered
-/// against [`PickingSystems::Backend`](crate::PickingSystems::Backend), or better, avoid reading `PointerHits` in `PreUpdate`.
+/// Hits are cleared before each [`crate::Picking`] pass. Readers must run in that
+/// schedule after [`PickingSystems::Backend`](crate::PickingSystems::Backend).
+/// Explicit ordering is required: ambiguity reporting is disabled for this message.
+/// Application systems can read [`crate::hover::HoverMap`] for the final hover state
+/// or pointer-event messages for every dispatched transition.
 #[derive(Message, Debug, Clone, Reflect)]
 #[reflect(Debug, Clone)]
 pub struct PointerHits {

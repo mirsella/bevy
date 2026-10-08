@@ -77,7 +77,7 @@ pub struct UiPickingPlugin;
 impl Plugin for UiPickingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiPickingSettings>()
-            .add_systems(PreUpdate, ui_picking.in_set(PickingSystems::Backend));
+            .add_systems(Picking, ui_picking.in_set(PickingSystems::Backend));
     }
 }
 

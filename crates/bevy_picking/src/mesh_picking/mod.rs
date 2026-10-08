@@ -69,7 +69,7 @@ pub struct MeshPickingPlugin;
 impl Plugin for MeshPickingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MeshPickingSettings>()
-            .add_systems(PreUpdate, update_hits.in_set(PickingSystems::Backend));
+            .add_systems(Picking, update_hits.in_set(PickingSystems::Backend));
     }
 }
 

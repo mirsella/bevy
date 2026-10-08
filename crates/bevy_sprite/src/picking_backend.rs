@@ -80,7 +80,7 @@ pub struct SpritePickingPlugin;
 impl Plugin for SpritePickingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SpritePickingSettings>()
-            .add_systems(PreUpdate, sprite_picking.in_set(PickingSystems::Backend));
+            .add_systems(Picking, sprite_picking.in_set(PickingSystems::Backend));
     }
 }
 
