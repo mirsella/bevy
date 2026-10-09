@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::{
     backend::{self, HitData},
-    pointer::{PointerAction, PointerId, PointerInputBatch, PointerInteraction, PointerPress},
+    pointer::{PointerAction, PointerId, PointerInput, PointerInteraction, PointerPress},
     Pickable,
 };
 
@@ -98,7 +98,7 @@ pub fn generate_hovermap(
     pickable: Query<&Pickable>,
     pointers: Query<&PointerId>,
     mut pointer_hits_reader: MessageReader<backend::PointerHits>,
-    pointer_inputs: Res<PointerInputBatch>,
+    mut pointer_input_reader: MessageReader<PointerInput>,
     // Local
     mut over_map: Local<OverMap>,
     // Output
@@ -111,7 +111,11 @@ pub fn generate_hovermap(
         &mut over_map,
         &pointers,
     );
-    build_over_map(&mut pointer_hits_reader, &mut over_map, &pointer_inputs);
+    build_over_map(
+        &mut pointer_hits_reader,
+        &mut over_map,
+        &mut pointer_input_reader,
+    );
     build_hover_map(&pointers, pickable, &over_map, &mut hover_map);
 }
 
@@ -144,11 +148,10 @@ fn reset_maps(
 fn build_over_map(
     pointer_hit_reader: &mut MessageReader<backend::PointerHits>,
     pointer_over_map: &mut Local<OverMap>,
-    pointer_inputs: &PointerInputBatch,
+    pointer_input_reader: &mut MessageReader<PointerInput>,
 ) {
-    let cancelled_pointers: HashSet<PointerId> = pointer_inputs
-        .inputs
-        .iter()
+    let cancelled_pointers: HashSet<PointerId> = pointer_input_reader
+        .read()
         .filter_map(|p| {
             if let PointerAction::Cancel = p.action {
                 Some(p.pointer_id)

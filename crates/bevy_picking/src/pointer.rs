@@ -286,16 +286,6 @@ pub struct PointerInput {
     pub action: PointerAction,
 }
 
-/// Inputs sharing one hit snapshot in the current [`crate::Picking`] pass.
-///
-/// Picking systems read this resource; application systems should read the full
-/// [`PointerInput`] message stream instead. The runner reuses its allocation.
-#[derive(Resource, Default)]
-pub struct PointerInputBatch {
-    /// Ordered inputs in this pass.
-    pub inputs: Vec<PointerInput>,
-}
-
 impl PointerInput {
     /// Creates a new pointer input event.
     ///
@@ -330,46 +320,52 @@ impl PointerInput {
 
     /// Updates pointer entities according to the input events.
     pub fn receive(
-        events: Res<PointerInputBatch>,
+        mut events: MessageReader<PointerInput>,
         mut pointers: Query<(&PointerId, &mut PointerLocation, &mut PointerPress)>,
     ) {
-        for event in &events.inputs {
-            for (id, mut location, mut press) in &mut pointers {
-                if *id != event.pointer_id {
-                    continue;
+        for event in events.read() {
+            match event.action {
+                PointerAction::Press(button) => {
+                    pointers
+                        .iter_mut()
+                        .for_each(|(pointer_id, _, mut pointer)| {
+                            if *pointer_id == event.pointer_id {
+                                match button {
+                                    PointerButton::Primary => pointer.primary = true,
+                                    PointerButton::Secondary => pointer.secondary = true,
+                                    PointerButton::Middle => pointer.middle = true,
+                                }
+                            }
+                        });
                 }
-                // A release may carry a new position without an intervening Move.
-                // Backends must hit-test that position, not the last movement sample.
-                location.set_if_neq(PointerLocation::new(event.location.clone()));
-                match event.action {
-                    PointerAction::Press(button) | PointerAction::Release(button) => {
-                        let down = matches!(event.action, PointerAction::Press(_));
-                        match button {
-                            PointerButton::Primary => press.primary = down,
-                            PointerButton::Secondary => press.secondary = down,
-                            PointerButton::Middle => press.middle = down,
+                PointerAction::Release(button) => {
+                    pointers
+                        .iter_mut()
+                        .for_each(|(pointer_id, _, mut pointer)| {
+                            if *pointer_id == event.pointer_id {
+                                match button {
+                                    PointerButton::Primary => pointer.primary = false,
+                                    PointerButton::Secondary => pointer.secondary = false,
+                                    PointerButton::Middle => pointer.middle = false,
+                                }
+                            }
+                        });
+                }
+                PointerAction::Move { .. } => {
+                    pointers.iter_mut().for_each(|(id, mut pointer, _)| {
+                        if *id == event.pointer_id {
+                            pointer.location = Some(event.location.to_owned());
+                        }
+                    });
+                }
+                PointerAction::Cancel => {
+                    for (id, _, mut state) in &mut pointers {
+                        if *id == event.pointer_id {
+                            state.set_if_neq(PointerPress::default());
                         }
                     }
-                    PointerAction::Cancel => *press = PointerPress::default(),
-                    _ => {}
                 }
-            }
-        }
-    }
-
-    // Keep the cancellation location available to Out/Cancel observers, then
-    // deactivate the pointer so later passes cannot hover it again.
-    pub(crate) fn finish(
-        events: Res<PointerInputBatch>,
-        mut pointers: Query<(&PointerId, &mut PointerLocation)>,
-    ) {
-        for event in &events.inputs {
-            if matches!(event.action, PointerAction::Cancel) {
-                for (id, mut location) in &mut pointers {
-                    if *id == event.pointer_id {
-                        location.location = None;
-                    }
-                }
+                _ => {}
             }
         }
     }

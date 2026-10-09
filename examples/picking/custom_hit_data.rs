@@ -36,7 +36,7 @@ fn main() {
         .init_resource::<HoveredTriangles>()
         .add_systems(Startup, (setup_gizmos, setup_scene))
         .add_systems(
-            bevy::picking::Picking,
+            PreUpdate,
             (
                 custom_backend_system.in_set(PickingSystems::Backend),
                 cache_hovered_triangles.after(PickingSystems::Backend),

@@ -162,13 +162,11 @@ pub mod hover;
 pub mod input;
 #[cfg(feature = "mesh_picking")]
 pub mod mesh_picking;
-mod pipeline;
 pub mod pointer;
 pub mod window;
 
 use bevy_app::{prelude::*, PluginGroupBuilder};
 use bevy_ecs::prelude::*;
-use bevy_ecs::schedule::ScheduleLabel;
 use bevy_reflect::prelude::*;
 use hover::{update_is_directly_hovered, update_is_hovered};
 
@@ -185,7 +183,7 @@ pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
         events::*, input::PointerInputPlugin, pointer::PointerButton, DefaultPickingPlugins,
-        InteractionPlugin, Pickable, Picking, PickingPlugin,
+        InteractionPlugin, Pickable, PickingPlugin,
     };
 }
 
@@ -255,14 +253,6 @@ impl Default for Pickable {
     }
 }
 
-/// Hit testing and event dispatch for one batch of pointer inputs.
-///
-/// Runs within [`PreUpdate`], once for ordinary movement or stationary pointers,
-/// and again when a press, release or cancellation needs a different hit snapshot.
-/// Register picking backends here, in [`PickingSystems::Backend`].
-#[derive(Debug, Hash, PartialEq, Eq, Clone, ScheduleLabel)]
-pub struct Picking;
-
 /// Groups the stages of the picking process under shared labels.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum PickingSystems {
@@ -271,19 +261,18 @@ pub enum PickingSystems {
     /// Runs after input events are generated but before commands are flushed. In the [`First`]
     /// schedule.
     PostInput,
-    /// Receives the current input batch. In the [`Picking`] schedule.
+    /// Receives and processes pointer input events. In the [`PreUpdate`] schedule.
     ProcessInput,
-    /// Reads inputs and produces [`backend::PointerHits`]s. In the [`Picking`] schedule.
+    /// Reads inputs and produces [`backend::PointerHits`]s. In the [`PreUpdate`] schedule.
     Backend,
     /// Reads [`backend::PointerHits`]s, and updates the hovermap, selection, and highlighting states. In
-    /// the [`Picking`] schedule.
+    /// the [`PreUpdate`] schedule.
     Hover,
-    /// Runs after all picking passes and their observers. In the [`PreUpdate`] schedule.
+    /// Runs after all the [`PickingSystems::Hover`] systems are done, before event listeners are triggered. In the
+    /// [`PreUpdate`] schedule.
     PostHover,
     /// Runs after all other picking sets. In the [`PreUpdate`] schedule.
     Last,
-    /// Runs the ordered [`Picking`] passes. In the [`PreUpdate`] schedule.
-    Run,
 }
 
 /// One plugin that contains the [`PointerInputPlugin`](input::PointerInputPlugin), [`PickingPlugin`]
@@ -379,8 +368,6 @@ pub struct PickingPlugin;
 impl Plugin for PickingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PickingSettings>()
-            .init_resource::<pointer::PointerInputBatch>()
-            .init_schedule(Picking)
             .init_resource::<pointer::PointerMap>()
             .init_resource::<backend::ray::RayMap>()
             .add_message::<pointer::PointerInput>()
@@ -391,12 +378,6 @@ impl Plugin for PickingPlugin {
             .allow_ambiguous_resource::<Messages<backend::PointerHits>>()
             .add_systems(
                 PreUpdate,
-                pipeline::run
-                    .in_set(PickingSystems::Run)
-                    .run_if(|settings: Res<PickingSettings>| settings.is_enabled),
-            )
-            .add_systems(
-                Picking,
                 (
                     pointer::update_pointer_map,
                     pointer::PointerInput::receive,
@@ -405,14 +386,10 @@ impl Plugin for PickingPlugin {
                     .in_set(PickingSystems::ProcessInput),
             )
             .add_systems(
-                Picking,
+                PreUpdate,
                 window::update_window_hits
                     .run_if(PickingSettings::window_picking_should_run)
                     .in_set(PickingSystems::Backend),
-            )
-            .add_systems(
-                Picking,
-                pointer::PointerInput::finish.after(PickingSystems::Hover),
             )
             .configure_sets(
                 First,
@@ -422,18 +399,11 @@ impl Plugin for PickingPlugin {
                     .chain(),
             )
             .configure_sets(
-                Picking,
+                PreUpdate,
                 (
                     PickingSystems::ProcessInput.run_if(PickingSettings::input_should_run),
                     PickingSystems::Backend,
                     PickingSystems::Hover.run_if(PickingSettings::hover_should_run),
-                )
-                    .chain(),
-            )
-            .configure_sets(
-                PreUpdate,
-                (
-                    PickingSystems::Run,
                     PickingSystems::PostHover,
                     PickingSystems::Last,
                 )
@@ -473,7 +443,7 @@ impl Plugin for InteractionPlugin {
             .add_message::<Pointer<Release>>()
             .add_message::<Pointer<Scroll>>()
             .add_systems(
-                Picking,
+                PreUpdate,
                 (
                     generate_hovermap,
                     update_interactions,

@@ -23,8 +23,9 @@
 //!
 //! The order in which interaction events are received is extremely important, and you can read more
 //! about it on the docs for the dispatcher system: [`pointer_events`]. This system runs in
-//! [`Picking`](crate::Picking) in [`PickingSystems::Hover`](crate::PickingSystems::Hover).
-//! Pointer observers resolve before the next picking pass.
+//! [`PreUpdate`](bevy_app::PreUpdate) in [`PickingSystems::Hover`](crate::PickingSystems::Hover). All pointer-event
+//! observers resolve during the sync point between [`pointer_events`] and
+//! [`update_interactions`](crate::hover::update_interactions).
 //!
 //! # Events Types
 //!
@@ -59,10 +60,7 @@ use tracing::debug;
 use crate::{
     backend::{prelude::PointerLocation, HitData},
     hover::{get_hovered_entities, is_directly_hovered, HoverMap, PreviousHoverMap},
-    pointer::{
-        Location, PointerAction, PointerButton, PointerId, PointerInput, PointerInputBatch,
-        PointerMap,
-    },
+    pointer::{Location, PointerAction, PointerButton, PointerId, PointerInput, PointerMap},
     PickingSettings,
 };
 
@@ -177,6 +175,7 @@ impl<E: Debug + Clone + Reflect> Pointer<E> {
 }
 
 /// Fires when a pointer is canceled, and its current interaction state is dropped.
+/// Sent to previously hovered entities and any entities still pressed by the pointer.
 #[derive(Clone, PartialEq, Debug, Reflect)]
 #[reflect(Clone, PartialEq)]
 pub struct Cancel {
@@ -618,7 +617,7 @@ pub struct PickingMessageWriters<'w> {
 
 /// Dispatches interaction events to the target entities.
 ///
-/// Within a single picking pass, events are dispatched in the following order:
+/// Within a single frame, events are dispatched in the following order:
 /// + [`Out`] → [`Leave`] → [`DragLeave`].
 /// + [`DragEnter`] → [`Enter`] → [`Over`].
 /// + Any number of any of the following:
@@ -626,7 +625,7 @@ pub struct PickingMessageWriters<'w> {
 ///   + For each button press: [`Press`] or [`Click`] → [`Release`] → [`DragDrop`] → [`DragEnd`] → [`DragLeave`].
 ///   + For each pointer cancellation: [`Cancel`].
 ///
-/// Additionally, across multiple picking passes, the following are also strictly
+/// Additionally, across multiple frames, the following are also strictly
 /// ordered by the interaction state machine:
 /// + When a pointer moves over the target:
 ///   [`Over`], [`Enter`], [`Move`], [`Leave`], [`Out`].
@@ -647,7 +646,7 @@ pub struct PickingMessageWriters<'w> {
 /// When the pointer goes from hovering entity A to entity B, entity A will
 /// receive [`Out`] and [`Leave`] and then entity B will receive [`Enter`] and [`Over`].
 /// No entity will ever receive both an [`Over`] and an [`Out`] or
-/// an [`Enter`] and a [`Leave`] event during the same picking pass.
+/// an [`Enter`] and a [`Leave`] event during the same frame.
 ///
 /// When we account for event bubbling, the two pairs of events,
 /// [`Out`] [`Over`] and [`Enter`] [`Leave`], behave differently. When the hovering focus shifts
@@ -655,17 +654,20 @@ pub struct PickingMessageWriters<'w> {
 /// the case of [`Enter`] → [`Leave`], shared parent entities will not receive [`Enter`]
 /// or [`Leave`].
 ///
-/// [`Click`] targets entities hovered at release that were also pressed. Touch
-/// pointers must remain alive through event dispatch, including when a press and
-/// release arrive in the same frame. [`Release`] also reaches the original press
-/// targets after the pointer leaves them, so they can always clear held state.
+/// Both [`Click`] and [`Release`] target entities hovered in the *previous frame*,
+/// unless the same pointer button has an unmatched press earlier in this frame. In that case, they use the
+/// current hover map, like [`Press`]. This includes touch pointers that begin and end in the
+/// same frame. These events can be received sequentially after an [`Out`] event (but always
+/// on the same frame as the [`Out`] event).
 ///
-/// Movement samples within a picking pass share its final hover state. Press,
-/// release and cancellation boundaries run in separate passes when needed, so
-/// their targets are hit-tested at the corresponding input position.
+/// Note: Though it is common for the [`PointerInput`] stream may contain
+/// multiple pointer movements and presses each frame, the hover state is
+/// determined only by the pointer's *final position*. Since the hover state
+/// ultimately determines which entities receive events, this may mean that an
+/// entity can receive events from before or after it was actually hovered.
 pub fn pointer_events(
     // Input
-    input_events: Res<PointerInputBatch>,
+    mut input_events: MessageReader<PointerInput>,
     // ECS State
     pointers: Query<&PointerLocation>,
     ancestors_query: Query<&ChildOf>,
@@ -677,6 +679,7 @@ pub fn pointer_events(
     mut hovered_entity_ancestors: Local<HoveredEntityAncestors>,
     mut sent_leave: Local<HashSet<(PointerId, Entity)>>,
     mut sent_enter: Local<HashSet<(PointerId, Entity)>>,
+    mut just_pressed: Local<HashSet<(PointerId, PointerButton)>>,
     // Output
     mut commands: Commands,
     mut message_writers: PickingMessageWriters,
@@ -692,11 +695,12 @@ pub fn pointer_events(
     hovered_entity_ancestors.rebuild(&hover_map, &pointer_state, &ancestors_query);
     sent_leave.clear();
     sent_enter.clear();
+    just_pressed.clear();
 
     // If the entity was hovered by a specific pointer last frame...
     for (pointer_id, hovered_entity, hit) in previous_hover_map
         .iter()
-        .flat_map(|(id, hashmap)| hashmap.iter().map(|(entity, hit)| (*id, *entity, hit)))
+        .flat_map(|(id, hashmap)| hashmap.iter().map(|data| (*id, *data.0, data.1.clone())))
     {
         // ...but is now not being hovered by that same pointer...
         if !hover_map
@@ -796,7 +800,7 @@ pub fn pointer_events(
     // Iterate all currently hovered entities for each pointer
     for (pointer_id, hovered_entity, hit) in hover_map
         .iter()
-        .flat_map(|(id, hashmap)| hashmap.iter().map(|(entity, hit)| (*id, *entity, hit)))
+        .flat_map(|(id, hashmap)| hashmap.iter().map(|data| (*id, *data.0, data.1.clone())))
     {
         // Continue if the pointer does not have a valid location.
         let Some(location) = pointer_location(pointer_id) else {
@@ -914,11 +918,11 @@ pub fn pointer_events(
         pointer_id,
         location,
         action,
-    } in &input_events.inputs
+    } in input_events.read().cloned()
     {
-        let pointer_id = *pointer_id;
-        match *action {
+        match action {
             PointerAction::Press(button) => {
+                just_pressed.insert((pointer_id, button));
                 let state = pointer_state.get_mut(pointer_id, button);
                 state.clicking.retain(|_, (last_click, _)| {
                     now - *last_click <= picking_settings.multi_click_interval
@@ -928,7 +932,7 @@ pub fn pointer_events(
                 for (hovered_entity, hit) in hover_map
                     .get(&pointer_id)
                     .iter()
-                    .flat_map(|h| h.iter().map(|(entity, hit)| (*entity, hit)))
+                    .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.clone())))
                 {
                     let count = state
                         .clicking
@@ -950,7 +954,7 @@ pub fn pointer_events(
                     // Also insert the press into the state
                     state
                         .pressing
-                        .insert(hovered_entity, (location.clone(), now, hit.clone()));
+                        .insert(hovered_entity, (location.clone(), now, hit));
                 }
             }
             PointerAction::Release(button) => {
@@ -959,18 +963,14 @@ pub fn pointer_events(
                     now - *last_click <= picking_settings.multi_click_interval
                 });
 
-                // Current hits may click; original press targets outside them only release.
-                let hovered = hover_map.get(&pointer_id);
-                let pressing = &state.pressing;
-                let hovered_targets = hovered.into_iter().flatten().map(|(entity, hit)| {
-                    (*entity, hit, pressing.get(entity).map(|(_, time, _)| *time))
-                });
-                let outside_targets = pressing
-                    .iter()
-                    .filter(|(entity, _)| hovered.is_none_or(|hits| !hits.contains_key(*entity)))
-                    .map(|(entity, (_, _, hit))| (*entity, hit, None));
-                for (hovered_entity, hit, press_instant) in hovered_targets.chain(outside_targets) {
-                    if let Some(press_instant) = press_instant {
+                let targets = if just_pressed.remove(&(pointer_id, button)) {
+                    hover_map.get(&pointer_id)
+                } else {
+                    previous_hover_map.get(&pointer_id)
+                };
+                for (&hovered_entity, hit) in targets.into_iter().flat_map(|hits| hits.iter()) {
+                    // If this pointer previously pressed the hovered entity, emit a Click event
+                    if let Some((_, press_instant, _)) = state.pressing.get(&hovered_entity) {
                         let count = state
                             .clicking
                             .get(&hovered_entity)
@@ -982,7 +982,7 @@ pub fn pointer_events(
                             Click {
                                 button,
                                 hit: hit.clone(),
-                                duration: now - press_instant,
+                                duration: now - *press_instant,
                                 count,
                             },
                             hovered_entity,
@@ -1027,7 +1027,7 @@ pub fn pointer_events(
                         location.clone(),
                         DragEnd {
                             button,
-                            distance: location.position - drag.start_pos,
+                            distance: drag.latest_pos - drag.start_pos,
                         },
                         drag_target,
                     );
@@ -1091,7 +1091,7 @@ pub fn pointer_events(
                         for (hovered_entity, hit) in hover_map
                             .get(&pointer_id)
                             .iter()
-                            .flat_map(|h| h.iter().map(|(entity, hit)| (*entity, hit)))
+                            .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.to_owned())))
                             .filter(|(hovered_entity, _)| *hovered_entity != *press_target)
                         {
                             // Inserting the `dragging_over` state here ensures the `DragEnter` event won't be dispatched twice.
@@ -1137,7 +1137,7 @@ pub fn pointer_events(
                         for (hovered_entity, hit) in hover_map
                             .get(&pointer_id)
                             .iter()
-                            .flat_map(|h| h.iter().map(|(entity, hit)| (*entity, hit)))
+                            .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.to_owned())))
                             .filter(|(hovered_entity, _)| *hovered_entity != *drag_target)
                         {
                             let drag_over_event = Pointer::new(
@@ -1159,7 +1159,7 @@ pub fn pointer_events(
                 for (hovered_entity, hit) in hover_map
                     .get(&pointer_id)
                     .iter()
-                    .flat_map(|h| h.iter().map(|(entity, hit)| (*entity, hit)))
+                    .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.to_owned())))
                 {
                     // Emit Move events to the entities we are hovering
                     let move_event = Pointer::new(
@@ -1179,7 +1179,7 @@ pub fn pointer_events(
                 for (hovered_entity, hit) in hover_map
                     .get(&pointer_id)
                     .iter()
-                    .flat_map(|h| h.iter().map(|(entity, hit)| (*entity, hit)))
+                    .flat_map(|h| h.iter().map(|(entity, data)| (*entity, data.clone())))
                 {
                     // Emit Scroll events to the entities we are hovering
                     let scroll_event = Pointer::new(
@@ -1200,8 +1200,11 @@ pub fn pointer_events(
             }
             // Canceled
             PointerAction::Cancel => {
-                // Cancelled pointers are excluded from the current hover map. Recover
-                // their targets from the last hover and all outstanding button presses.
+                // Hits for canceled pointers are excluded from the current hover map.
+                let hovered = previous_hover_map
+                    .get(&pointer_id)
+                    .into_iter()
+                    .flat_map(|hits| hits.iter());
                 let pressed = PointerButton::iter()
                     .filter_map(|button| pointer_state.get(pointer_id, button))
                     .flat_map(|state| {
@@ -1210,17 +1213,16 @@ pub fn pointer_events(
                             .iter()
                             .map(|(entity, (_, _, hit))| (entity, hit))
                     });
-                let hovered = previous_hover_map.get(&pointer_id).into_iter().flatten();
                 let mut sent = EntityHashSet::default();
-                for (entity, hit) in pressed.chain(hovered) {
-                    if !sent.insert(*entity) {
+                for (&entity, hit) in hovered.chain(pressed) {
+                    if !sent.insert(entity) {
                         continue;
                     }
                     let cancel_event = Pointer::new(
                         pointer_id,
                         location.clone(),
                         Cancel { hit: hit.clone() },
-                        *entity,
+                        entity,
                     );
                     commands.trigger(cancel_event.clone());
                     message_writers.cancel_events.write(cancel_event);
@@ -1231,9 +1233,6 @@ pub fn pointer_events(
         }
     }
 }
-
-#[cfg(test)]
-mod touch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1256,7 +1255,6 @@ mod tests {
             .init_resource::<PreviousHoverMap>()
             .init_resource::<PickingSettings>()
             .init_resource::<PointerState>()
-            .init_resource::<PointerInputBatch>()
             .add_message::<PointerInput>()
             .add_message::<Pointer<Cancel>>()
             .add_message::<Pointer<Click>>()
@@ -1307,6 +1305,200 @@ mod tests {
         app.world_mut()
             .insert_resource(PreviousHoverMap(previous_hover_map));
         app.world_mut().insert_resource(hover_map);
+    }
+
+    fn touch_test_app() -> (App, Entity, [Entity; 2]) {
+        use crate::{backend::PointerHits, DefaultPickingPlugins, PickingSystems};
+        use bevy_app::PreUpdate;
+        use bevy_input::InputPlugin;
+        use bevy_math::Rect;
+        use bevy_window::{PrimaryWindow, WindowPlugin};
+
+        let mut app = App::new();
+        app.add_plugins((InputPlugin, WindowPlugin::default(), DefaultPickingPlugins));
+        app.world_mut()
+            .resource_mut::<PickingSettings>()
+            .is_window_picking_enabled = false;
+        app.update();
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        let first = app.world_mut().spawn_empty().id();
+        let second = app.world_mut().spawn_empty().id();
+        let targets = [
+            (first, Rect::from_corners(Vec2::ZERO, Vec2::splat(100.))),
+            (
+                second,
+                Rect::from_corners(Vec2::new(200., 0.), Vec2::new(300., 100.)),
+            ),
+        ];
+        app.add_systems(
+            PreUpdate,
+            (move |pointers: Query<(&PointerId, &PointerLocation)>,
+                   mut hits: MessageWriter<PointerHits>| {
+                for (id, location) in &pointers {
+                    let Some(location) = location.location() else {
+                        continue;
+                    };
+                    for (entity, bounds) in &targets {
+                        if bounds.contains(location.position) {
+                            hits.write(PointerHits::new(
+                                *id,
+                                vec![(*entity, HitData::new(window, 0., None, None))],
+                                0.,
+                            ));
+                        }
+                    }
+                }
+            })
+            .in_set(PickingSystems::Backend),
+        );
+        (app, window, [first, second])
+    }
+
+    fn touch(app: &mut App, window: Entity, phase: TouchPhase, position: Vec2) {
+        let touch = bevy_input::touch::TouchInput {
+            window,
+            phase,
+            position,
+            force: None,
+            id: 42,
+        };
+        app.world_mut().write_message(touch);
+        app.world_mut()
+            .write_message(bevy_window::WindowEvent::TouchInput(touch));
+    }
+
+    #[test]
+    fn touch_cancellation_reaches_pressed_target() {
+        use crate::pointer::PointerPress;
+        #[derive(Resource, Default)]
+        struct Observed(Vec<Entity>);
+
+        for move_to_second in [false, true] {
+            let (mut app, window, [first, second]) = touch_test_app();
+            app.init_resource::<Observed>();
+            touch(&mut app, window, TouchPhase::Started, Vec2::splat(50.));
+            app.update();
+            assert_eq!(app.world().resource::<Messages<Pointer<Press>>>().len(), 1);
+            let pointer = app
+                .world()
+                .resource::<PointerMap>()
+                .get_entity(PointerId::Touch(42))
+                .unwrap();
+            assert!(app
+                .world()
+                .get::<PointerPress>(pointer)
+                .unwrap()
+                .is_primary_pressed());
+            for target in [first, second] {
+                app.world_mut().entity_mut(target).observe(
+                    move |event: On<Pointer<Cancel>>,
+                          pointers: Query<&PointerPress>,
+                          mut observed: ResMut<Observed>| {
+                        assert!(!pointers.get(pointer).unwrap().is_any_pressed());
+                        observed.0.push(event.entity);
+                    },
+                );
+            }
+            let position = if move_to_second {
+                Vec2::new(250., 50.)
+            } else {
+                Vec2::splat(50.)
+            };
+            if move_to_second {
+                touch(&mut app, window, TouchPhase::Moved, position);
+                app.update();
+            }
+            touch(&mut app, window, TouchPhase::Canceled, position);
+            app.update();
+            let mut expected = if move_to_second {
+                vec![first, second]
+            } else {
+                vec![first]
+            };
+            expected.sort_unstable();
+            let mut canceled: Vec<_> = app
+                .world_mut()
+                .resource_mut::<Messages<Pointer<Cancel>>>()
+                .drain()
+                .map(|event| event.entity)
+                .collect();
+            canceled.sort_unstable();
+            assert_eq!(canceled, expected, "move_to_second={move_to_second}");
+            let mut observed = app.world_mut().resource_mut::<Observed>();
+            observed.0.sort_unstable();
+            assert_eq!(observed.0, expected, "move_to_second={move_to_second}");
+        }
+    }
+
+    #[test]
+    fn touch_started_and_ended_in_one_frame() {
+        for seed_previous_hover in [false, true] {
+            for separate_frames in [false, true] {
+                let (mut app, window, [first, second]) = touch_test_app();
+                if seed_previous_hover {
+                    for phase in [TouchPhase::Started, TouchPhase::Ended] {
+                        touch(&mut app, window, phase, Vec2::splat(50.));
+                        app.update();
+                    }
+                    assert!(app
+                        .world()
+                        .resource::<HoverMap>()
+                        .get(&PointerId::Touch(42))
+                        .unwrap()
+                        .contains_key(&first));
+                    app.world_mut()
+                        .resource_mut::<Messages<Pointer<Press>>>()
+                        .clear();
+                    app.world_mut()
+                        .resource_mut::<Messages<Pointer<Click>>>()
+                        .clear();
+                    app.world_mut()
+                        .resource_mut::<Messages<Pointer<Release>>>()
+                        .clear();
+                }
+                touch(&mut app, window, TouchPhase::Started, Vec2::new(250., 50.));
+                if separate_frames {
+                    app.update();
+                }
+                touch(&mut app, window, TouchPhase::Ended, Vec2::new(250., 50.));
+                app.update();
+                let pressed: Vec<_> = app
+                    .world_mut()
+                    .resource_mut::<Messages<Pointer<Press>>>()
+                    .drain()
+                    .map(|event| (event.entity, event.pointer_id))
+                    .collect();
+                let clicked: Vec<_> = app
+                    .world_mut()
+                    .resource_mut::<Messages<Pointer<Click>>>()
+                    .drain()
+                    .map(|event| (event.entity, event.pointer_id))
+                    .collect();
+                let released: Vec<_> = app
+                    .world_mut()
+                    .resource_mut::<Messages<Pointer<Release>>>()
+                    .drain()
+                    .map(|event| (event.entity, event.pointer_id))
+                    .collect();
+                let expected = [(second, PointerId::Touch(42))];
+                assert_eq!(
+                    pressed, expected,
+                    "seed_previous_hover={seed_previous_hover}, separate_frames={separate_frames}"
+                );
+                assert_eq!(
+                    clicked, expected,
+                    "seed_previous_hover={seed_previous_hover}, separate_frames={separate_frames}"
+                );
+                assert_eq!(
+                    released, expected,
+                    "seed_previous_hover={seed_previous_hover}, separate_frames={separate_frames}"
+                );
+            }
+        }
     }
 
     #[test]
