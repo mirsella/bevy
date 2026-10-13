@@ -1,242 +1,95 @@
-#import bevy_render::view::View
-#import bevy_ui::ui_node::draw_uinode
+#define_import_path bevy_ui::gradient
 
 #import bevy_render::color_operations::{
-    convert_to_linear_rgba,
-    mix_oklch,
-    mix_oklch_long,
-    mix_hsv,
-    mix_hsv_long,
-    mix_hsl,
-    mix_hsl_long,
-    oklch_to_linear_rgb,
-    hsv_to_linear_rgb,
-    hsl_to_linear_rgb,
-    oklab_to_linear_rgb,
+    mix_oklch, mix_oklch_long, mix_hsv, mix_hsv_long, mix_hsl, mix_hsl_long,
+    oklch_to_linear_rgb, hsv_to_linear_rgb, hsl_to_linear_rgb, oklab_to_linear_rgb,
     srgb_to_linear,
 }
-
 #import bevy_render::maths::PI
+#import bevy_ui::paint::read_paint
 
-const TAU: f32 = 2. * PI;
-
-// must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
-const RADIAL: u32 = 16u;
-const FILL_START: u32 = 32u;
-const FILL_END: u32 = 64u;
-const CONIC: u32 = 128u;
-
-fn enabled(flags: u32, mask: u32) -> bool {
-    return (flags & mask) != 0u;
+struct Gradient {
+    start: vec2<f32>,
+    direction: vec2<f32>,
+    kind: u32,
+    color_space: u32,
+    stops_start: u32,
+    stops_count: u32,
 }
 
-@group(0) @binding(0) var<uniform> view: View;
-
-struct GradientVertexOutput {
-    @location(1) @interpolate(flat) size: vec2<f32>,
-    @location(2) @interpolate(flat) flags: u32,
-    @location(3) @interpolate(flat) radius: vec4<f32>,
-    @location(4) @interpolate(flat) border: vec4<f32>,    
-
-    // Position relative to the center of the rectangle.
-    @location(5) point: vec2<f32>,
-    @location(6) @interpolate(flat) g_start: vec2<f32>,
-    @location(7) @interpolate(flat) dir: vec2<f32>,
-    @location(8) @interpolate(flat) start_color: vec4<f32>,
-    @location(9) @interpolate(flat) start_len: f32,
-    @location(10) @interpolate(flat) end_len: f32,
-    @location(11) @interpolate(flat) end_color: vec4<f32>,
-    @location(12) @interpolate(flat) hint: f32,
-    @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vertex(
-    @location(0) vertex_position: vec3<f32>,
-    @location(1) flags: u32,
-
-    // x: top left, y: top right, z: bottom right, w: bottom left.
-    @location(2) radius: vec4<f32>,
-
-    // x: left, y: top, z: right, w: bottom.
-    @location(3) border: vec4<f32>,
-    @location(4) size: vec2<f32>,
-    @location(5) point: vec2<f32>,
-    @location(6) @interpolate(flat) g_start: vec2<f32>,
-    @location(7) @interpolate(flat) dir: vec2<f32>,
-    @location(8) @interpolate(flat) start_color: vec4<f32>,
-    @location(9) @interpolate(flat) start_len: f32,
-    @location(10) @interpolate(flat) end_len: f32,
-    @location(11) @interpolate(flat) end_color: vec4<f32>,
-    @location(12) @interpolate(flat) hint: f32
-) -> GradientVertexOutput {
-    var out: GradientVertexOutput;
-    out.position = view.clip_from_world * vec4(vertex_position, 1.0);
-    out.size = size;
-    out.flags = flags;
-    out.radius = radius;
-    out.border = border;
-    out.point = point;
-    out.dir = dir;
-    out.start_color = start_color;
-    out.start_len = start_len;
-    out.end_len = end_len;
-    out.end_color = end_color;
-    out.g_start = g_start;
-    out.hint = hint;
-
-    return out;
-}
-
-@fragment
-fn fragment(in: GradientVertexOutput) -> @location(0) vec4<f32> {
-    var g_distance: f32;
-    if enabled(in.flags, RADIAL) {
-        g_distance = radial_distance(in.point, in.g_start, in.dir.x);
-    } else if enabled(in.flags, CONIC) {
-        g_distance = conic_distance(in.dir.x, in.point, in.g_start);
-    } else {
-        g_distance = linear_distance(in.point, in.g_start, in.dir);
-    }
-
-    let gradient_color = interpolate_gradient(
-        g_distance,
-        in.start_color,
-        in.start_len,
-        in.end_color,
-        in.end_len,
-        in.hint,
-        in.flags
-    );
-
-    return draw_uinode(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
-}
-
-fn rem_euclid(a: f32, b: f32) -> f32 {
-    return ((a % b) + b) % b;
-}
-
-// These functions are used to calculate the distance in gradient space from the start of the gradient to the point.
-// The distance in gradient space is then used to interpolate between the start and end colors.
-
-fn linear_distance(
-    point: vec2<f32>,
-    g_start: vec2<f32>,
-    g_dir: vec2<f32>,
-) -> f32 {
-    return dot(point - g_start, g_dir);
-}
-
-fn radial_distance(
-    point: vec2<f32>,
-    center: vec2<f32>,
-    ratio: f32,
-) -> f32 {
-    let d = point - center;
-    return length(vec2(d.x, d.y * ratio));
-}
-
-fn conic_distance(
-    start: f32,
-    point: vec2<f32>,
-    center: vec2<f32>,
-) -> f32 {
-    let d = point - center;
-    let angle = atan2(-d.x, d.y) + PI;
-    return (((angle - start) % TAU) + TAU) % TAU;
-}
-
-// Mix the colors, choosing the appropriate interpolation method for the given color space
-fn mix_colors(
-    start_color: vec3<f32>,
-    end_color: vec3<f32>,
-    t: f32,
-) -> vec3<f32> {
-#ifdef IN_OKLCH
-    return mix_oklch(start_color, end_color, t);
-#else ifdef IN_OKLCH_LONG
-    return mix_oklch_long(start_color, end_color, t);
-#else ifdef IN_HSV
-    return mix_hsv(start_color, end_color, t);
-#else ifdef IN_HSV_LONG
-    return mix_hsv_long(start_color, end_color, t);
-#else ifdef IN_HSL
-    return mix_hsl(start_color, end_color, t);
-#else ifdef IN_HSL_LONG
-    return mix_hsl_long(start_color, end_color, t);
-#else
-    // Just lerp in linear RGBA, OkLab and SRGBA spaces
-    return mix(start_color, end_color, t);
-#endif
-}
-
-// Convert a color from the interpolation color space to linear rgba
-fn convert_to_linear_rgba(
+struct ColorStop {
     color: vec4<f32>,
-) -> vec4<f32> {
-#ifdef IN_OKLCH
-    let rgb = oklch_to_linear_rgb(color.xyz);
-#else ifdef IN_OKLCH_LONG
-    let rgb = oklch_to_linear_rgb(color.xyz);
-#else ifdef IN_HSV
-    let rgb = hsv_to_linear_rgb(color.xyz);
-#else ifdef IN_HSV_LONG
-    let rgb = hsv_to_linear_rgb(color.xyz);
-#else ifdef IN_HSL
-    let rgb = hsl_to_linear_rgb(color.xyz);
-#else ifdef IN_HSL_LONG
-    let rgb = hsl_to_linear_rgb(color.xyz);
-#else ifdef IN_OKLAB
-    let rgb = oklab_to_linear_rgb(color.xyz);
-#else ifdef IN_SRGB
-    let rgb = srgb_to_linear(color.xyz);
-#else
-    // Color is already in linear rgba space
-    let rgb = color.rgb;
-#endif
+    point: f32,
+    hint: f32,
+}
+
+fn load_gradient(address: u32) -> Gradient {
+    let geometry = bitcast<vec4<f32>>(read_paint(address));
+    let metadata = read_paint(address + 1u);
+    return Gradient(geometry.xy, geometry.zw, metadata.x, metadata.y, metadata.z, metadata.w);
+}
+
+fn load_stop(address: u32, index: u32) -> ColorStop {
+    let color = bitcast<vec4<f32>>(read_paint(address + index * 2u));
+    let position = bitcast<vec4<f32>>(read_paint(address + index * 2u + 1u));
+    return ColorStop(color, position.x, position.y);
+}
+
+fn to_linear(color: vec4<f32>, space: u32) -> vec4<f32> {
+    var rgb = color.rgb;
+    switch space {
+        case 1u: { rgb = srgb_to_linear(rgb); }
+        case 2u: { rgb = oklab_to_linear_rgb(rgb); }
+        case 3u, 4u: { rgb = oklch_to_linear_rgb(rgb); }
+        case 5u, 6u: { rgb = hsl_to_linear_rgb(rgb); }
+        case 7u, 8u: { rgb = hsv_to_linear_rgb(rgb); }
+        default: {}
+    }
     return vec4(rgb, color.a);
 }
 
-fn interpolate_gradient(
-    distance: f32,
-    start_color: vec4<f32>,
-    start_distance: f32,
-    end_color: vec4<f32>,
-    end_distance: f32,
-    hint: f32,
-    flags: u32,
-) -> vec4<f32> {
-    if start_distance == end_distance {
-        if distance <= start_distance && enabled(flags, FILL_START) {
-            return convert_to_linear_rgba(start_color);
-        }
-        if start_distance <= distance && enabled(flags, FILL_END) {
-            return convert_to_linear_rgba(end_color);
-        }
-        return vec4(0.);
+fn mix_colors(a: vec3<f32>, b: vec3<f32>, t: f32, space: u32) -> vec3<f32> {
+    switch space {
+        case 3u: { return mix_oklch(a, b, t); }
+        case 4u: { return mix_oklch_long(a, b, t); }
+        case 5u: { return mix_hsl(a, b, t); }
+        case 6u: { return mix_hsl_long(a, b, t); }
+        case 7u: { return mix_hsv(a, b, t); }
+        case 8u: { return mix_hsv_long(a, b, t); }
+        default: { return mix(a, b, t); }
     }
+}
 
-    var t = (distance - start_distance) / (end_distance - start_distance);
-
-    if t < 0.0 {
-        if enabled(flags, FILL_START) {
-            return convert_to_linear_rgba(start_color);
-        }
-        return vec4(0.0);
+fn sample_gradient(index: u32, point: vec2<f32>) -> vec4<f32> {
+    let gradient = load_gradient(index);
+    let offset = point - gradient.start;
+    var distance = dot(offset, gradient.direction);
+    if gradient.kind == 1u {
+        distance = length(vec2(offset.x, offset.y * gradient.direction.x));
+    } else if gradient.kind == 2u {
+        let angle = atan2(-offset.x, offset.y) + PI - gradient.direction.x;
+        distance = ((angle % (2.0 * PI)) + 2.0 * PI) % (2.0 * PI);
     }
+    let last_index = gradient.stops_count - 1u;
+    let first = load_stop(gradient.stops_start, 0u);
+    let last = load_stop(gradient.stops_start, last_index);
+    if distance < first.point { return to_linear(first.color, gradient.color_space); }
+    if distance >= last.point || last_index == 0u { return to_linear(last.color, gradient.color_space); }
 
-    if 1. < t {
-        if enabled(flags, FILL_END) {
-            return convert_to_linear_rgba(end_color);
-        }
-        return vec4(0.0);
+    // Resolve one segment, including hard stops, rather than rasterizing the node
+    // once per segment. Equal-position stops select the color on their right.
+    var low = 0u;
+    var high = last_index;
+    var a = first;
+    var b = last;
+    while high - low > 1u {
+        let mid = low + (high - low) / 2u;
+        let stop = load_stop(gradient.stops_start, mid);
+        if stop.point <= distance { low = mid; a = stop; }
+        else { high = mid; b = stop; }
     }
-
-    if t < hint {
-        t = 0.5 * t / hint;
-    } else {
-        t = 0.5 * (1 + (t - hint) / (1.0 - hint));
-    }
-
-    return convert_to_linear_rgba(vec4(mix_colors(start_color.xyz, end_color.xyz, t), mix(start_color.a, end_color.a, t)));
+    var t = (distance - a.point) / (b.point - a.point);
+    if t < a.hint { t = 0.5 * t / a.hint; }
+    else { t = 0.5 * (1.0 + (t - a.hint) / (1.0 - a.hint)); }
+    return to_linear(vec4(mix_colors(a.color.rgb, b.color.rgb, t, gradient.color_space), mix(a.color.a, b.color.a, t)), gradient.color_space);
 }

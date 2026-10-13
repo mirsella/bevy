@@ -3,7 +3,6 @@ use super::ExtractedUiNode;
 use super::ExtractedUiNodes;
 use super::NodeType;
 use super::UiCameraMap;
-use crate::shader_flags;
 use bevy_asset::AssetId;
 use bevy_camera::visibility::InheritedVisibility;
 use bevy_color::Hsla;
@@ -236,7 +235,7 @@ pub fn extract_debug_overlay(
                     flip_y: false,
                     border,
                     border_radius: radius,
-                    node_type: NodeType::Border(shader_flags::BORDER_ALL),
+                    node_type: NodeType::Outline,
                 },
                 main_entity: entity.into(),
             });

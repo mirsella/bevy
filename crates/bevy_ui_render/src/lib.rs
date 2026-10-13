@@ -9,9 +9,9 @@
 
 pub mod box_shadow;
 pub mod clipping;
-mod gradient;
 mod pipeline;
 pub mod render_pass;
+mod surface;
 mod text;
 pub mod ui_material;
 mod ui_material_pipeline;
@@ -32,9 +32,8 @@ use bevy_ui::widget::{
     ImageNode, ImageNodeSize, NodeImageMode, TextOutline, TextScroll, TextShadow, ViewportNode,
 };
 use bevy_ui::{
-    BackgroundColor, BorderColor, CalculatedClip, ComputedNode, ComputedStackIndex,
-    ComputedUiTargetCamera, Display, Node, OuterColor, Outline, ResolvedBorderRadius,
-    UiGlobalTransform, VisualBox,
+    CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiTargetCamera, Display, Node,
+    OuterColor, Outline, ResolvedBorderRadius, UiGlobalTransform, VisualBox,
 };
 
 use bevy_app::prelude::*;
@@ -64,7 +63,7 @@ use bevy_sprite::BorderRect;
 #[cfg(feature = "bevy_ui_debug")]
 pub use debug_overlay::{GlobalUiDebugOptions, UiDebugOptions};
 
-use gradient::GradientPlugin;
+use surface::SurfacePlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
@@ -114,9 +113,8 @@ pub mod prelude {
 pub mod stack_z_offsets {
     pub const BOX_SHADOW: f32 = -0.1;
     pub const BACKGROUND_COLOR: f32 = 0.0;
-    pub const BORDER: f32 = 0.01;
-    pub const GRADIENT: f32 = 0.02;
-    pub const BORDER_GRADIENT: f32 = 0.03;
+    pub const OUTER_COLOR: f32 = 0.005;
+    pub const OUTLINE: f32 = 0.01;
     pub const IMAGE: f32 = 0.04;
     pub const MATERIAL: f32 = 0.05;
     pub const TEXT_SELECTION: f32 = 0.055;
@@ -133,14 +131,13 @@ pub enum RenderUiSystems {
     ExtractBackgrounds,
     ExtractImages,
     ExtractTextureSlice,
-    ExtractBorders,
+    ExtractOutlines,
     ExtractViewportNodes,
     ExtractTextBackgrounds,
     ExtractTextShadows,
     ExtractText,
     ExtractCursor,
     ExtractDebug,
-    ExtractGradient,
 }
 
 /// Marker for controlling whether UI is rendered with or without anti-aliasing
@@ -242,7 +239,7 @@ impl Plugin for UiRenderPlugin {
                     RenderUiSystems::ExtractBackgrounds,
                     RenderUiSystems::ExtractImages,
                     RenderUiSystems::ExtractTextureSlice,
-                    RenderUiSystems::ExtractBorders,
+                    RenderUiSystems::ExtractOutlines,
                     RenderUiSystems::ExtractTextBackgrounds,
                     RenderUiSystems::ExtractTextShadows,
                     RenderUiSystems::ExtractText,
@@ -258,9 +255,9 @@ impl Plugin for UiRenderPlugin {
                     extract_ui_camera_view
                         .after(extract_cameras)
                         .in_set(RenderUiSystems::ExtractCameraViews),
-                    extract_uinode_background_colors.in_set(RenderUiSystems::ExtractBackgrounds),
+                    extract_uinode_outer_colors.in_set(RenderUiSystems::ExtractBackgrounds),
                     extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
-                    extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
+                    extract_uinode_outlines.in_set(RenderUiSystems::ExtractOutlines),
                     extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
                     extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
                     extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
@@ -298,7 +295,7 @@ impl Plugin for UiRenderPlugin {
             );
 
         app.add_plugins(UiTextureSlicerPlugin);
-        app.add_plugins(GradientPlugin);
+        app.add_plugins(SurfacePlugin);
         app.add_plugins(BoxShadowPlugin);
     }
 }
@@ -369,9 +366,7 @@ pub enum NodeType {
     Rect,
     Viewport,
     Inverted,
-    Border(u32), // shader flags
-    /// The node's background color, which can be covered by its own gradient.
-    Background,
+    Outline,
 }
 
 pub enum ExtractedUiItem {
@@ -410,19 +405,16 @@ pub struct ExtractedGlyph {
 pub struct ExtractedUiNodes {
     pub uinodes: Vec<ExtractedUiNode>,
     pub glyphs: Vec<ExtractedGlyph>,
-    /// Nodes with an opaque covering gradient whose render pipeline is ready this frame.
-    pub(crate) covered_backgrounds: HashSet<MainEntity>,
 }
 
 impl ExtractedUiNodes {
     pub fn clear(&mut self) {
         self.uinodes.clear();
         self.glyphs.clear();
-        self.covered_backgrounds.clear();
     }
 }
 
-pub fn extract_uinode_background_colors(
+pub fn extract_uinode_outer_colors(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     uinode_query: Extract<
@@ -434,78 +426,45 @@ pub fn extract_uinode_background_colors(
             &InheritedVisibility,
             Option<&CalculatedClip>,
             &ComputedUiTargetCamera,
-            &BackgroundColor,
-            Option<&OuterColor>,
+            &OuterColor,
         )>,
     >,
     camera_map: Extract<UiCameraMap>,
 ) {
     let mut camera_mapper = camera_map.get_mapper();
-
-    for (
-        entity,
-        uinode,
-        stack_index,
-        transform,
-        inherited_visibility,
-        clip,
-        camera,
-        background_color,
-        maybe_outer_color,
-    ) in &uinode_query
-    {
-        // Skip invisible backgrounds
-        if !inherited_visibility.get()
-            || (background_color.is_fully_transparent()
-                && maybe_outer_color.is_none_or(|outer| outer.is_fully_transparent()))
-            || uinode.is_empty()
-            || clipping::rect_is_clipped(clip, transform.into(), uinode.size())
+    for (entity, node, stack, transform, visibility, clip, camera, color) in &uinode_query {
+        if !visibility.get()
+            || color.is_fully_transparent()
+            || node.is_empty()
+            || clipping::rect_is_clipped(clip, transform.into(), node.size())
         {
             continue;
         }
-
-        let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
+        let Some(camera) = camera_mapper.map(camera) else {
             continue;
         };
-
-        for (color, border, node_type) in [
-            (
-                Some(background_color.0),
-                uinode.border(),
-                NodeType::Background,
-            ),
-            (
-                maybe_outer_color.map(|outer| outer.0),
-                BorderRect::ZERO,
-                NodeType::Inverted,
-            ),
-        ] {
-            let Some(color) = color.filter(|color| !color.is_fully_transparent()) else {
-                continue;
-            };
-            extracted_uinodes.uinodes.push(ExtractedUiNode {
-                render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                z_order: stack_index.0 as f32 + stack_z_offsets::BACKGROUND_COLOR,
-                clip: clip.cloned(),
-                image: AssetId::default(),
-                extracted_camera_entity,
-                transform: transform.into(),
-                item: ExtractedUiItem::Node {
-                    color: color.into(),
-                    rect: Rect {
-                        min: Vec2::ZERO,
-                        max: uinode.size,
-                    },
-                    atlas_scaling: None,
-                    flip_x: false,
-                    flip_y: false,
-                    border,
-                    border_radius: uinode.border_radius(),
-                    node_type,
+        extracted_uinodes.uinodes.push(ExtractedUiNode {
+            render_entity: commands.spawn(TemporaryRenderEntity).id(),
+            z_order: stack.0 as f32 + stack_z_offsets::OUTER_COLOR,
+            clip: clip.cloned(),
+            image: AssetId::default(),
+            extracted_camera_entity: camera,
+            transform: transform.into(),
+            main_entity: entity.into(),
+            item: ExtractedUiItem::Node {
+                color: color.0.into(),
+                rect: Rect {
+                    min: Vec2::ZERO,
+                    max: node.size(),
                 },
-                main_entity: entity.into(),
-            });
-        }
+                atlas_scaling: None,
+                flip_x: false,
+                flip_y: false,
+                border: BorderRect::ZERO,
+                border_radius: node.border_radius(),
+                node_type: NodeType::Inverted,
+            },
+        });
     }
 }
 
@@ -628,7 +587,7 @@ pub fn extract_uinode_images(
     }
 }
 
-pub fn extract_uinode_borders(
+pub fn extract_uinode_outlines(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     uinode_query: Extract<
@@ -641,7 +600,7 @@ pub fn extract_uinode_borders(
             &InheritedVisibility,
             Option<&CalculatedClip>,
             &ComputedUiTargetCamera,
-            AnyOf<(&BorderColor, &Outline)>,
+            &Outline,
         )>,
     >,
     camera_map: Extract<UiCameraMap>,
@@ -658,114 +617,45 @@ pub fn extract_uinode_borders(
         inherited_visibility,
         maybe_clip,
         camera,
-        (maybe_border_color, maybe_outline),
+        outline,
     ) in &uinode_query
     {
-        // Skip invisible borders and removed nodes
-        if !inherited_visibility.get() || node.is_some_and(|node| node.display == Display::None) {
+        if !inherited_visibility.get()
+            || node.is_some_and(|node| node.display == Display::None)
+            || computed_node.outline_width() <= 0.
+            || outline.color.is_fully_transparent()
+        {
             continue;
         }
-
+        let outline_size = computed_node.outlined_node_size();
+        if clipping::rect_is_clipped(maybe_clip, transform.into(), outline_size) {
+            continue;
+        }
         let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
             continue;
         };
-
-        // Don't extract borders with zero width along all edges
-        if computed_node.border() != BorderRect::ZERO
-            && let Some(border_color) = maybe_border_color
-            && !clipping::rect_is_clipped(maybe_clip, transform.into(), computed_node.size())
-        {
-            let border_colors = [
-                border_color.left.to_linear(),
-                border_color.top.to_linear(),
-                border_color.right.to_linear(),
-                border_color.bottom.to_linear(),
-            ];
-
-            const BORDER_FLAGS: [u32; 4] = [
-                shader_flags::BORDER_LEFT,
-                shader_flags::BORDER_TOP,
-                shader_flags::BORDER_RIGHT,
-                shader_flags::BORDER_BOTTOM,
-            ];
-            let mut completed_flags = 0;
-
-            for (i, &color) in border_colors.iter().enumerate() {
-                if color.is_fully_transparent() {
-                    continue;
-                }
-
-                let mut border_flags = BORDER_FLAGS[i];
-
-                if completed_flags & border_flags != 0 {
-                    continue;
-                }
-
-                for j in i + 1..4 {
-                    if color == border_colors[j] {
-                        border_flags |= BORDER_FLAGS[j];
-                    }
-                }
-                completed_flags |= border_flags;
-
-                extracted_uinodes.uinodes.push(ExtractedUiNode {
-                    z_order: stack_index.0 as f32 + stack_z_offsets::BORDER,
-                    image,
-                    clip: maybe_clip.cloned(),
-                    extracted_camera_entity,
-                    transform: transform.into(),
-                    item: ExtractedUiItem::Node {
-                        color,
-                        rect: Rect {
-                            max: computed_node.size(),
-                            ..Default::default()
-                        },
-                        atlas_scaling: None,
-                        flip_x: false,
-                        flip_y: false,
-                        border: computed_node.border(),
-                        border_radius: computed_node.border_radius(),
-                        node_type: NodeType::Border(border_flags),
-                    },
-                    main_entity: entity.into(),
-                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                });
-            }
-        }
-
-        if computed_node.outline_width() <= 0. {
-            continue;
-        }
-
-        if let Some(outline) = maybe_outline.filter(|outline| !outline.color.is_fully_transparent())
-        {
-            let outline_size = computed_node.outlined_node_size();
-            if clipping::rect_is_clipped(maybe_clip, transform.into(), outline_size) {
-                continue;
-            }
-            extracted_uinodes.uinodes.push(ExtractedUiNode {
-                z_order: stack_index.0 as f32 + stack_z_offsets::BORDER,
-                render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                image,
-                clip: maybe_clip.cloned(),
-                extracted_camera_entity,
-                transform: transform.into(),
-                item: ExtractedUiItem::Node {
-                    color: outline.color.into(),
-                    rect: Rect {
-                        max: outline_size,
-                        ..Default::default()
-                    },
-                    atlas_scaling: None,
-                    flip_x: false,
-                    flip_y: false,
-                    border: BorderRect::all(computed_node.outline_width()),
-                    border_radius: computed_node.outline_radius(),
-                    node_type: NodeType::Border(shader_flags::BORDER_ALL),
+        extracted_uinodes.uinodes.push(ExtractedUiNode {
+            z_order: stack_index.0 as f32 + stack_z_offsets::OUTLINE,
+            render_entity: commands.spawn(TemporaryRenderEntity).id(),
+            image,
+            clip: maybe_clip.cloned(),
+            extracted_camera_entity,
+            transform: transform.into(),
+            item: ExtractedUiItem::Node {
+                color: outline.color.into(),
+                rect: Rect {
+                    max: outline_size,
+                    ..Default::default()
                 },
-                main_entity: entity.into(),
-            });
-        }
+                atlas_scaling: None,
+                flip_x: false,
+                flip_y: false,
+                border: BorderRect::all(computed_node.outline_width()),
+                border_radius: computed_node.outline_radius(),
+                node_type: NodeType::Outline,
+            },
+            main_entity: entity.into(),
+        });
     }
 }
 
@@ -1653,17 +1543,7 @@ pub mod shader_flags {
     pub const UNTEXTURED: u32 = 0;
     /// Textured
     pub const TEXTURED: u32 = 1;
-    /// Ordering: top left, top right, bottom right, bottom left.
-    pub const CORNERS: [u32; 4] = [0, 2, 2 | 4, 4];
-    pub const RADIAL: u32 = 16;
-    pub const FILL_START: u32 = 32;
-    pub const FILL_END: u32 = 64;
-    pub const CONIC: u32 = 128;
-    pub const BORDER_LEFT: u32 = 256;
-    pub const BORDER_TOP: u32 = 512;
-    pub const BORDER_RIGHT: u32 = 1024;
-    pub const BORDER_BOTTOM: u32 = 2048;
-    pub const BORDER_ALL: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
+    pub const OUTLINE: u32 = 256;
     pub const INVERT: u32 = 4096;
     pub const VIEWPORT_TEXTURE: u32 = 8192;
     pub const TEXT_GLYPH: u32 = 16384;
@@ -1839,8 +1719,8 @@ pub fn prepare_uinodes(
 
                         let color = color.to_f32_array();
                         match *node_type {
-                            NodeType::Border(border_flags) => {
-                                flags |= border_flags;
+                            NodeType::Outline => {
+                                flags |= shader_flags::OUTLINE;
                             }
                             NodeType::Inverted => {
                                 flags |= INVERT;
@@ -1851,13 +1731,8 @@ pub fn prepare_uinodes(
                             _ => {}
                         }
 
-                        // Borders have zero coverage in the interior. Opaque gradients can
-                        // also cover a background interior, but keep both antialiased edges.
-                        let omit_interior = matches!(node_type, NodeType::Border(_))
-                            || (matches!(node_type, NodeType::Background)
-                                && extracted_uinodes
-                                    .covered_backgrounds
-                                    .contains(&extracted_uinode.main_entity));
+                        // Outlines have no coverage in the interior.
+                        let omit_interior = matches!(node_type, NodeType::Outline);
                         let hole = if omit_interior {
                             rounded_inner_rect(rect_size, *border, *border_radius)
                         } else {

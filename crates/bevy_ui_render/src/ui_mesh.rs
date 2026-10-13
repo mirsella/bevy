@@ -72,7 +72,7 @@ impl<P: PhaseItem, V: Pod + Send + Sync> RenderCommand<P> for DrawUiMesh<V> {
     }
 }
 
-/// Index-buffer range for a gradient or shadow draw. All other draw data is per vertex.
+/// Index-buffer range for a UI mesh draw, including surfaces and shadows.
 #[derive(Component)]
 pub struct UiIndexedBatch {
     pub range: Range<u32>,

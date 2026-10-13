@@ -3,12 +3,8 @@
 #import bevy_render::view::View
 
 const TEXTURED = 1u;
-// must align with BORDER_* shader_flags from bevy_ui/render/mod.rs
-const BORDER_LEFT: u32 = 256u;
-const BORDER_TOP: u32 = 512u;
-const BORDER_RIGHT: u32 = 1024u;
-const BORDER_BOTTOM: u32 = 2048u;
-const BORDER_ANY: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
+// Must match shader_flags in lib.rs.
+const OUTLINE: u32 = 256u;
 const INVERT: u32 = 4096u;
 const VIEWPORT_TEXTURE: u32 = 8192u;
 const TEXT_GLYPH: u32 = 16384u;
@@ -146,27 +142,6 @@ fn sd_inset_rounded_box(point: vec2<f32>, size: vec2<f32>, radius: vec4<f32>, in
     return sd_rounded_box(inner_point, inner_size, r);
 }
 
-fn nearest_border_active(point_vs_mid: vec2<f32>, size: vec2<f32>, width: vec4<f32>, flags: u32) -> bool {
-    if (flags & BORDER_ANY) == BORDER_ANY {
-        return true;
-    }
- 
-    // get point vs top left
-    let point = clamp(point_vs_mid + size * 0.49999, vec2(0.0), size);
- 
-    let left = point.x / width.x;
-    let top = point.y / width.y;
-    let right = (size.x - point.x) / width.z;
-    let bottom = (size.y - point.y) / width.w;
- 
-    let min_dist = min(min(left, top), min(right, bottom));
- 
-    return (enabled(flags, BORDER_LEFT) && min_dist == left) ||
-        (enabled(flags, BORDER_TOP) && min_dist == top) || 
-        (enabled(flags, BORDER_RIGHT) && min_dist == right) || 
-        (enabled(flags, BORDER_BOTTOM) && min_dist == bottom);
-}
-
 // get alpha for antialiasing for sdf
 fn antialias(distance: f32) -> f32 {
     // Using the fwidth(distance) was causing artifacts, so just use the distance.
@@ -200,12 +175,11 @@ fn composite_text_layers(
     return vec4<f32>(rgb, alpha);
 }
 
-fn border_coverage(
+fn outline_coverage(
     point: vec2<f32>,
     size: vec2<f32>,
     radius: vec4<f32>,
     border: vec4<f32>,
-    flags: u32,
 ) -> f32 {
     // Signed distances. The magnitude is the distance of the point from the edge of the shape.
     // * Negative values indicate that the point is inside the shape.
@@ -225,9 +199,6 @@ fn border_coverage(
     // outside the outside edge, or inside the inner edge have positive signed distance.
     let border_distance = max(external_distance, -internal_distance);
 
-    // check if this node should apply color for the nearest border
-    let nearest_border = select(0.0, 1.0, nearest_border_active(point, size, border, flags));
-
 #ifdef ANTI_ALIAS
     // At external edges with no border, `border_distance` is equal to zero. 
     // This select statement ensures we only perform anti-aliasing where a non-zero width border 
@@ -238,7 +209,7 @@ fn border_coverage(
     let t = 1.0 - step(0.0, border_distance);
 #endif
 
-    return t * nearest_border;
+    return t;
 }
 
 fn background_coverage(
@@ -267,8 +238,8 @@ fn node_coverage(
     border: vec4<f32>,
     flags: u32,
 ) -> f32 {
-    if enabled(flags, BORDER_ANY) {
-        return border_coverage(point, size, radius, border, flags);
+    if enabled(flags, OUTLINE) {
+        return outline_coverage(point, size, radius, border);
     }
     return background_coverage(point, size, radius, border, flags);
 }

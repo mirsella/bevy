@@ -48,6 +48,11 @@ default = ["bevy_ui_debug"]
 serialize = ["bevy_math/serialize", "bevy_platform/serialize"]
 bevy_ui_debug = []
 
+[dev-dependencies]
+bevy_tasks = { path = "../bevy_tasks", version = "0.19.1" }
+naga_oil = "0.22"
+wgpu = { version = "29.0.3", default-features = false, features = ["vulkan", "gles", "naga-ir"] }
+
 [lints]
 workspace = true
 
