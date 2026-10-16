@@ -6,7 +6,7 @@ use bevy_input_focus::InputFocus;
 use bevy_math::{Affine2, Rect, Vec2};
 use bevy_render::{sync_world::TemporaryRenderEntity, Extract};
 use bevy_sprite::BorderRect;
-use bevy_text::{EditableText, TextColor, TextCursorStyle, TextLayoutInfo};
+use bevy_text::{EditableText, TextColor, TextCursorStyle, TextLayoutInfo, TextOpacity};
 use bevy_ui::{
     widget::TextScroll, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiTargetCamera,
     ResolvedBorderRadius, UiGlobalTransform,
@@ -175,7 +175,7 @@ pub fn extract_preedit_underlines(
                 &ComputedStackIndex,
                 Option<&TextScroll>,
             ),
-            With<EditableText>,
+            (With<EditableText>, Without<TextOpacity>),
         >,
     >,
     camera_map: Extract<UiCameraMap>,

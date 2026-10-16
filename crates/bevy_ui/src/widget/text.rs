@@ -165,7 +165,9 @@ impl Default for TextShadow {
 #[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct TextOutline {
-    /// Outline width in logical pixels.
+    /// Outward stroke extent in logical pixels. The round stroke is centred on
+    /// the glyph contour with twice this width, then covered by the text fill.
+    /// Fractional widths are antialiased; the outline does not affect layout.
     pub width: f32,
     /// Outline color.
     pub color: Color,

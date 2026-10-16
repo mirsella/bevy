@@ -15,11 +15,11 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     prelude::ReflectComponent,
-    query::{Changed, Without},
+    query::{Changed, Or, Without},
     system::{Commands, Local, Query, Res, ResMut},
 };
 use bevy_image::prelude::*;
-use bevy_math::{FloatOrd, Vec2, Vec3};
+use bevy_math::{FloatOrd, Vec2};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_text::{
     text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock, Font, FontAtlasSet,
@@ -162,7 +162,9 @@ impl Default for Text2dShadow {
 #[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct Text2dOutline {
-    /// Outline width in logical pixels.
+    /// Outward stroke extent in logical pixels. The round stroke is centred on
+    /// the glyph contour with twice this width, then covered by the text fill.
+    /// Fractional widths are antialiased; the outline does not affect layout.
     pub width: f32,
     /// Outline color.
     pub color: Color,
@@ -399,12 +401,25 @@ pub fn calculate_bounds_text2d(
             &TextLayoutInfo,
             &Anchor,
             &TextBounds,
+            Option<&Text2dOutline>,
+            Option<&Text2dShadow>,
             Option<&mut Aabb>,
         ),
-        (Changed<TextLayoutInfo>, Without<NoFrustumCulling>),
+        (
+            Or<(
+                Changed<TextLayoutInfo>,
+                Changed<Anchor>,
+                Changed<TextBounds>,
+                Changed<Text2dOutline>,
+                Changed<Text2dShadow>,
+            )>,
+            Without<NoFrustumCulling>,
+        ),
     >,
 ) {
-    for (entity, layout_info, anchor, text_bounds, aabb) in &mut text_to_update_aabb {
+    for (entity, layout_info, anchor, text_bounds, outline, shadow, aabb) in
+        &mut text_to_update_aabb
+    {
         let size = Vec2::new(
             text_bounds.width.unwrap_or(layout_info.size.x),
             text_bounds.height.unwrap_or(layout_info.size.y),
@@ -414,7 +429,24 @@ pub fn calculate_bounds_text2d(
         let x2 = (Anchor::TOP_LEFT.0.x - anchor.as_vec().x + 1.) * size.x;
         let y1 = (Anchor::TOP_LEFT.0.y - anchor.as_vec().y - 1.) * size.y;
         let y2 = (Anchor::TOP_LEFT.0.y - anchor.as_vec().y) * size.y;
-        let new_aabb = Aabb::from_min_max(Vec3::new(x1, y1, 0.), Vec3::new(x2, y2, 0.));
+        let stroke = outline
+            .filter(|outline| !outline.color.is_fully_transparent())
+            .and_then(|outline| {
+                text_effect_outline_width(outline.width, 1.0, entity, "Text2dOutline")
+            })
+            .unwrap_or(0.0);
+        let mut min = Vec2::new(x1, y1) - Vec2::splat(stroke);
+        let mut max = Vec2::new(x2, y2) + Vec2::splat(stroke);
+        if let Some(offset) = shadow
+            .filter(|shadow| !shadow.color.is_fully_transparent())
+            .and_then(|shadow| {
+                text_effect_shadow_offset(shadow.offset, 1.0, entity, "Text2dShadow")
+            })
+        {
+            min = min.min(min + offset);
+            max = max.max(max + offset);
+        }
+        let new_aabb = Aabb::from_min_max(min.extend(0.0), max.extend(0.0));
 
         if let Some(mut aabb) = aabb {
             *aabb = new_aabb;
@@ -530,6 +562,36 @@ mod tests {
 
         // AABB has an actual size.
         assert!(aabb.half_extents.x > 0.0 && aabb.half_extents.y > 0.0);
+    }
+
+    #[test]
+    fn calculate_bounds_text2d_includes_effects_and_offset_changes() {
+        let (mut app, entity) = setup();
+        app.update();
+        let original = *app.world().get::<Aabb>(entity).unwrap();
+        app.world_mut().entity_mut(entity).insert((
+            Text2dOutline {
+                width: 2.0,
+                ..Default::default()
+            },
+            Text2dShadow {
+                offset: Vec2::new(80.0, -48.0),
+                ..Default::default()
+            },
+        ));
+        app.update();
+        let expanded = *app.world().get::<Aabb>(entity).unwrap();
+        approx::assert_abs_diff_eq!(expanded.half_extents.x, original.half_extents.x + 42.0);
+        approx::assert_abs_diff_eq!(expanded.half_extents.y, original.half_extents.y + 26.0);
+        app.world_mut()
+            .get_mut::<Text2dShadow>(entity)
+            .unwrap()
+            .offset
+            .x = -100.0;
+        app.update();
+        let moved = app.world().get::<Aabb>(entity).unwrap();
+        approx::assert_abs_diff_eq!(moved.half_extents.x, original.half_extents.x + 52.0);
+        approx::assert_abs_diff_eq!(moved.center.x, original.center.x - 50.0);
     }
 
     #[test]

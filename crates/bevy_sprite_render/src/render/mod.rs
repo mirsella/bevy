@@ -212,66 +212,17 @@ impl SpecializedRenderPipeline for SpritePipeline {
 
         let format = key.target_format();
 
-        let instance_rate_vertex_buffer_layout = VertexBufferLayout {
-            array_stride: 144,
-            step_mode: VertexStepMode::Instance,
-            attributes: vec![
-                // @location(0) i_model_transpose_col0: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                // @location(1) i_model_transpose_col1: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 16,
-                    shader_location: 1,
-                },
-                // @location(2) i_model_transpose_col2: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 32,
-                    shader_location: 2,
-                },
-                // @location(3) i_color: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 48,
-                    shader_location: 3,
-                },
-                // @location(4) i_uv_offset_scale: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 64,
-                    shader_location: 4,
-                },
-                // @location(5) i_effect_params: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 80,
-                    shader_location: 5,
-                },
-                // @location(6) i_shadow_color: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 96,
-                    shader_location: 6,
-                },
-                // @location(7) i_outline_color: vec4<f32>,
-                VertexAttribute {
-                    format: VertexFormat::Float32x4,
-                    offset: 112,
-                    shader_location: 7,
-                },
-                // @location(8) i_effect_flags: vec4<u32>,
-                VertexAttribute {
-                    format: VertexFormat::Uint32x4,
-                    offset: 128,
-                    shader_location: 8,
-                },
+        let instance_rate_vertex_buffer_layout = VertexBufferLayout::from_vertex_formats(
+            VertexStepMode::Instance,
+            [
+                VertexFormat::Float32x4, // model transpose columns
+                VertexFormat::Float32x4,
+                VertexFormat::Float32x4,
+                VertexFormat::Float32x4, // paint
+                VertexFormat::Float32x4, // UV offset and scale
+                VertexFormat::Uint32x4,  // text coverage, padded to the model's alignment
             ],
-        };
+        );
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -467,11 +418,13 @@ impl PhaseItem for SrgbTransparent2d {
 }
 
 impl SortedPhaseItem for SrgbTransparent2d {
-    type SortKey = FloatOrd;
+    type SortKey = (FloatOrd, usize);
 
     #[inline]
     fn sort_key(&self) -> Self::SortKey {
-        self.sort_key
+        // Removing retained items can reorder equal-depth entries in the phase map.
+        // Restore sprite extraction order so text effects stay behind their fill.
+        (self.sort_key, self.extracted_index)
     }
 
     #[inline]
@@ -503,59 +456,18 @@ pub struct ExtractedSlice {
     pub text_effect: ExtractedTextEffect,
 }
 
-const TEXT_EFFECT_TEXT: u32 = 1 << 0;
-const TEXT_EFFECT_OUTLINE: u32 = 1 << 1;
-const TEXT_EFFECT_SHADOW: u32 = 1 << 2;
-
-#[derive(Clone, Copy, Debug)]
-pub struct ExtractedTextEffect {
-    flags: u32,
-    shadow_offset: Vec2,
-    shadow_color: LinearRgba,
-    outline_color: LinearRgba,
-}
-
-impl Default for ExtractedTextEffect {
-    fn default() -> Self {
-        Self {
-            flags: 0,
-            shadow_offset: Vec2::ZERO,
-            shadow_color: LinearRgba::NONE,
-            outline_color: LinearRgba::NONE,
-        }
-    }
-}
-
-impl ExtractedTextEffect {
-    pub fn text(shadow: Option<(LinearRgba, Vec2)>, outline_color: Option<LinearRgba>) -> Self {
-        let mut text_effect = Self {
-            flags: TEXT_EFFECT_TEXT,
-            ..Default::default()
-        };
-
-        text_effect.set_shadow(shadow);
-
-        if let Some(outline_color) = outline_color {
-            text_effect.flags |= TEXT_EFFECT_OUTLINE;
-            text_effect.outline_color = outline_color;
-        }
-
-        text_effect
-    }
-
-    pub fn shadow(shadow: Option<(LinearRgba, Vec2)>) -> Self {
-        let mut text_effect = Self::default();
-        text_effect.set_shadow(shadow);
-        text_effect
-    }
-
-    fn set_shadow(&mut self, shadow: Option<(LinearRgba, Vec2)>) {
-        if let Some((shadow_color, shadow_offset)) = shadow {
-            self.flags |= TEXT_EFFECT_SHADOW;
-            self.shadow_offset = shadow_offset;
-            self.shadow_color = shadow_color;
-        }
-    }
+/// Texture coverage for one sprite layer. Its paint is `ExtractedSprite::color`.
+/// Discriminants match `sprite.wgsl`.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ExtractedTextEffect {
+    #[default]
+    None = 0,
+    Alpha = 1,
+    Outline = 2,
+    OutlinedShadow = 3,
+    /// Premultiplied gamma-space text group, with opacity applied on composition.
+    Group = 4,
 }
 
 pub struct ExtractedSprite {
@@ -699,10 +611,7 @@ struct SpriteInstance {
     pub i_model_transpose: [Vec4; 3],
     pub i_color: [f32; 4],
     pub i_uv_offset_scale: [f32; 4],
-    pub i_effect_params: [f32; 4],
-    pub i_shadow_color: [f32; 4],
-    pub i_outline_color: [f32; 4],
-    pub i_effect_flags: [u32; 4],
+    pub i_text_effect: [u32; 4],
 }
 
 impl SpriteInstance {
@@ -722,16 +631,7 @@ impl SpriteInstance {
             ],
             i_color: color.to_f32_array(),
             i_uv_offset_scale: uv_offset_scale.to_array(),
-            i_effect_params: Vec4::new(
-                text_effect.shadow_offset.x,
-                text_effect.shadow_offset.y,
-                0.0,
-                0.0,
-            )
-            .to_array(),
-            i_shadow_color: text_effect.shadow_color.to_f32_array(),
-            i_outline_color: text_effect.outline_color.to_f32_array(),
-            i_effect_flags: [text_effect.flags, 0, 0, 0],
+            i_text_effect: [text_effect as u32, 0, 0, 0],
         }
     }
 }
@@ -1078,12 +978,6 @@ pub fn prepare_sprite_image_bind_groups(
                                 (slice.size * -Vec2::splat(0.5) + slice.offset).extend(0.0),
                             );
 
-                        let mut text_effect = slice.text_effect;
-                        if text_effect.flags & TEXT_EFFECT_SHADOW != 0 {
-                            text_effect.shadow_offset.x /= batch_image_size.x;
-                            text_effect.shadow_offset.y /= batch_image_size.y;
-                        }
-
                         // Store the vertex data and add the item to the render phase
                         sprite_meta
                             .sprite_instance_buffer
@@ -1091,7 +985,7 @@ pub fn prepare_sprite_image_bind_groups(
                                 &transform,
                                 &extracted_sprite.color,
                                 &uv_offset_scale,
-                                text_effect,
+                                slice.text_effect,
                             ));
 
                         current_batch.get_mut().range.end += 1;
@@ -1519,5 +1413,58 @@ fn apply_scaling(
                 *quad_size = new_quad;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_render::render_phase::SortedRenderPhase;
+
+    #[test]
+    fn equal_depth_sprites_keep_extraction_order_after_retained_removal() {
+        let mut world = World::new();
+        let mut item = |extracted_index, z| {
+            let entity = world.spawn_empty().id();
+            SrgbTransparent2d {
+                sort_key: FloatOrd(z),
+                entity: (entity, entity.into()),
+                pipeline: CachedRenderPipelineId::INVALID,
+                draw_function: DrawFunctionId(0),
+                batch_range: 0..0,
+                extra_index: PhaseItemExtraIndex::None,
+                extracted_index,
+                indexed: true,
+            }
+        };
+        let mut phase = SortedRenderPhase::<SrgbTransparent2d>::default();
+        let retained = item(usize::MAX, 0.);
+        let retained_key = retained.entity;
+        phase.add_retained(retained);
+        // A text block is extracted in shadow, outline, fill order.
+        for layer in 0..3 {
+            phase.add_transient(item(layer, 1.));
+        }
+        // Removing a retained mesh swaps the last item (fill) ahead of its effects.
+        phase.remove(retained_key.0, retained_key.1);
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.extracted_index)
+                .collect::<Vec<_>>(),
+            [2, 0, 1]
+        );
+        // Depth must still take priority over extraction order.
+        phase.add_transient(item(3, -1.));
+        phase.sort();
+        assert_eq!(
+            phase
+                .items
+                .values()
+                .map(|item| item.extracted_index)
+                .collect::<Vec<_>>(),
+            [3, 0, 1, 2]
+        );
     }
 }

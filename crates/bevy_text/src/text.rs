@@ -180,6 +180,66 @@ impl TextLayout {
     }
 }
 
+/// Opacity of an entire text block, applied after its glyphs, outline, shadow,
+/// backgrounds and decorations have been composited together.
+///
+/// Attach this to a `Text`, `Text2d`, or [`crate::EditableText`] root, not a `TextSpan`. Animate this value
+/// instead of the individual paint alphas to keep effects behind letter faces.
+/// Paint alpha remains independent: it describes the appearance inside the group.
+/// This does not fade child UI nodes, the editing cursor, or selection highlights.
+///
+/// The renderer caches the group at the text's rasterization scale. Opacity and
+/// transform changes reuse that cache; layout and paint changes refresh it.
+/// Values are clamped to `[0, 1]`. A non-finite value is invalid and hides the block
+/// with a diagnostic.
+#[derive(Component, Debug, Copy, Clone, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+pub struct TextOpacity(pub f32);
+
+impl Default for TextOpacity {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl TextOpacity {
+    /// Returns the local opacity, validating animated input at the render boundary.
+    pub fn get(self) -> f32 {
+        validated_text_opacity(self.0)
+    }
+}
+
+/// Additional group opacity supplied by an external hierarchy or animation system.
+///
+/// The renderer multiplies this with [`TextOpacity`], keeping inherited fades
+/// independent of an authored or animated local opacity. Bevy does not propagate
+/// this component through the hierarchy; the integrating system owns its value.
+#[derive(Component, Debug, Copy, Clone, PartialEq, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+#[require(TextOpacity)]
+pub struct InheritedTextOpacity(pub f32);
+
+impl Default for InheritedTextOpacity {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl InheritedTextOpacity {
+    /// Returns the inherited multiplier, validating input at the render boundary.
+    pub fn get(self) -> f32 {
+        validated_text_opacity(self.0)
+    }
+}
+
+fn validated_text_opacity(opacity: f32) -> f32 {
+    if !opacity.is_finite() {
+        bevy_log::warn_once!("Text group opacity must be finite; hiding invalid text group");
+        return 0.0;
+    }
+    opacity.clamp(0.0, 1.0)
+}
+
 /// A span of text in a tree of spans.
 ///
 /// A `TextSpan` is only valid when it exists as a child of a parent that has either `Text` or
