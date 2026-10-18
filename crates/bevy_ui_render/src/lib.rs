@@ -27,7 +27,11 @@ use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_render::camera::{extract_cameras, CameraMainPassTextureFormats};
 use bevy_shader::{load_shader_library, Shader};
+use bevy_sprite_render::text_group::{
+    TextGroupCache, TextGroupEffects, TextGroupPlugin, TextGroupStyleQuery,
+};
 use bevy_sprite_render::SpriteAssetEvents;
+use bevy_text::{InheritedTextOpacity, TextOpacity};
 use bevy_ui::widget::{
     ImageNode, ImageNodeSize, NodeImageMode, TextOutline, TextScroll, TextShadow, ViewportNode,
 };
@@ -67,9 +71,9 @@ use surface::SurfacePlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
-    combined_text_effect_padding, expanded_text_effect_rect, text_effect_outline_width,
-    text_effect_shadow_offset, ComputedTextBlock, EditableTextPlaceholderColor, PositionedGlyph,
-    Strikethrough, StrikethroughColor, TextBackgroundColor, TextColor, TextCursorStyle,
+    glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
+    EditableText, EditableTextPlaceholderColor, PositionedGlyph, Strikethrough, StrikethroughColor,
+    TextBackgroundColor, TextColor, TextCursorStyle, TextEffectLayer, TextEntity, TextFont,
     TextLayoutInfo, Underline, UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
@@ -207,6 +211,9 @@ struct SrgbUiCompositeShader {
 
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<TextGroupPlugin>() {
+            app.add_plugins(TextGroupPlugin);
+        }
         load_shader_library!(app, "ui.wgsl");
         embedded_asset!(app, "srgb_ui_composite.wgsl");
         app.insert_resource(SrgbUiCompositeShader {
@@ -393,12 +400,10 @@ pub enum ExtractedUiItem {
 
 pub struct ExtractedGlyph {
     pub color: LinearRgba,
-    pub shadow_color: LinearRgba,
-    pub shadow_offset: Vec2,
-    pub outline_color: LinearRgba,
     pub translation: Vec2,
     pub rect: Rect,
-    pub is_alpha_mask: bool,
+    /// Text mask and effect selection; color is the paint for this layer.
+    pub flags: u32,
 }
 
 #[derive(Resource, Default)]
@@ -878,6 +883,9 @@ pub fn extract_viewport_nodes(
 
 pub fn extract_text_sections(
     mut commands: Commands,
+    mut groups: ResMut<TextGroupCache>,
+    group_styles: Extract<Query<TextGroupStyleQuery>>,
+    images: Extract<Res<Assets<Image>>>,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     uinode_query: Extract<
         Query<(
@@ -890,12 +898,17 @@ pub fn extract_text_sections(
             &ComputedUiTargetCamera,
             &ComputedTextBlock,
             &TextColor,
-            &TextLayoutInfo,
-            Option<&TextShadow>,
-            Option<&TextOutline>,
+            Ref<TextLayoutInfo>,
+            (
+                Option<&TextOpacity>,
+                Option<&InheritedTextOpacity>,
+                Option<&TextShadow>,
+                Option<&TextOutline>,
+            ),
             Option<&TextScroll>,
             Option<&TextCursorStyle>,
             Option<&EditableTextPlaceholderColor>,
+            (Has<EditableText>, &TextFont),
         )>,
     >,
     text_styles: Extract<Query<&TextColor>>,
@@ -913,11 +926,11 @@ pub fn extract_text_sections(
         computed_block,
         text_color,
         text_layout_info,
-        maybe_shadow,
-        maybe_outline,
+        (opacity, inherited_opacity, maybe_shadow, maybe_outline),
         text_scroll,
         cursor_style,
         placeholder_color,
+        (editable, text_font),
     ) in &uinode_query
     {
         // Skip if not visible or if size is set to zero (e.g. when a parent is set to `Display::None`)
@@ -966,11 +979,59 @@ pub fn extract_text_sections(
                 )
                 .map(|offset| (shadow.color.to_linear(), offset))
             });
-        let glyph_padding = combined_text_effect_padding(
-            shadow.map(|(_, offset)| offset),
-            outline.map(|(_, width)| width),
-        );
-
+        if let Some(opacity) = opacity {
+            let alpha = opacity.get() * inherited_opacity.map_or(1., |inherited| inherited.get());
+            if alpha == 0. {
+                groups.keep_cached(entity);
+                continue;
+            }
+            let effects = TextGroupEffects {
+                shadow,
+                outline,
+                selected_color: selected_text_color,
+                placeholder_color: placeholder_color.map(|c| c.0.to_linear()),
+                tint_color_glyphs: false,
+            };
+            // EditableText owns its layout and does not populate ComputedTextBlock's spans.
+            let root_section = TextEntity {
+                entity,
+                depth: 0,
+                font_smoothing: text_font.font_smoothing,
+            };
+            let sections = if editable {
+                core::slice::from_ref(&root_section)
+            } else {
+                computed_block.entities()
+            };
+            for tile in groups.extract(
+                entity,
+                &images,
+                &text_layout_info,
+                sections,
+                &group_styles,
+                effects,
+            ) {
+                let start = extracted_uinodes.glyphs.len();
+                extracted_uinodes.glyphs.push(ExtractedGlyph {
+                    color: LinearRgba::WHITE.with_alpha(alpha),
+                    translation: tile.bounds.center(),
+                    rect: tile.rect,
+                    flags: shader_flags::TEXTURED | shader_flags::TEXT_GROUP,
+                });
+                push_glyph_batch(
+                    &mut commands,
+                    &mut extracted_uinodes,
+                    tile.image,
+                    start,
+                    stack_index.0 as f32 + stack_z_offsets::TEXT,
+                    clip.clone(),
+                    extracted_camera_entity,
+                    entity.into(),
+                    transform,
+                );
+            }
+            continue;
+        }
         extract_glyphs(
             &mut commands,
             &mut extracted_uinodes,
@@ -1022,7 +1083,6 @@ pub fn extract_text_sections(
             },
             shadow,
             outline,
-            glyph_padding,
             stack_index.0 as f32 + stack_z_offsets::TEXT,
             clip.clone(),
             extracted_camera_entity,
@@ -1043,7 +1103,6 @@ pub fn extract_text_sections(
                 |_| Some(placeholder_color),
                 shadow,
                 outline,
-                glyph_padding,
                 stack_index.0 as f32 + stack_z_offsets::TEXT,
                 clip,
                 extracted_camera_entity,
@@ -1057,32 +1116,103 @@ pub fn extract_text_sections(
 fn extract_glyphs<'a>(
     commands: &mut Commands,
     extracted_uinodes: &mut ExtractedUiNodes,
-    glyphs: impl IntoIterator<Item = &'a PositionedGlyph>,
+    glyphs: impl Iterator<Item = &'a PositionedGlyph> + Clone,
     mut color: impl FnMut(&'a PositionedGlyph) -> Option<LinearRgba>,
     shadow: Option<(LinearRgba, Vec2)>,
     outline: Option<(LinearRgba, f32)>,
-    glyph_padding: Option<Vec2>,
     z_order: f32,
     clip: Option<CalculatedClip>,
     extracted_camera_entity: Entity,
     main_entity: MainEntity,
     transform: Affine2,
 ) {
-    let mut start = extracted_uinodes.glyphs.len();
-    let mut texture = None;
-
-    for glyph in glyphs {
-        let Some(color) = color(glyph) else {
-            continue;
+    let glyph_padding = glyph_effect_padding(
+        shadow.is_some() || outline.is_some(),
+        outline.map(|(_, width)| width),
+    );
+    // Paint the whole block in layers: a later glyph's effects must never cover
+    // an earlier glyph's face, including when the run crosses atlas textures.
+    for layer in TextEffectLayer::ALL {
+        let (paint, offset, layer_flags) = match layer {
+            TextEffectLayer::Shadow => {
+                let Some((color, offset)) = shadow else {
+                    continue;
+                };
+                (Some(color), offset, shader_flags::TEXT_EFFECT_SHADOW)
+            }
+            TextEffectLayer::Outline => {
+                let Some((color, _)) = outline else { continue };
+                (Some(color), Vec2::ZERO, 0)
+            }
+            TextEffectLayer::Fill => (None, Vec2::ZERO, 0),
         };
+        let mask_flags = shader_flags::TEXT_GLYPH
+            | if layer != TextEffectLayer::Fill && outline.is_some() {
+                shader_flags::TEXT_EFFECT_OUTLINE
+            } else {
+                0
+            };
+        let layer_padding = layer.glyph_padding(glyph_padding);
+        let mut start = extracted_uinodes.glyphs.len();
+        let mut texture = None;
 
-        if let Some(previous_texture) = texture
-            && previous_texture != glyph.atlas_info.texture
-        {
+        for glyph in glyphs.clone() {
+            if layer == TextEffectLayer::Outline && !glyph.atlas_info.is_alpha_mask {
+                continue;
+            }
+            let Some(color) = color(glyph) else {
+                continue;
+            };
+
+            if let Some(previous_texture) = texture
+                && previous_texture != glyph.atlas_info.texture
+            {
+                push_glyph_batch(
+                    commands,
+                    extracted_uinodes,
+                    previous_texture,
+                    start,
+                    z_order,
+                    clip.clone(),
+                    extracted_camera_entity,
+                    main_entity,
+                    transform,
+                );
+                start = extracted_uinodes.glyphs.len();
+            }
+
+            texture = Some(glyph.atlas_info.texture);
+
+            let atlas_info = &glyph.atlas_info;
+            let rect = if atlas_info.is_alpha_mask || shadow.is_some() {
+                atlas_info.rect.inflate(layer_padding)
+            } else {
+                atlas_info.rect
+            };
+
+            extracted_uinodes.glyphs.push(ExtractedGlyph {
+                color: paint.unwrap_or(if atlas_info.is_alpha_mask {
+                    color
+                } else {
+                    LinearRgba::WHITE
+                }),
+                translation: glyph.position + offset,
+                rect,
+                flags: shader_flags::TEXTURED
+                    | layer_flags
+                    | if atlas_info.is_alpha_mask {
+                        mask_flags
+                    } else {
+                        0
+                    },
+            });
+        }
+
+        if let Some(texture) = texture {
             push_glyph_batch(
                 commands,
                 extracted_uinodes,
-                previous_texture,
+                texture,
                 start,
                 z_order,
                 clip.clone(),
@@ -1090,51 +1220,7 @@ fn extract_glyphs<'a>(
                 main_entity,
                 transform,
             );
-            start = extracted_uinodes.glyphs.len();
         }
-
-        texture = Some(glyph.atlas_info.texture);
-
-        let atlas_info = &glyph.atlas_info;
-        let rect = if atlas_info.is_alpha_mask || shadow.is_some() {
-            glyph_padding
-                .map(|padding| expanded_text_effect_rect(atlas_info.rect, padding))
-                .unwrap_or(atlas_info.rect)
-        } else {
-            atlas_info.rect
-        };
-
-        extracted_uinodes.glyphs.push(ExtractedGlyph {
-            color: if atlas_info.is_alpha_mask {
-                color
-            } else {
-                LinearRgba::WHITE
-            },
-            shadow_color: shadow.map(|(color, _)| color).unwrap_or(LinearRgba::NONE),
-            shadow_offset: shadow.map(|(_, offset)| offset).unwrap_or(Vec2::ZERO),
-            outline_color: if atlas_info.is_alpha_mask {
-                outline.map(|(color, _)| color).unwrap_or(LinearRgba::NONE)
-            } else {
-                LinearRgba::NONE
-            },
-            translation: glyph.position,
-            rect,
-            is_alpha_mask: atlas_info.is_alpha_mask,
-        });
-    }
-
-    if let Some(texture) = texture {
-        push_glyph_batch(
-            commands,
-            extracted_uinodes,
-            texture,
-            start,
-            z_order,
-            clip,
-            extracted_camera_entity,
-            main_entity,
-            transform,
-        );
     }
 }
 
@@ -1170,19 +1256,22 @@ pub fn extract_text_shadows(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &UiGlobalTransform,
-            &ComputedUiTargetCamera,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &TextLayoutInfo,
-            &TextShadow,
-            &ComputedTextBlock,
-            Option<&TextScroll>,
-        )>,
+        Query<
+            (
+                Entity,
+                &ComputedNode,
+                &ComputedStackIndex,
+                &UiGlobalTransform,
+                &ComputedUiTargetCamera,
+                &InheritedVisibility,
+                Option<&CalculatedClip>,
+                &TextLayoutInfo,
+                &TextShadow,
+                &ComputedTextBlock,
+                Option<&TextScroll>,
+            ),
+            Without<TextOpacity>,
+        >,
     >,
     text_decoration_query: Extract<Query<(Has<Strikethrough>, Has<Underline>)>>,
     camera_map: Extract<UiCameraMap>,
@@ -1302,18 +1391,21 @@ pub fn extract_text_decorations(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &ComputedTextBlock,
-            &UiGlobalTransform,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &ComputedUiTargetCamera,
-            &TextLayoutInfo,
-            Option<&TextScroll>,
-        )>,
+        Query<
+            (
+                Entity,
+                &ComputedNode,
+                &ComputedStackIndex,
+                &ComputedTextBlock,
+                &UiGlobalTransform,
+                &InheritedVisibility,
+                Option<&CalculatedClip>,
+                &ComputedUiTargetCamera,
+                &TextLayoutInfo,
+                Option<&TextScroll>,
+            ),
+            Without<TextOpacity>,
+        >,
     >,
     text_background_colors_query: Extract<
         Query<(
@@ -1480,9 +1572,6 @@ pub struct UiVertex {
     pub size: [f32; 2],
     /// Position relative to the center of the UI node.
     pub point: [f32; 2],
-    pub shadow_color: [f32; 4],
-    pub outline_color: [f32; 4],
-    pub effect_params: [f32; 4],
 }
 
 pub(crate) const QUAD_VERTEX_POSITIONS: [Vec2; 4] = [
@@ -1549,6 +1638,7 @@ pub mod shader_flags {
     pub const TEXT_GLYPH: u32 = 16384;
     pub const TEXT_EFFECT_OUTLINE: u32 = 32768;
     pub const TEXT_EFFECT_SHADOW: u32 = 65536;
+    pub const TEXT_GROUP: u32 = 131072;
 }
 
 pub fn queue_uinodes(
@@ -1634,10 +1724,9 @@ pub fn prepare_uinodes(
     for event in &events.images {
         match event {
             AssetEvent::Added { .. } |
-            AssetEvent::Unused { .. } |
             // Images don't have dependencies
             AssetEvent::LoadedWithDependencies { .. } => {}
-            AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
+            AssetEvent::Unused { id } | AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
                 image_bind_groups.values.remove(id);
             }
         };
@@ -1770,9 +1859,6 @@ pub fn prepare_uinodes(
                                     ],
                                     size: rect_size.into(),
                                     point: point.into(),
-                                    shadow_color: [0.0; 4],
-                                    outline_color: [0.0; 4],
-                                    effect_params: [0.0; 4],
                                 },
                             ));
                         }
@@ -1782,30 +1868,9 @@ pub fn prepare_uinodes(
 
                         for glyph in &extracted_uinodes.glyphs[range.clone()] {
                             let color = glyph.color.to_f32_array();
-                            let shadow_color = glyph.shadow_color.to_f32_array();
-                            let outline_color = glyph.outline_color.to_f32_array();
                             let glyph_rect = glyph.rect;
                             let rect_size = glyph_rect.size();
-                            let mut flags = shader_flags::TEXTURED;
-                            let has_shadow = !glyph.shadow_color.is_fully_transparent();
-                            let effect_params = [
-                                glyph.shadow_offset.x / atlas_extent.x,
-                                glyph.shadow_offset.y / atlas_extent.y,
-                                0.0,
-                                0.0,
-                            ];
-
-                            if glyph.is_alpha_mask {
-                                flags |= shader_flags::TEXT_GLYPH;
-                                if has_shadow {
-                                    flags |= shader_flags::TEXT_EFFECT_SHADOW;
-                                }
-                                if !glyph.outline_color.is_fully_transparent() {
-                                    flags |= shader_flags::TEXT_EFFECT_OUTLINE;
-                                }
-                            } else if has_shadow {
-                                flags |= shader_flags::TEXT_EFFECT_SHADOW;
-                            }
+                            let flags = glyph.flags;
 
                             // Specify the corners of the glyph
                             let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
@@ -1849,9 +1914,6 @@ pub fn prepare_uinodes(
                                 border: [0.0; 4],
                                 size: rect_size.into(),
                                 point: [0.0; 2],
-                                shadow_color,
-                                outline_color,
-                                effect_params,
                             }));
                         }
                     }

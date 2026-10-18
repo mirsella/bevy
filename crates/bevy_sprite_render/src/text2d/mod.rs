@@ -1,31 +1,37 @@
+use crate::text_group::{TextGroupCache, TextGroupEffects, TextGroupStyleQuery};
 use crate::{
     ExtractedSlice, ExtractedSlices, ExtractedSprite, ExtractedSpriteKind, ExtractedSprites,
     ExtractedTextEffect,
 };
-use bevy_asset::AssetId;
+use bevy_asset::{AssetId, Assets};
 use bevy_camera::visibility::ViewVisibility;
 use bevy_color::{Alpha, LinearRgba};
+use bevy_ecs::change_detection::Ref;
 use bevy_ecs::{
     entity::Entity,
     query::Has,
-    system::{Commands, Query, ResMut},
+    system::{Commands, Query, Res, ResMut},
 };
+use bevy_image::Image;
 use bevy_math::{Vec2, Vec3};
 use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dOutline, Text2dShadow};
 use bevy_text::{
-    combined_text_effect_padding, expanded_text_effect_rect, text_effect_outline_width,
-    text_effect_shadow_offset, ComputedTextBlock, PositionedGlyph, Strikethrough,
-    StrikethroughColor, TextBackgroundColor, TextBounds, TextColor, TextLayoutInfo, Underline,
-    UnderlineColor,
+    glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
+    PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor, TextBounds, TextColor,
+    TextEffectLayer, TextLayoutInfo, Underline, UnderlineColor,
 };
+use bevy_text::{InheritedTextOpacity, TextOpacity};
 use bevy_transform::prelude::GlobalTransform;
 
 /// This system extracts the sprites from the 2D text components and adds them to the
 /// "render world".
 pub fn extract_text2d_sprite(
     mut commands: Commands,
+    mut groups: ResMut<TextGroupCache>,
+    group_styles: Extract<Query<TextGroupStyleQuery>>,
+    images: Extract<Res<Assets<Image>>>,
     mut extracted_sprites: ResMut<ExtractedSprites>,
     mut extracted_slices: ResMut<ExtractedSlices>,
     text2d_query: Extract<
@@ -33,7 +39,9 @@ pub fn extract_text2d_sprite(
             Entity,
             &ViewVisibility,
             &ComputedTextBlock,
-            &TextLayoutInfo,
+            Ref<TextLayoutInfo>,
+            Option<&TextOpacity>,
+            Option<&InheritedTextOpacity>,
             &TextBounds,
             &Anchor,
             Option<&Text2dShadow>,
@@ -58,6 +66,8 @@ pub fn extract_text2d_sprite(
         view_visibility,
         computed_block,
         text_layout_info,
+        opacity,
+        inherited_opacity,
         text_bounds,
         anchor,
         maybe_shadow,
@@ -78,6 +88,75 @@ pub fn extract_text2d_sprite(
         );
 
         let top_left = (Anchor::TOP_LEFT.0 - anchor.as_vec()) * size;
+
+        let shadow = maybe_shadow
+            .filter(|shadow| !shadow.color.is_fully_transparent())
+            .and_then(|shadow| {
+                text_effect_shadow_offset(
+                    shadow.offset,
+                    text_layout_info.scale_factor,
+                    main_entity,
+                    "Text2dShadow",
+                )
+                .map(|offset| (LinearRgba::from(shadow.color), offset))
+            });
+
+        let transform =
+            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
+
+        let outline = maybe_outline
+            .filter(|outline| !outline.color.is_fully_transparent())
+            .and_then(|outline| {
+                text_effect_outline_width(
+                    outline.width,
+                    text_layout_info.scale_factor,
+                    main_entity,
+                    "Text2dOutline",
+                )
+                .map(|width| (outline.color.to_linear(), width))
+            });
+        if let Some(opacity) = opacity {
+            let alpha = opacity.get() * inherited_opacity.map_or(1., |inherited| inherited.get());
+            if alpha == 0. {
+                groups.keep_cached(main_entity);
+                continue;
+            }
+            let effects = TextGroupEffects {
+                shadow: shadow.map(|(c, o)| (c, Vec2::new(o.x, -o.y))),
+                outline,
+                tint_color_glyphs: true,
+                ..Default::default()
+            };
+            for tile in groups.extract(
+                main_entity,
+                &images,
+                &text_layout_info,
+                computed_block.entities(),
+                &group_styles,
+                effects,
+            ) {
+                let index = extracted_slices.slices.len();
+                extracted_slices.slices.push(ExtractedSlice {
+                    offset: tile.bounds.center(),
+                    rect: tile.rect,
+                    size: tile.bounds.size(),
+                    text_effect: ExtractedTextEffect::Group,
+                });
+                extracted_sprites.sprites.push(ExtractedSprite {
+                    main_entity,
+                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
+                    transform,
+                    color: LinearRgba::WHITE.with_alpha(alpha),
+                    image_handle_id: tile.image,
+                    flip_x: false,
+                    flip_y: true,
+                    kind: ExtractedSpriteKind::Slices {
+                        indices: index..index + 1,
+                    },
+                });
+            }
+            continue;
+        }
 
         for run in text_layout_info.run_geometry.iter() {
             let section_entity = computed_block.entities()[run.section_index].entity;
@@ -106,18 +185,6 @@ pub fn extract_text2d_sprite(
                 },
             });
         }
-
-        let shadow = maybe_shadow
-            .filter(|shadow| !shadow.color.is_fully_transparent())
-            .and_then(|shadow| {
-                text_effect_shadow_offset(
-                    shadow.offset,
-                    text_layout_info.scale_factor,
-                    main_entity,
-                    "Text2dShadow",
-                )
-                .map(|offset| (LinearRgba::from(shadow.color), offset))
-            });
 
         if let Some((color, shadow_offset)) = shadow {
             let shadow_transform = *global_transform
@@ -180,101 +247,109 @@ pub fn extract_text2d_sprite(
             }
         }
 
-        let transform =
-            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
-
-        let outline = maybe_outline
-            .filter(|outline| !outline.color.is_fully_transparent())
-            .and_then(|outline| {
-                text_effect_outline_width(
-                    outline.width,
-                    text_layout_info.scale_factor,
-                    main_entity,
-                    "Text2dOutline",
-                )
-                .map(|width| (outline.color.to_linear(), width))
-            });
-        let glyph_padding = combined_text_effect_padding(
-            shadow.map(|(_, offset)| offset),
+        let glyph_padding = glyph_effect_padding(
+            shadow.is_some() || outline.is_some(),
             outline.map(|(_, width)| width),
         );
 
-        let mut color = LinearRgba::WHITE;
-        let mut current_section = usize::MAX;
-        let mut start = extracted_slices.slices.len();
+        // Keep every shadow behind every stroke, and every stroke behind every fill.
+        for layer in TextEffectLayer::ALL {
+            let (paint, offset) = match layer {
+                TextEffectLayer::Shadow => {
+                    let Some((color, offset)) = shadow else {
+                        continue;
+                    };
+                    (Some(color), Vec2::new(offset.x, -offset.y))
+                }
+                TextEffectLayer::Outline => {
+                    let Some((color, _)) = outline else { continue };
+                    (Some(color), Vec2::ZERO)
+                }
+                TextEffectLayer::Fill => (None, Vec2::ZERO),
+            };
+            let mut color = LinearRgba::WHITE;
+            let mut current_section = usize::MAX;
+            let layer_padding = layer.glyph_padding(glyph_padding);
+            let mut start = extracted_slices.slices.len();
 
-        for (
-            i,
-            PositionedGlyph {
+            let mut glyphs = text_layout_info
+                .glyphs
+                .iter()
+                .filter(|glyph| layer != TextEffectLayer::Outline || glyph.atlas_info.is_alpha_mask)
+                .peekable();
+            while let Some(PositionedGlyph {
                 position,
                 atlas_info,
                 section_index,
                 ..
-            },
-        ) in text_layout_info.glyphs.iter().enumerate()
-        {
-            if *section_index != current_section {
-                let Some(section_entity) = computed_block
-                    .entities()
-                    .get(*section_index)
-                    .map(|text_entity| text_entity.entity)
-                else {
-                    tracing::warn!(
+            }) = glyphs.next()
+            {
+                if *section_index != current_section {
+                    let Some(section_entity) = computed_block
+                        .entities()
+                        .get(*section_index)
+                        .map(|text_entity| text_entity.entity)
+                    else {
+                        tracing::warn!(
                         "Skipping Text2d glyph for {main_entity:?}: missing text section {section_index}"
                     );
-                    continue;
-                };
+                        continue;
+                    };
 
-                let Ok(text_color) = text_colors.get(section_entity) else {
-                    tracing::warn!(
+                    let Ok(text_color) = text_colors.get(section_entity) else {
+                        tracing::warn!(
                         "Skipping Text2d glyph for {main_entity:?}: missing TextColor on section entity {section_entity:?}"
                     );
-                    continue;
+                        continue;
+                    };
+
+                    color = LinearRgba::from(text_color.0);
+                    current_section = *section_index;
+                }
+                let text_effect = match layer {
+                    TextEffectLayer::Shadow if atlas_info.is_alpha_mask && outline.is_some() => {
+                        ExtractedTextEffect::OutlinedShadow
+                    }
+                    TextEffectLayer::Shadow => ExtractedTextEffect::Alpha,
+                    TextEffectLayer::Outline => ExtractedTextEffect::Outline,
+                    TextEffectLayer::Fill if atlas_info.is_alpha_mask => ExtractedTextEffect::Alpha,
+                    TextEffectLayer::Fill => ExtractedTextEffect::None,
+                };
+                let rect = if atlas_info.is_alpha_mask || layer == TextEffectLayer::Shadow {
+                    atlas_info.rect.inflate(layer_padding)
+                } else {
+                    atlas_info.rect
                 };
 
-                color = LinearRgba::from(text_color.0);
-                current_section = *section_index;
-            }
-            let shadow = shadow.map(|(color, offset)| (color, Vec2::new(offset.x, -offset.y)));
-            let text_effect = if atlas_info.is_alpha_mask {
-                ExtractedTextEffect::text(shadow, outline.map(|(color, _)| color))
-            } else {
-                ExtractedTextEffect::shadow(shadow)
-            };
-            let rect = if atlas_info.is_alpha_mask || shadow.is_some() {
-                glyph_padding
-                    .map(|padding| expanded_text_effect_rect(atlas_info.rect, padding))
-                    .unwrap_or(atlas_info.rect)
-            } else {
-                atlas_info.rect
-            };
-
-            extracted_slices.slices.push(ExtractedSlice {
-                offset: *position,
-                rect,
-                size: rect.size(),
-                text_effect,
-            });
-
-            if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
-                info.section_index != current_section
-                    || info.atlas_info.texture != atlas_info.texture
-            }) {
-                let end = extracted_slices.slices.len();
-                let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                extracted_sprites.sprites.push(ExtractedSprite {
-                    main_entity,
-                    render_entity,
-                    transform,
-                    color,
-                    image_handle_id: atlas_info.texture,
-                    flip_x: false,
-                    flip_y: true,
-                    kind: ExtractedSpriteKind::Slices {
-                        indices: start..end,
-                    },
+                extracted_slices.slices.push(ExtractedSlice {
+                    // Offset the geometry without changing the block's depth sort key.
+                    // A translated layer transform would reorder effects on tilted text.
+                    offset: *position + offset,
+                    rect,
+                    size: rect.size(),
+                    text_effect,
                 });
-                start = end;
+
+                if glyphs.peek().is_none_or(|info| {
+                    info.section_index != current_section
+                        || info.atlas_info.texture != atlas_info.texture
+                }) {
+                    let end = extracted_slices.slices.len();
+                    let render_entity = commands.spawn(TemporaryRenderEntity).id();
+                    extracted_sprites.sprites.push(ExtractedSprite {
+                        main_entity,
+                        render_entity,
+                        transform,
+                        color: paint.unwrap_or(color),
+                        image_handle_id: atlas_info.texture,
+                        flip_x: false,
+                        flip_y: true,
+                        kind: ExtractedSpriteKind::Slices {
+                            indices: start..end,
+                        },
+                    });
+                    start = end;
+                }
             }
         }
 

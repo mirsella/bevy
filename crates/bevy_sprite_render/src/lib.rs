@@ -15,6 +15,8 @@ mod render;
 mod sprite_mesh;
 #[cfg(feature = "bevy_text")]
 mod text2d;
+#[cfg(feature = "bevy_text")]
+pub mod text_group;
 mod texture_slice;
 mod tilemap_chunk;
 
@@ -107,6 +109,11 @@ impl Plugin for SpriteRenderPlugin {
             )
                 .in_set(SpriteSystems::ComputeSlices),
         );
+
+        #[cfg(feature = "bevy_text")]
+        if !app.is_plugin_added::<text_group::TextGroupPlugin>() {
+            app.add_plugins(text_group::TextGroupPlugin);
+        }
 
         app.register_required_components::<Sprite, SyncToRenderWorld>();
 

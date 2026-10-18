@@ -10,6 +10,7 @@ const VIEWPORT_TEXTURE: u32 = 8192u;
 const TEXT_GLYPH: u32 = 16384u;
 const TEXT_EFFECT_OUTLINE: u32 = 32768u;
 const TEXT_EFFECT_SHADOW: u32 = 65536u;
+const TEXT_GROUP: u32 = 131072u;
 
 fn enabled(flags: u32, mask: u32) -> bool {
     return (flags & mask) != 0u;
@@ -27,7 +28,8 @@ fn manual_srgb(color: vec3<f32>) -> vec3<f32> {
 
 struct VertexOutput {
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    // Every vertex of a UI quad carries the same tint or text-layer paint.
+    @location(1) @interpolate(flat) color: vec4<f32>,
 
     @location(2) @interpolate(flat) size: vec2<f32>,
     @location(3) @interpolate(flat) flags: u32,
@@ -36,9 +38,6 @@ struct VertexOutput {
 
     // Position relative to the center of the rectangle.
     @location(6) point: vec2<f32>,
-    @location(7) @interpolate(flat) shadow_color: vec4<f32>,
-    @location(8) @interpolate(flat) outline_color: vec4<f32>,
-    @location(9) @interpolate(flat) effect_params: vec4<f32>,
     @builtin(position) position: vec4<f32>,
 };
 
@@ -56,17 +55,14 @@ fn vertex(
     @location(5) border: vec4<f32>,
     @location(6) size: vec2<f32>,
     @location(7) point: vec2<f32>,
-    @location(8) shadow_color: vec4<f32>,
-    @location(9) outline_color: vec4<f32>,
-    @location(10) effect_params: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     out.uv = vertex_uv;
     out.position = view.clip_from_world * vec4(vertex_position, 1.0);
     out.color = vertex_color;
-    // Solid nodes have one color across all vertices. Convert it here instead of
-    // repeating the gamma conversion for every covered pixel.
-    if !enabled(flags, TEXTURED) {
+    // Solid nodes and text layers have one paint color across each quad.
+    // Convert it once per vertex instead of for every covered pixel.
+    if !enabled(flags, TEXTURED) || enabled(flags, TEXT_GLYPH) || enabled(flags, TEXT_EFFECT_SHADOW) {
         out.color = vec4(manual_srgb(vertex_color.rgb), vertex_color.a);
     }
     out.flags = flags;
@@ -74,9 +70,6 @@ fn vertex(
     out.size = size;
     out.border = border;
     out.point = point;
-    out.shadow_color = shadow_color;
-    out.outline_color = outline_color;
-    out.effect_params = effect_params;
 
     return out;
 }
@@ -146,33 +139,6 @@ fn sd_inset_rounded_box(point: vec2<f32>, size: vec2<f32>, radius: vec4<f32>, in
 fn antialias(distance: f32) -> f32 {
     // Using the fwidth(distance) was causing artifacts, so just use the distance.
     return saturate(0.5 - distance);
-}
-
-fn composite_text_layers(
-    fill_color: vec4<f32>,
-    outline_color: vec4<f32>,
-    shadow_color: vec4<f32>,
-    fill_cov: f32,
-    outline_cov: f32,
-    shadow_cov: f32,
-) -> vec4<f32> {
-    let fill_alpha = fill_color.a * fill_cov;
-    let outline_alpha = outline_color.a * outline_cov;
-    let shadow_alpha = shadow_color.a * shadow_cov;
-    let outline_weight = outline_alpha * (1.0 - fill_alpha);
-    let shadow_weight = shadow_alpha * (1.0 - fill_alpha) * (1.0 - outline_alpha);
-    let alpha = fill_alpha + outline_weight + shadow_weight;
-
-    if alpha <= 0.0 {
-        return vec4<f32>(0.0);
-    }
-
-    let rgb = (
-        fill_color.rgb * fill_alpha
-        + outline_color.rgb * outline_weight
-        + shadow_color.rgb * shadow_weight
-    ) / alpha;
-    return vec4<f32>(rgb, alpha);
 }
 
 fn outline_coverage(
@@ -269,39 +235,27 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let base_sample = textureSampleGrad(sprite_texture, sprite_sampler, in.uv, uv_dx, uv_dy);
 
-    if enabled(in.flags, TEXT_GLYPH) {
-        let fill_cov = base_sample.a;
-        let outline_cov = select(0.0, base_sample.r, enabled(in.flags, TEXT_EFFECT_OUTLINE));
-        var shadow_cov = 0.0;
-        if enabled(in.flags, TEXT_EFFECT_SHADOW) {
-            let shadow_uv = in.uv - in.effect_params.xy;
-            shadow_cov = textureSampleLevel(sprite_texture, sprite_sampler, shadow_uv, 0.0).a
-                * (1.0 - max(fill_cov, outline_cov));
-        }
+    if enabled(in.flags, TEXT_GROUP) {
+        let straight = base_sample.rgb / max(base_sample.a, 0.00001);
+#ifdef MANUAL_SRGB
+        return vec4(straight, base_sample.a * in.color.a);
+#else
+        return vec4(pow(max(straight, vec3(0.)), vec3(2.2)), base_sample.a * in.color.a);
+#endif
+    }
 
-        let color = composite_text_layers(
-            in.color,
-            in.outline_color,
-            in.shadow_color,
-            fill_cov,
-            outline_cov,
-            shadow_cov,
-        );
-        return vec4(manual_srgb(color.rgb), color.a);
-    } else if enabled(in.flags, TEXT_EFFECT_SHADOW) {
-        let fill_color = in.color * base_sample;
-        let shadow_uv = in.uv - in.effect_params.xy;
-        let shadow_cov = textureSampleLevel(sprite_texture, sprite_sampler, shadow_uv, 0.0).a
-            * (1.0 - base_sample.a);
-        let color = composite_text_layers(
-            fill_color,
-            vec4<f32>(0.0),
-            in.shadow_color,
-            1.0,
-            0.0,
-            shadow_cov,
-        );
-        return vec4(manual_srgb(color.rgb), color.a);
+    if enabled(in.flags, TEXT_EFFECT_SHADOW) {
+        var coverage = base_sample.a;
+        if enabled(in.flags, TEXT_GLYPH) && enabled(in.flags, TEXT_EFFECT_OUTLINE) {
+            coverage += base_sample.r * (1.0 - coverage);
+        }
+        return vec4(in.color.rgb, in.color.a * coverage);
+    }
+    if enabled(in.flags, TEXT_GLYPH) {
+        if enabled(in.flags, TEXT_EFFECT_OUTLINE) {
+            return vec4(in.color.rgb, in.color.a * base_sample.r);
+        }
+        return vec4(in.color.rgb, in.color.a * base_sample.a);
     }
 
     var texture_color = base_sample;

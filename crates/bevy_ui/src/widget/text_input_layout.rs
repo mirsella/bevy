@@ -513,7 +513,7 @@ pub fn update_editable_text_layout(
             };
             let cursor_is_visible = has_focus && *cursor_timer < cursor_blink_period / 2;
 
-            info.cursor = driver
+            let cursor = driver
                 .editor
                 .cursor_geometry(cursor_width)
                 .map(bounding_box_to_rect)
@@ -530,6 +530,9 @@ pub fn update_editable_text_layout(
                     }
                 })
                 .map(|rect| (cursor_is_visible, rect));
+            info.reborrow()
+                .map_unchanged(|info| &mut info.cursor)
+                .set_if_neq(cursor);
         }
 
         if placeholder_visible {
