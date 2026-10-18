@@ -101,7 +101,7 @@ pub fn extract_text2d_sprite(
                 .map(|offset| (LinearRgba::from(shadow.color), offset))
             });
 
-        let transform =
+        let text_transform =
             *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
 
         let outline = maybe_outline
@@ -145,7 +145,7 @@ pub fn extract_text2d_sprite(
                 extracted_sprites.sprites.push(ExtractedSprite {
                     main_entity,
                     render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    transform,
+                    transform: text_transform,
                     color: LinearRgba::WHITE.with_alpha(alpha),
                     image_handle_id: tile.image,
                     flip_x: false,
@@ -164,15 +164,11 @@ pub fn extract_text2d_sprite(
                 continue;
             };
             let render_entity = commands.spawn(TemporaryRenderEntity).id();
-            let offset = run.bounds.center();
-            let transform = *global_transform
-                * GlobalTransform::from_translation(top_left.extend(0.))
-                * scaling
-                * GlobalTransform::from_translation(offset.extend(0.));
             extracted_sprites.sprites.push(ExtractedSprite {
                 main_entity,
                 render_entity,
-                transform,
+                transform: text_transform
+                    * GlobalTransform::from_translation(run.bounds.center().extend(0.)),
                 color: text_background_color.0.into(),
                 image_handle_id: AssetId::default(),
                 flip_x: false,
@@ -201,15 +197,19 @@ pub fn extract_text2d_sprite(
                     continue;
                 };
 
-                if has_strikethrough {
-                    let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                    let offset = run.strikethrough_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
+                for (position, size) in [
+                    has_strikethrough
+                        .then(|| (run.strikethrough_position(), run.strikethrough_size())),
+                    has_underline.then(|| (run.underline_position(), run.underline_size())),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     extracted_sprites.sprites.push(ExtractedSprite {
                         main_entity,
-                        render_entity,
-                        transform,
+                        render_entity: commands.spawn(TemporaryRenderEntity).id(),
+                        transform: shadow_transform
+                            * GlobalTransform::from_translation(position.extend(0.)),
                         color,
                         image_handle_id: AssetId::default(),
                         flip_x: false,
@@ -218,29 +218,7 @@ pub fn extract_text2d_sprite(
                             anchor: Vec2::ZERO,
                             rect: None,
                             scaling_mode: None,
-                            custom_size: Some(run.strikethrough_size()),
-                        },
-                    });
-                }
-
-                if has_underline {
-                    let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                    let offset = run.underline_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
-                    extracted_sprites.sprites.push(ExtractedSprite {
-                        main_entity,
-                        render_entity,
-                        transform,
-                        color,
-                        image_handle_id: AssetId::default(),
-                        flip_x: false,
-                        flip_y: false,
-                        kind: ExtractedSpriteKind::Single {
-                            anchor: Vec2::ZERO,
-                            rect: None,
-                            scaling_mode: None,
-                            custom_size: Some(run.underline_size()),
+                            custom_size: Some(size),
                         },
                     });
                 }
@@ -339,7 +317,7 @@ pub fn extract_text2d_sprite(
                     extracted_sprites.sprites.push(ExtractedSprite {
                         main_entity,
                         render_entity,
-                        transform,
+                        transform: text_transform,
                         color: paint.unwrap_or(color),
                         image_handle_id: atlas_info.texture,
                         flip_x: false,
@@ -365,22 +343,31 @@ pub fn extract_text2d_sprite(
             else {
                 continue;
             };
-            if has_strike_through {
-                let color = maybe_strikethrough_color
-                    .map(|c| c.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-                let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                let offset = run.strikethrough_position();
-                let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
-                    * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
+            for (color, position, size) in [
+                has_strike_through.then(|| {
+                    (
+                        maybe_strikethrough_color.map_or(text_color.0, |c| c.0),
+                        run.strikethrough_position(),
+                        run.strikethrough_size(),
+                    )
+                }),
+                has_underline.then(|| {
+                    (
+                        maybe_underline_color.map_or(text_color.0, |c| c.0),
+                        run.underline_position(),
+                        run.underline_size(),
+                    )
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 extracted_sprites.sprites.push(ExtractedSprite {
                     main_entity,
-                    render_entity,
-                    transform,
-                    color,
+                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
+                    transform: text_transform
+                        * GlobalTransform::from_translation(position.extend(0.)),
+                    color: color.to_linear(),
                     image_handle_id: AssetId::default(),
                     flip_x: false,
                     flip_y: false,
@@ -388,35 +375,7 @@ pub fn extract_text2d_sprite(
                         anchor: Vec2::ZERO,
                         rect: None,
                         scaling_mode: None,
-                        custom_size: Some(run.strikethrough_size()),
-                    },
-                });
-            }
-
-            if has_underline {
-                let color = maybe_underline_color
-                    .map(|c| c.0)
-                    .unwrap_or(text_color.0)
-                    .to_linear();
-                let render_entity = commands.spawn(TemporaryRenderEntity).id();
-                let offset = run.underline_position();
-                let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
-                    * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
-                extracted_sprites.sprites.push(ExtractedSprite {
-                    main_entity,
-                    render_entity,
-                    transform,
-                    color,
-                    image_handle_id: AssetId::default(),
-                    flip_x: false,
-                    flip_y: false,
-                    kind: ExtractedSpriteKind::Single {
-                        anchor: Vec2::ZERO,
-                        rect: None,
-                        scaling_mode: None,
-                        custom_size: Some(run.underline_size()),
+                        custom_size: Some(size),
                     },
                 });
             }

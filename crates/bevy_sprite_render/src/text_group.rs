@@ -8,7 +8,7 @@ use bevy_asset::{
 use bevy_color::{Alpha, LinearRgba};
 use bevy_ecs::{change_detection::Tick, entity::EntityHashMap, prelude::*, query::QueryData};
 use bevy_image::Image;
-use bevy_math::{Rect, UVec2, Vec2};
+use bevy_math::{ops, Rect, UVec2, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::{collections::HashMap, time::Instant};
 use bevy_render::{
@@ -299,7 +299,7 @@ impl TextGroupCache {
         entity: Entity,
         images: &Assets<Image>,
         layout: &Ref<TextLayoutInfo>,
-        sections: &[bevy_text::TextEntity],
+        sections: &[TextEntity],
         styles: &Query<TextGroupStyleQuery>,
         effects: TextGroupEffects,
     ) -> impl Iterator<Item = TextGroupTile> + '_ {
@@ -922,7 +922,7 @@ fn prepare_groups(
 fn instance(bounds: Rect, color: LinearRgba, coverage: u32, page_size: u32) -> GroupInstance {
     let min = bounds.min / page_size as f32;
     let size = bounds.size() / page_size as f32;
-    let gamma = |v: f32| v.max(0.).powf(1. / 2.2);
+    let gamma = |v: f32| ops::powf(v.max(0.), 1. / 2.2);
     GroupInstance {
         rect: [min.x, min.y, size.x, size.y],
         uv: [0.; 4],
