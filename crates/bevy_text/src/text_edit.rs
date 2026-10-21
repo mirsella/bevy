@@ -199,6 +199,14 @@ pub enum TextEdit {
         /// The committed text to insert at the cursor.
         value: SmolStr,
     },
+    /// Undo the most recent text change, restoring its cursor and selection.
+    ///
+    /// Apply through [`crate::EditableText::apply_pending_edits`], which owns history.
+    Undo,
+    /// Redo the most recently undone text change.
+    ///
+    /// Apply through [`crate::EditableText::apply_pending_edits`], which owns history.
+    Redo,
 }
 
 impl TextEdit {
@@ -212,6 +220,8 @@ impl TextEdit {
 
     /// Apply the [`TextEdit`] to the text editor driver.
     ///
+    /// Undo and redo require the history owned by [`EditableText`](super::EditableText)
+    /// and cannot be applied directly to a driver.
     /// Note that some edits, such as [`TextEdit::Paste`], may need to be deferred across frames due to asynchronous clipboard I/O.
     /// For proper handling of deferred edits, use [`EditableText::apply_pending_edits`](super::EditableText::apply_pending_edits) instead,
     /// which manages the queuing and application of edits by storing them in the [`EditableText`](super::EditableText) component.
@@ -223,6 +233,11 @@ impl TextEdit {
         char_filter: impl Fn(char) -> bool,
     ) {
         match self {
+            TextEdit::Undo | TextEdit::Redo => {
+                bevy_log::warn_once!(
+                    "Undo and redo require EditableText::apply_pending_edits, not TextEdit::apply."
+                );
+            }
             TextEdit::Copy => {
                 if let Some(text) = driver.editor.selected_text()
                     && let Err(e) = clipboard.set_text(text)
@@ -305,13 +320,7 @@ impl TextEdit {
             }
             TextEdit::ImeCommit { value: text } => {
                 driver.clear_compose();
-                if text.chars().all(&char_filter)
-                    && max_characters.is_none_or(|max| {
-                        driver.editor.text().chars().count() + text.chars().count() <= max
-                    })
-                {
-                    driver.insert_or_replace_selection(text.as_str());
-                }
+                let _ = insert_filtered(driver, text.as_str(), max_characters, char_filter);
             }
         }
     }

@@ -14,6 +14,7 @@
 //! - Shift+arrow and Shift+word-arrow to extend the selection by character or word
 //! - Backspace and delete operations, both for single characters and words
 //! - Clipboard operations (copy, cut, paste) — requires the `system_clipboard` feature for OS clipboard integration
+//! - Undo and redo, with grouped typing and cursor/selection restoration
 //! - Click to place cursor; click and drag to extend the selection
 //! - Multi-click: double-click to select a word, triple-click to select a line
 //! - Optional select-all on focus via the `SelectAllOnFocus` component
@@ -57,7 +58,6 @@
 //!
 //! However, the following features are planned but currently not implemented:
 //!
-//! - Undo/redo functionality
 //! - Text validation (e.g., email format, numeric input)
 //! - Password-style character masking
 //! - Mobile pop-up keyboard support
@@ -73,14 +73,17 @@
 // and `bevy_ui`, such as text layout and font management.
 
 use crate::{
+    edit_history::{EditKind, Snapshot},
     text_edit::{poll_and_apply_paste, TextEdit},
-    FontCx, FontHinting, LayoutCx, LineHeight, TextBrush, TextColor, TextFont, TextLayout,
+    FontCx, FontHinting, LayoutCx, LineHeight, TextBrush, TextColor, TextEditHistory, TextFont,
+    TextLayout,
 };
 use alloc::sync::Arc;
 use bevy_clipboard::ClipboardRead;
 use bevy_color::{palettes::tailwind::SLATE_400, Color};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::prelude::*;
+use bevy_platform::time::Instant;
 use core::time::Duration;
 use parley::{FontContext, LayoutContext, PlainEditor, SplitString};
 
@@ -116,6 +119,9 @@ pub struct EditableText {
     /// These operations should generally be batched together to avoid redundant layout work.
     // The B: Brush generic here must match the brush used by `ComputedTextBlock` to ensure that the font system is compatible.
     pub editor: PlainEditor<TextBrush>,
+    /// Undo and redo history for queued edits. Cleared by [`Self::clear`].
+    /// Direct text replacements are detected before applying edits.
+    pub history: TextEditHistory,
     /// Text edit actions that have been requested but not yet applied.
     ///
     /// These edits are processed in first-in, first-out order.
@@ -179,6 +185,7 @@ impl Default for EditableText {
         Self {
             // Defaults selected to match `Text::default()`
             editor: PlainEditor::new(100.),
+            history: TextEditHistory::default(),
             pending_edits: Vec::new(),
             pending_paste: None,
             cursor_width: 0.2,
@@ -209,6 +216,8 @@ impl EditableText {
 
     /// Mutably access the internal [`PlainEditor`].
     ///
+    /// Direct text replacements discard history before the next queued edit.
+    /// Use queued edits for undoable user input.
     pub fn editor_mut(&mut self) -> &mut PlainEditor<TextBrush> {
         &mut self.editor
     }
@@ -243,40 +252,61 @@ impl EditableText {
     ) {
         let Self {
             editor,
+            history,
             pending_edits,
             pending_paste,
             max_characters,
             ..
         } = self;
 
+        // A direct set_text leaves Parley's old selection until layout refresh.
+        // Clamp it before taking snapshots or inserting into the new buffer.
+        editor.refresh_layout(font_context, layout_context);
+        history.synchronize(editor);
         let mut driver = editor.driver(font_context, layout_context);
 
-        // First: resolve any paste carried over from a previous frame. If it's still
-        // pending, hold the remaining edits (untouched in `pending_edits`) for next frame
-        // so ordering relative to the paste is preserved.
-        if let Some(mut read) = pending_paste.take()
-            && !poll_and_apply_paste(&mut read, &mut driver, *max_characters, &char_filter)
-        {
-            *pending_paste = Some(read);
-            return;
-        }
-
-        // Drain edits one at a time. A paste that resolves synchronously (always the case
-        // on native) applies immediately, but a still-pending paste stashes its `ClipboardRead` and
-        // requeues the *remaining* edits, so this loop continually requeues the pending paste until it resolves.
         let mut edits = core::mem::take(pending_edits).into_iter();
-        while let Some(edit) = edits.next() {
+        loop {
+            // An in-flight paste stays ahead of every subsequently queued edit.
+            let edit = if pending_paste.is_some() {
+                TextEdit::Paste
+            } else if let Some(edit) = edits.next() {
+                edit
+            } else {
+                break;
+            };
             match edit {
                 TextEdit::Paste => {
-                    let mut read = clipboard.fetch_text();
-                    if !poll_and_apply_paste(&mut read, &mut driver, *max_characters, &char_filter)
-                    {
-                        *pending_paste = Some(read);
-                        pending_edits.extend(edits);
+                    let before = Snapshot::capture(driver.editor);
+                    let read = pending_paste.get_or_insert_with(|| clipboard.fetch_text());
+                    if !poll_and_apply_paste(read, &mut driver, *max_characters, &char_filter) {
+                        *pending_edits = edits.collect();
                         return;
                     }
+                    *pending_paste = None;
+                    history.record(before, driver.editor, None, Instant::now());
                 }
-                other => other.apply(&mut driver, clipboard, *max_characters, &char_filter),
+                TextEdit::Undo => history.restore(&mut driver, false),
+                TextEdit::Redo => history.restore(&mut driver, true),
+                TextEdit::ImeSetCompose { ref value, .. } => {
+                    let cancelling = value.is_empty();
+                    if !cancelling {
+                        history.begin_compose(driver.editor);
+                    }
+                    edit.apply(&mut driver, clipboard, *max_characters, &char_filter);
+                    if cancelling {
+                        history.cancel_compose(&mut driver);
+                    }
+                }
+                other => {
+                    let before = match other {
+                        TextEdit::ImeCommit { .. } => history.before_commit(&mut driver),
+                        _ => Snapshot::capture(driver.editor),
+                    };
+                    let kind = EditKind::for_edit(&other, driver.editor);
+                    other.apply(&mut driver, clipboard, *max_characters, &char_filter);
+                    history.record(before, driver.editor, kind, Instant::now());
+                }
             }
         }
     }
@@ -287,6 +317,7 @@ impl EditableText {
     /// will still complete, but its result is discarded.
     pub fn clear(&mut self) {
         self.editor.set_text("");
+        self.history.clear();
         self.pending_edits.clear();
         self.pending_paste = None;
     }

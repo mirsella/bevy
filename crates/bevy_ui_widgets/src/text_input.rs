@@ -40,8 +40,8 @@ const COMMAND: u8 = if cfg!(target_os = "macos") {
 // Modifier key for word-level navigation and selection. Alt on macOS, Control otherwise.
 const WORD: u8 = if cfg!(target_os = "macos") { ALT } else { CTRL };
 const SHIFT_WORD: u8 = SHIFT | WORD;
-#[cfg(target_os = "macos")]
 const SHIFT_SUPER: u8 = SHIFT | SUPER;
+const SHIFT_CTRL: u8 = SHIFT | CTRL;
 const SHIFT_COMMAND: u8 = SHIFT | COMMAND;
 #[cfg(not(target_os = "macos"))]
 const SHIFT_ALT: u8 = SHIFT | ALT;
@@ -95,6 +95,19 @@ fn on_focused_keyboard_input(
         (NONE, Key::Copy) => queue_edit(TextEdit::Copy),
         (NONE, Key::Cut) => queue_edit(TextEdit::Cut),
         (NONE, Key::Paste) => queue_edit(TextEdit::Paste),
+        (NONE, Key::Undo) => queue_edit(TextEdit::Undo),
+        (NONE, Key::Redo) => queue_edit(TextEdit::Redo),
+        // Accept both command modifiers so macOS browser builds also work.
+        // The browser host OS is independent of Rust's wasm target OS.
+        (CTRL | SUPER, Key::Character(c)) if c.eq_ignore_ascii_case("z") => {
+            queue_edit(TextEdit::Undo);
+        }
+        (SHIFT_CTRL | SHIFT_SUPER, Key::Character(c)) if c.eq_ignore_ascii_case("z") => {
+            queue_edit(TextEdit::Redo);
+        }
+        (CTRL, Key::Character(c)) if c.eq_ignore_ascii_case("y") => {
+            queue_edit(TextEdit::Redo);
+        }
         (COMMAND, Key::Character(c)) if c.eq_ignore_ascii_case("a") => {
             queue_edit(TextEdit::SelectAll);
         }
@@ -559,6 +572,88 @@ impl Plugin for EditableTextInputPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_input::{keyboard::KeyCode, ButtonState};
+    use bevy_input_focus::dispatch_focused_input;
+
+    #[test]
+    fn history_shortcuts_are_cross_platform_and_focus_scoped() {
+        for (modifiers, key, state, expected) in [
+            (
+                vec![Key::Control],
+                "z",
+                ButtonState::Pressed,
+                Some(TextEdit::Undo),
+            ),
+            (
+                vec![Key::Super],
+                "z",
+                ButtonState::Pressed,
+                Some(TextEdit::Undo),
+            ),
+            (
+                vec![Key::Control],
+                "y",
+                ButtonState::Pressed,
+                Some(TextEdit::Redo),
+            ),
+            (
+                vec![Key::Control, Key::Shift],
+                "Z",
+                ButtonState::Pressed,
+                Some(TextEdit::Redo),
+            ),
+            (
+                vec![Key::Super, Key::Shift],
+                "Z",
+                ButtonState::Pressed,
+                Some(TextEdit::Redo),
+            ),
+            (vec![Key::Control], "z", ButtonState::Released, None),
+            (
+                vec![Key::Control, Key::Alt],
+                "z",
+                ButtonState::Pressed,
+                None,
+            ),
+        ] {
+            let mut app = App::new();
+            let mut keys = ButtonInput::<Key>::default();
+            for modifier in modifiers {
+                keys.press(modifier);
+            }
+            app.insert_resource(keys)
+                .init_resource::<InputFocus>()
+                .add_message::<KeyboardInput>()
+                .add_systems(PreUpdate, dispatch_focused_input::<KeyboardInput>)
+                .add_observer(on_focused_keyboard_input);
+            let window = app.world_mut().spawn(PrimaryWindow).id();
+            let editor = app.world_mut().spawn(EditableText::default()).id();
+            let other = app.world_mut().spawn(EditableText::default()).id();
+            app.insert_resource(InputFocus::from_entity(editor));
+            app.world_mut().write_message(KeyboardInput {
+                key_code: KeyCode::KeyZ,
+                logical_key: Key::Character(key.into()),
+                state,
+                text: None,
+                repeat: false,
+                window,
+            });
+            app.world_mut().run_schedule(PreUpdate);
+            assert_eq!(
+                app.world()
+                    .get::<EditableText>(editor)
+                    .unwrap()
+                    .pending_edits,
+                expected.into_iter().collect::<Vec<_>>()
+            );
+            assert!(app
+                .world()
+                .get::<EditableText>(other)
+                .unwrap()
+                .pending_edits
+                .is_empty());
+        }
+    }
 
     fn ime_app(plugin: EditableTextInputPlugin) -> (App, Entity, Entity) {
         let mut app = App::new();

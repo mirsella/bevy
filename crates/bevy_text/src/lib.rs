@@ -33,6 +33,7 @@ extern crate alloc;
 
 mod bounds;
 mod cursor;
+mod edit_history;
 mod editing;
 mod error;
 mod font;
@@ -48,6 +49,7 @@ mod text_edit;
 
 pub use bounds::*;
 pub use cursor::*;
+pub use edit_history::TextEditHistory;
 pub use editing::*;
 pub use error::*;
 pub use font::*;
