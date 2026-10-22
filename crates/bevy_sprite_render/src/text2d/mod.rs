@@ -20,7 +20,7 @@ use bevy_sprite::{Anchor, Text2dOutline, Text2dShadow};
 use bevy_text::{
     glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
     PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor, TextBounds, TextColor,
-    TextEffectLayer, TextLayoutInfo, Underline, UnderlineColor,
+    TextEffectLayer, TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
 use bevy_text::{InheritedTextOpacity, TextOpacity};
 use bevy_transform::prelude::GlobalTransform;
@@ -46,6 +46,7 @@ pub fn extract_text2d_sprite(
             &Anchor,
             Option<&Text2dShadow>,
             Option<&Text2dOutline>,
+            Option<&TextPaintOrder>,
             &GlobalTransform,
         )>,
     >,
@@ -72,6 +73,7 @@ pub fn extract_text2d_sprite(
         anchor,
         maybe_shadow,
         maybe_outline,
+        paint_order,
         global_transform,
     ) in text2d_query.iter()
     {
@@ -81,6 +83,7 @@ pub fn extract_text2d_sprite(
         if !view_visibility.get() {
             continue;
         }
+        let paint_order = paint_order.copied().unwrap_or_default();
 
         let size = Vec2::new(
             text_bounds.width.unwrap_or(text_layout_info.size.x),
@@ -124,6 +127,7 @@ pub fn extract_text2d_sprite(
             let effects = TextGroupEffects {
                 shadow: shadow.map(|(c, o)| (c, Vec2::new(o.x, -o.y))),
                 outline,
+                paint_order,
                 tint_color_glyphs: true,
                 ..Default::default()
             };
@@ -230,8 +234,7 @@ pub fn extract_text2d_sprite(
             outline.map(|(_, width)| width),
         );
 
-        // Keep every shadow behind every stroke, and every stroke behind every fill.
-        for layer in TextEffectLayer::ALL {
+        for layer in paint_order.layers() {
             let (paint, offset) = match layer {
                 TextEffectLayer::Shadow => {
                     let Some((color, offset)) = shadow else {

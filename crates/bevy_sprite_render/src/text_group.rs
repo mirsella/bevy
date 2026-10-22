@@ -21,7 +21,8 @@ use bevy_render::{
 };
 use bevy_text::{
     glyph_effect_padding, FontSmoothing, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextColor, TextEffectLayer, TextEntity, TextLayoutInfo, Underline, UnderlineColor,
+    TextColor, TextEffectLayer, TextEntity, TextLayoutInfo, TextPaintOrder, Underline,
+    UnderlineColor,
 };
 use bytemuck::{Pod, Zeroable};
 use core::{ops::Range, time::Duration};
@@ -95,6 +96,7 @@ impl TextGroupStyleQueryItem<'_, '_> {
 pub struct TextGroupEffects {
     pub shadow: Option<(LinearRgba, Vec2)>,
     pub outline: Option<(LinearRgba, f32)>,
+    pub paint_order: TextPaintOrder,
     pub selected_color: Option<LinearRgba>,
     pub placeholder_color: Option<LinearRgba>,
     /// World text tints color glyphs; UI preserves their original RGB.
@@ -512,7 +514,7 @@ fn build_quads(
         effects.shadow.is_some() || effects.outline.is_some(),
         effects.outline.map(|(_, w)| w),
     );
-    for layer in TextEffectLayer::ALL {
+    for layer in effects.paint_order.layers() {
         let (paint, offset) = match layer {
             TextEffectLayer::Shadow => {
                 let Some((c, o)) = effects.shadow else {
@@ -1005,6 +1007,47 @@ fn render_groups(
 mod tests {
     use super::*;
     use bevy_ecs::system::SystemState;
+
+    #[test]
+    fn text_paint_order_is_opt_in_and_applies_across_atlases() {
+        let mut layout = glyph_layout(true);
+        let mut second = layout.glyphs[0].clone();
+        let images = Assets::<Image>::default();
+        second.atlas_info.texture = images.reserve_handle().id();
+        layout.glyphs.push(second);
+        let style = TextGroupStyle {
+            color: LinearRgba::WHITE,
+            background: None,
+            underline: None,
+            strikethrough: None,
+        };
+        assert_eq!(TextPaintOrder::default(), TextPaintOrder::StrokeThenFill);
+        let mut quads = Vec::new();
+        for (paint_order, expected) in [
+            (TextPaintOrder::default(), [3, 3, 2, 2, 1, 1]),
+            (TextPaintOrder::FillThenStroke, [3, 3, 1, 1, 2, 2]),
+            (TextPaintOrder::StrokeThenFill, [3, 3, 2, 2, 1, 1]),
+        ] {
+            build_quads(
+                &mut quads,
+                &layout,
+                &[style],
+                TextGroupEffects {
+                    shadow: Some((LinearRgba::BLACK, Vec2::ONE)),
+                    outline: Some((LinearRgba::BLACK, 0.5)),
+                    paint_order,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                quads.iter().map(|q| q.coverage).collect::<Vec<_>>(),
+                expected
+            );
+            for pair in quads.chunks_exact(2) {
+                assert_ne!(pair[0].image, pair[1].image);
+            }
+        }
+    }
     fn extract_test_group(world: &mut World, cache: &mut TextGroupCache, entity: Entity) -> usize {
         let mut state =
             SystemState::<(Query<Ref<TextLayoutInfo>>, Query<TextGroupStyleQuery>)>::new(world);

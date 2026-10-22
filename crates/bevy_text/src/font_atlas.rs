@@ -9,7 +9,7 @@ use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::{FontSmoothing, GlyphAtlasInfo, GlyphAtlasLocation, TextError};
 
-/// Paint order for a complete text block, including runs on different atlases.
+/// A paint layer within a text block.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TextEffectLayer {
@@ -19,8 +19,6 @@ pub enum TextEffectLayer {
 }
 
 impl TextEffectLayer {
-    pub const ALL: [Self; 3] = [Self::Shadow, Self::Outline, Self::Fill];
-
     /// Keep one transparent texel for filtering the face; only effect layers
     /// need the full stroke margin. This avoids shading empty face fragments.
     pub fn glyph_padding(self, padding: u32) -> f32 {

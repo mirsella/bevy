@@ -74,7 +74,7 @@ use bevy_text::{
     glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
     EditableText, EditableTextPlaceholderColor, PositionedGlyph, Strikethrough, StrikethroughColor,
     TextBackgroundColor, TextColor, TextCursorStyle, TextEffectLayer, TextEntity, TextFont,
-    TextLayoutInfo, Underline, UnderlineColor,
+    TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
@@ -904,6 +904,7 @@ pub fn extract_text_sections(
                 Option<&InheritedTextOpacity>,
                 Option<&TextShadow>,
                 Option<&TextOutline>,
+                Option<&TextPaintOrder>,
             ),
             Option<&TextScroll>,
             Option<&TextCursorStyle>,
@@ -926,7 +927,7 @@ pub fn extract_text_sections(
         computed_block,
         text_color,
         text_layout_info,
-        (opacity, inherited_opacity, maybe_shadow, maybe_outline),
+        (opacity, inherited_opacity, maybe_shadow, maybe_outline, paint_order),
         text_scroll,
         cursor_style,
         placeholder_color,
@@ -948,6 +949,7 @@ pub fn extract_text_sections(
             );
 
         let clip = calculate_text_scroll_clip(text_scroll, maybe_clip, uinode, global_transform);
+        let paint_order = paint_order.copied().unwrap_or_default();
 
         let mut color = text_color.0.to_linear();
 
@@ -988,6 +990,7 @@ pub fn extract_text_sections(
             let effects = TextGroupEffects {
                 shadow,
                 outline,
+                paint_order,
                 selected_color: selected_text_color,
                 placeholder_color: placeholder_color.map(|c| c.0.to_linear()),
                 tint_color_glyphs: false,
@@ -1083,6 +1086,7 @@ pub fn extract_text_sections(
             },
             shadow,
             outline,
+            paint_order,
             stack_index.0 as f32 + stack_z_offsets::TEXT,
             clip.clone(),
             extracted_camera_entity,
@@ -1103,6 +1107,7 @@ pub fn extract_text_sections(
                 |_| Some(placeholder_color),
                 shadow,
                 outline,
+                paint_order,
                 stack_index.0 as f32 + stack_z_offsets::TEXT,
                 clip,
                 extracted_camera_entity,
@@ -1120,6 +1125,7 @@ fn extract_glyphs<'a>(
     mut color: impl FnMut(&'a PositionedGlyph) -> Option<LinearRgba>,
     shadow: Option<(LinearRgba, Vec2)>,
     outline: Option<(LinearRgba, f32)>,
+    paint_order: TextPaintOrder,
     z_order: f32,
     clip: Option<CalculatedClip>,
     extracted_camera_entity: Entity,
@@ -1130,9 +1136,8 @@ fn extract_glyphs<'a>(
         shadow.is_some() || outline.is_some(),
         outline.map(|(_, width)| width),
     );
-    // Paint the whole block in layers: a later glyph's effects must never cover
-    // an earlier glyph's face, including when the run crosses atlas textures.
-    for layer in TextEffectLayer::ALL {
+    // Keep block-wide paint order even when the run crosses atlas textures.
+    for layer in paint_order.layers() {
         let (paint, offset, layer_flags) = match layer {
             TextEffectLayer::Shadow => {
                 let Some((color, offset)) = shadow else {

@@ -71,7 +71,8 @@ pub mod prelude {
     pub use crate::{
         Font, FontHinting, FontSize, FontSmoothing, FontSource, FontStyle, FontWeight, FontWidth,
         InheritedTextOpacity, Justify, LineBreak, Strikethrough, StrikethroughColor, TextColor,
-        TextError, TextFont, TextLayout, TextOpacity, TextSpan, Underline, UnderlineColor,
+        TextError, TextFont, TextLayout, TextOpacity, TextPaintOrder, TextSpan, Underline,
+        UnderlineColor,
     };
 }
 
