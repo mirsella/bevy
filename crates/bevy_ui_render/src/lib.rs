@@ -71,7 +71,7 @@ use surface::SurfacePlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
-    glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
+    glyph_effect_padding, text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock,
     EditableText, EditableTextPlaceholderColor, PositionedGlyph, Strikethrough, StrikethroughColor,
     TextBackgroundColor, TextColor, TextCursorStyle, TextEffectLayer, TextEntity, TextFont,
     TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
@@ -962,8 +962,8 @@ pub fn extract_text_sections(
         let outline = maybe_outline
             .filter(|outline| !outline.color.is_fully_transparent())
             .and_then(|outline| {
-                text_effect_outline_width(
-                    outline.width,
+                text_effect_outline_extent(
+                    outline.stroke_width,
                     text_layout_info.scale_factor,
                     entity,
                     "TextOutline",

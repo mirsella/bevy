@@ -50,28 +50,29 @@ pub fn text_effect_shadow_offset(
     Some(offset)
 }
 
-/// Returns a validated, physical-pixel outline width for atlas-composited text effects.
+/// Converts a full centered stroke width in logical pixels to its validated
+/// outward extent in physical pixels, used by atlas padding and rasterization.
 #[doc(hidden)]
-pub fn text_effect_outline_width(
-    width: f32,
+pub fn text_effect_outline_extent(
+    stroke_width: f32,
     scale_factor: f32,
     entity: Entity,
     component: &str,
 ) -> Option<f32> {
-    let width = width * scale_factor;
+    let physical_stroke_width = stroke_width * scale_factor;
 
-    if !width.is_finite() {
+    if !physical_stroke_width.is_finite() {
         bevy_log::warn_once!(
-            "Skipping {component} on {entity:?}: outline width must be finite, got {width}"
+            "Skipping {component} on {entity:?}: physical stroke width must be finite, got {physical_stroke_width}"
         );
         return None;
     }
 
-    if width <= 0.0 {
+    if physical_stroke_width <= 0.0 {
         return None;
     }
 
-    Some(width)
+    Some(physical_stroke_width * 0.5)
 }
 
 /// Padding shared by glyph atlas allocation and rendering. Keep a transparent
@@ -461,6 +462,22 @@ pub fn get_glyph_atlas_info(
 mod tests {
     use super::*;
 
+    #[test]
+    fn centered_stroke_width_converts_to_physical_outward_extent() {
+        for (stroke_width, scale, extent) in [(0.5, 1.0, 0.25), (2.0, 1.0, 1.0), (2.0, 2.0, 2.0)] {
+            assert_eq!(
+                text_effect_outline_extent(stroke_width, scale, Entity::PLACEHOLDER, "test"),
+                Some(extent)
+            );
+        }
+        for stroke_width in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                text_effect_outline_extent(stroke_width, 1.0, Entity::PLACEHOLDER, "test"),
+                None
+            );
+        }
+    }
+
     fn glyph(width: f32) -> Image {
         let font = swash::FontRef::from_index(include_bytes!("FiraMono-subset.ttf"), 0).unwrap();
         let mut context = swash::scale::ScaleContext::new();
@@ -523,7 +540,7 @@ mod tests {
     fn large_strokes_have_transparent_atlas_borders() {
         let width = 24.5;
         assert_eq!(
-            text_effect_outline_width(width, 1.0, Entity::PLACEHOLDER, "test"),
+            text_effect_outline_extent(width * 2.0, 1.0, Entity::PLACEHOLDER, "test"),
             Some(width)
         );
         let image = glyph(width);

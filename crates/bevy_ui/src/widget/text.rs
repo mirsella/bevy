@@ -19,7 +19,7 @@ use bevy_log::warn_once;
 use bevy_math::Vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_text::{
-    text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock, Font, FontAtlasSet,
+    text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock, Font, FontAtlasSet,
     FontCx, FontHinting, LayoutCx, LetterSpacing, LineBreak, LineHeight, RemSize, ScaleCx,
     TextBounds, TextColor, TextError, TextFont, TextLayout, TextLayoutInfo, TextMeasureInfo,
     TextPipeline, TextReader, TextSection, TextWriter,
@@ -165,10 +165,16 @@ impl Default for TextShadow {
 #[derive(Component, Copy, Clone, Debug, PartialEq, Reflect)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct TextOutline {
-    /// Outward stroke extent in logical pixels. The round stroke is centred on
-    /// the glyph contour with twice this width, then covered by the text fill.
+    /// Full centered stroke width in logical pixels, matching SVG `stroke-width`.
+    /// Half extends outside the glyph contour and half extends inside it.
+    /// With the default [`bevy_text::TextPaintOrder::StrokeThenFill`], the fill
+    /// covers the inward half. [`bevy_text::TextPaintOrder::FillThenStroke`]
+    /// leaves both halves visible, covering part of the glyph's face.
     /// Fractional widths are antialiased; the outline does not affect layout.
-    pub width: f32,
+    ///
+    /// Replaces the former outward `width`: use `stroke_width = 2.0 * old_width`
+    /// to preserve the appearance. The default is `2.0`.
+    pub stroke_width: f32,
     /// Outline color.
     pub color: Color,
 }
@@ -176,7 +182,7 @@ pub struct TextOutline {
 impl Default for TextOutline {
     fn default() -> Self {
         Self {
-            width: 1.0,
+            stroke_width: 2.0,
             color: Color::BLACK,
         }
     }
@@ -417,7 +423,12 @@ pub fn text_system(
             .as_deref()
             .filter(|outline| !outline.color.is_fully_transparent())
             .and_then(|outline| {
-                text_effect_outline_width(outline.width, scale_factor, entity, "TextOutline")
+                text_effect_outline_extent(
+                    outline.stroke_width,
+                    scale_factor,
+                    entity,
+                    "TextOutline",
+                )
             });
         let text_effect_padding = shadow_offset.is_some() || outline_width.is_some();
         let outline_changed = maybe_outline

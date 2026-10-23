@@ -18,7 +18,7 @@ use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dOutline, Text2dShadow};
 use bevy_text::{
-    glyph_effect_padding, text_effect_outline_width, text_effect_shadow_offset, ComputedTextBlock,
+    glyph_effect_padding, text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock,
     PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor, TextBounds, TextColor,
     TextEffectLayer, TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
@@ -110,8 +110,8 @@ pub fn extract_text2d_sprite(
         let outline = maybe_outline
             .filter(|outline| !outline.color.is_fully_transparent())
             .and_then(|outline| {
-                text_effect_outline_width(
-                    outline.width,
+                text_effect_outline_extent(
+                    outline.stroke_width,
                     text_layout_info.scale_factor,
                     main_entity,
                     "Text2dOutline",

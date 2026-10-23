@@ -30,8 +30,8 @@ pub enum TextPaintOrder {
     StrokeThenFill,
     /// Paint shadows, then all fills, then all strokes, as in SVG's default
     /// `paint-order`. The centered stroke covers part of each glyph's face and
-    /// may cover neighboring glyphs. Stroke width is still twice the outline
-    /// component's width; use `0.5` for a one-pixel centered SVG stroke.
+    /// may cover neighboring glyphs. The outline component's `stroke_width` is
+    /// the full centered width in either order; use `1.0` for a one-pixel SVG stroke.
     FillThenStroke,
 }
 
