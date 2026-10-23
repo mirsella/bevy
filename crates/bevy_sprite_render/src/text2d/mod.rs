@@ -46,7 +46,6 @@ pub fn extract_text2d_sprite(
             &Anchor,
             Option<&Text2dShadow>,
             Option<&Text2dOutline>,
-            Option<&TextPaintOrder>,
             &GlobalTransform,
         )>,
     >,
@@ -73,7 +72,6 @@ pub fn extract_text2d_sprite(
         anchor,
         maybe_shadow,
         maybe_outline,
-        paint_order,
         global_transform,
     ) in text2d_query.iter()
     {
@@ -83,7 +81,8 @@ pub fn extract_text2d_sprite(
         if !view_visibility.get() {
             continue;
         }
-        let paint_order = paint_order.copied().unwrap_or_default();
+        let paint_order =
+            maybe_outline.map_or(TextPaintOrder::default(), |outline| outline.paint_order);
 
         let size = Vec2::new(
             text_bounds.width.unwrap_or(text_layout_info.size.x),

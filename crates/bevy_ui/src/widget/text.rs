@@ -177,6 +177,8 @@ pub struct TextOutline {
     pub stroke_width: f32,
     /// Outline color.
     pub color: Color,
+    /// Paint order for the entire text block. Shadows always paint first.
+    pub paint_order: bevy_text::TextPaintOrder,
 }
 
 impl Default for TextOutline {
@@ -184,6 +186,7 @@ impl Default for TextOutline {
         Self {
             stroke_width: 2.0,
             color: Color::BLACK,
+            paint_order: bevy_text::TextPaintOrder::default(),
         }
     }
 }

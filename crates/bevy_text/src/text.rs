@@ -17,13 +17,12 @@ use tracing::warn;
 
 /// Controls whether the stroke covers the fill of a UI or 2D text block.
 ///
-/// Without this component, strokes are painted before fills, preserving every
-/// glyph's face even when neighboring glyphs overlap. Shadows always paint first.
-/// This setting applies to the entire block, not individual spans.
-#[derive(
-    Component, Debug, Default, Clone, Copy, PartialEq, Eq, Reflect, Serialize, Deserialize,
-)]
-#[reflect(Component, Debug, Default, Clone, PartialEq)]
+/// Set through the outline component's `paint_order` field. By default, strokes
+/// are painted before fills, preserving every glyph's face even when neighboring
+/// glyphs overlap. Shadows always paint first. This setting applies to the entire
+/// block, not individual spans.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Reflect, Serialize, Deserialize)]
+#[reflect(Debug, Default, Clone, PartialEq)]
 pub enum TextPaintOrder {
     /// Paint shadows, then all strokes, then all fills. The default behavior.
     #[default]

@@ -904,7 +904,6 @@ pub fn extract_text_sections(
                 Option<&InheritedTextOpacity>,
                 Option<&TextShadow>,
                 Option<&TextOutline>,
-                Option<&TextPaintOrder>,
             ),
             Option<&TextScroll>,
             Option<&TextCursorStyle>,
@@ -927,7 +926,7 @@ pub fn extract_text_sections(
         computed_block,
         text_color,
         text_layout_info,
-        (opacity, inherited_opacity, maybe_shadow, maybe_outline, paint_order),
+        (opacity, inherited_opacity, maybe_shadow, maybe_outline),
         text_scroll,
         cursor_style,
         placeholder_color,
@@ -949,7 +948,8 @@ pub fn extract_text_sections(
             );
 
         let clip = calculate_text_scroll_clip(text_scroll, maybe_clip, uinode, global_transform);
-        let paint_order = paint_order.copied().unwrap_or_default();
+        let paint_order =
+            maybe_outline.map_or(TextPaintOrder::default(), |outline| outline.paint_order);
 
         let mut color = text_color.0.to_linear();
 
