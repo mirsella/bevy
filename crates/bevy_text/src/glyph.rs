@@ -42,6 +42,8 @@ pub struct GlyphAtlasInfo {
     pub offset: Vec2,
     /// True if this glyph is stored as a tintable alpha mask
     pub is_alpha_mask: bool,
+    /// Transparent/effect margin allocated around the fill rect, in physical pixels.
+    pub padding: u32,
 }
 
 /// The location of a glyph in an atlas,
@@ -57,4 +59,6 @@ pub struct GlyphAtlasLocation {
     pub offset: Vec2,
     /// True if this glyph is stored as a tintable alpha mask
     pub is_alpha_mask: bool,
+    /// Transparent/effect margin allocated around the fill rect, in physical pixels.
+    pub padding: u32,
 }

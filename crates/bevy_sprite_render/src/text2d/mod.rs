@@ -18,9 +18,9 @@ use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dOutline, Text2dShadow};
 use bevy_text::{
-    glyph_effect_padding, text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock,
-    PositionedGlyph, Strikethrough, StrikethroughColor, TextBackgroundColor, TextBounds, TextColor,
-    TextEffectLayer, TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
+    text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock, PositionedGlyph,
+    Strikethrough, StrikethroughColor, TextBackgroundColor, TextBounds, TextColor, TextEffectLayer,
+    TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
 use bevy_text::{InheritedTextOpacity, TextOpacity};
 use bevy_transform::prelude::GlobalTransform;
@@ -228,11 +228,6 @@ pub fn extract_text2d_sprite(
             }
         }
 
-        let glyph_padding = glyph_effect_padding(
-            shadow.is_some() || outline.is_some(),
-            outline.map(|(_, width)| width),
-        );
-
         for layer in paint_order.layers() {
             let (paint, offset) = match layer {
                 TextEffectLayer::Shadow => {
@@ -249,7 +244,6 @@ pub fn extract_text2d_sprite(
             };
             let mut color = LinearRgba::WHITE;
             let mut current_section = usize::MAX;
-            let layer_padding = layer.glyph_padding(glyph_padding);
             let mut start = extracted_slices.slices.len();
 
             let mut glyphs = text_layout_info
@@ -296,7 +290,9 @@ pub fn extract_text2d_sprite(
                     TextEffectLayer::Fill => ExtractedTextEffect::None,
                 };
                 let rect = if atlas_info.is_alpha_mask || layer == TextEffectLayer::Shadow {
-                    atlas_info.rect.inflate(layer_padding)
+                    atlas_info
+                        .rect
+                        .inflate(layer.glyph_padding(atlas_info.padding))
                 } else {
                     atlas_info.rect
                 };

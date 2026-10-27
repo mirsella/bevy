@@ -71,8 +71,8 @@ use surface::SurfacePlugin;
 
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_text::{
-    glyph_effect_padding, text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock,
-    EditableText, EditableTextPlaceholderColor, PositionedGlyph, Strikethrough, StrikethroughColor,
+    text_effect_outline_extent, text_effect_shadow_offset, ComputedTextBlock, EditableText,
+    EditableTextPlaceholderColor, PositionedGlyph, Strikethrough, StrikethroughColor,
     TextBackgroundColor, TextColor, TextCursorStyle, TextEffectLayer, TextEntity, TextFont,
     TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
@@ -1132,10 +1132,6 @@ fn extract_glyphs<'a>(
     main_entity: MainEntity,
     transform: Affine2,
 ) {
-    let glyph_padding = glyph_effect_padding(
-        shadow.is_some() || outline.is_some(),
-        outline.map(|(_, width)| width),
-    );
     // Keep block-wide paint order even when the run crosses atlas textures.
     for layer in paint_order.layers() {
         let (paint, offset, layer_flags) = match layer {
@@ -1157,7 +1153,6 @@ fn extract_glyphs<'a>(
             } else {
                 0
             };
-        let layer_padding = layer.glyph_padding(glyph_padding);
         let mut start = extracted_uinodes.glyphs.len();
         let mut texture = None;
 
@@ -1190,7 +1185,9 @@ fn extract_glyphs<'a>(
 
             let atlas_info = &glyph.atlas_info;
             let rect = if atlas_info.is_alpha_mask || shadow.is_some() {
-                atlas_info.rect.inflate(layer_padding)
+                atlas_info
+                    .rect
+                    .inflate(layer.glyph_padding(atlas_info.padding))
             } else {
                 atlas_info.rect
             };

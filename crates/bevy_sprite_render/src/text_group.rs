@@ -20,9 +20,8 @@ use bevy_render::{
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_text::{
-    glyph_effect_padding, FontSmoothing, Strikethrough, StrikethroughColor, TextBackgroundColor,
-    TextColor, TextEffectLayer, TextEntity, TextLayoutInfo, TextPaintOrder, Underline,
-    UnderlineColor,
+    FontSmoothing, Strikethrough, StrikethroughColor, TextBackgroundColor, TextColor,
+    TextEffectLayer, TextEntity, TextLayoutInfo, TextPaintOrder, Underline, UnderlineColor,
 };
 use bytemuck::{Pod, Zeroable};
 use core::{ops::Range, time::Duration};
@@ -510,10 +509,6 @@ fn build_quads(
     if effects.shadow.is_some() {
         decorations(quads, effects.shadow);
     }
-    let padding = glyph_effect_padding(
-        effects.shadow.is_some() || effects.outline.is_some(),
-        effects.outline.map(|(_, w)| w),
-    );
     for layer in effects.paint_order.layers() {
         let (paint, offset) = match layer {
             TextEffectLayer::Shadow => {
@@ -537,7 +532,7 @@ fn build_quads(
                     continue;
                 }
                 let rect = if atlas.is_alpha_mask || layer == TextEffectLayer::Shadow {
-                    atlas.rect.inflate(layer.glyph_padding(padding))
+                    atlas.rect.inflate(layer.glyph_padding(atlas.padding))
                 } else {
                     atlas.rect
                 };
@@ -1169,11 +1164,42 @@ mod tests {
                     rect: Rect::from_corners(Vec2::ZERO, Vec2::splat(8.)),
                     offset: Vec2::ZERO,
                     is_alpha_mask,
+                    padding: 0,
                 },
                 section_index: 0,
                 line_index: 0,
             }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effect_quads_use_each_glyphs_actual_padding() {
+        let mut layout = glyph_layout(true);
+        layout.glyphs[0].atlas_info.padding = 7;
+        let mut second = layout.glyphs[0].clone();
+        second.atlas_info.padding = 3;
+        layout.glyphs.push(second);
+        let mut quads = Vec::new();
+        build_quads(
+            &mut quads,
+            &layout,
+            &[TextGroupStyle {
+                color: LinearRgba::WHITE,
+                background: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            TextGroupEffects {
+                shadow: Some((LinearRgba::BLACK, Vec2::ZERO)),
+                outline: Some((LinearRgba::BLACK, 1.0)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(quads.len(), 6);
+        for (quad, padding) in quads.iter().zip([7., 3., 7., 3., 1., 1.]) {
+            assert_eq!(quad.rect.size(), Vec2::splat(8. + padding * 2.));
+            assert_eq!(quad.bounds.size(), Vec2::splat(8. + padding * 2.));
         }
     }
 

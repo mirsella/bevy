@@ -75,18 +75,6 @@ pub fn text_effect_outline_extent(
     Some(physical_stroke_width * 0.5)
 }
 
-/// Padding shared by glyph atlas allocation and rendering. Keep a transparent
-/// texel outside the validated stroke for antialiasing and linear sampling.
-/// Translated shadows need no additional padding for their displacement.
-#[doc(hidden)]
-pub fn glyph_effect_padding(enabled: bool, outline_width: Option<f32>) -> u32 {
-    if enabled {
-        outline_width.map_or(1, |width| width.ceil() as u32 + 1)
-    } else {
-        0
-    }
-}
-
 /// Key identifying a glyph
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphCacheKey {
@@ -200,6 +188,7 @@ impl FontAtlas {
                     glyph_index,
                     offset,
                     is_alpha_mask,
+                    padding,
                 },
             );
             Ok(())
@@ -230,14 +219,13 @@ pub fn add_glyph_to_atlas(
     text_effect_padding: bool,
     outline_width: Option<f32>,
 ) -> Result<GlyphAtlasInfo, TextError> {
-    let (glyph_texture, offset, is_alpha_mask) = get_outlined_glyph_texture(
+    let (glyph_texture, offset, is_alpha_mask, padding) = get_outlined_glyph_texture(
         scaler,
         glyph_id,
         font_smoothing,
         text_effect_padding,
         outline_width,
     )?;
-    let padding = glyph_effect_padding(text_effect_padding, outline_width);
     let mut add_char_to_font_atlas = |atlas: &mut FontAtlas| -> Result<(), TextError> {
         atlas.add_glyph(
             textures,
@@ -279,14 +267,14 @@ pub fn add_glyph_to_atlas(
         .ok_or(TextError::InconsistentAtlasState)
 }
 
-/// Get the texture of the glyph as a rendered image, and its offset
+/// Get the glyph texture, its offset, whether it is an alpha mask, and its actual padding.
 pub fn get_outlined_glyph_texture(
     scaler: &mut Scaler,
     glyph_id: u16,
     font_smoothing: FontSmoothing,
     text_effect_padding: bool,
     outline_width: Option<f32>,
-) -> Result<(Image, Vec2, bool), TextError> {
+) -> Result<(Image, Vec2, bool, u32), TextError> {
     let mut image = swash::scale::Render::new(&[
         swash::scale::Source::ColorOutline(0),
         swash::scale::Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
@@ -296,7 +284,7 @@ pub fn get_outlined_glyph_texture(
     .render(scaler, glyph_id)
     .ok_or(TextError::FailedToGetGlyphImage(glyph_id))?;
 
-    let padding = glyph_effect_padding(text_effect_padding, outline_width);
+    let mut padding = u32::from(text_effect_padding);
     let left = image.placement.left;
     let top = image.placement.top;
     let mut width = image.placement.width;
@@ -304,8 +292,36 @@ pub fn get_outlined_glyph_texture(
 
     let (rgba, is_alpha_mask) = match image.content {
         swash::scale::image::Content::Mask => {
+            let stroke = outline_width
+                .filter(|outline_width| 0.0 < *outline_width)
+                .map(|outline_width| {
+                    swash::scale::Render::new(&[swash::scale::Source::Outline])
+                        .format(swash::zeno::Format::Alpha)
+                        .style(
+                            swash::zeno::Stroke::new(outline_width * 2.0)
+                                .join(swash::zeno::Join::Round),
+                        )
+                        .render(scaler, glyph_id)
+                        .ok_or(TextError::FailedToGetGlyphImage(glyph_id))
+                })
+                .transpose()?;
+            if let Some(stroke) = &stroke {
+                // Curved strokes can extend beyond the nominal radius. Measure the
+                // rasterized bounds before allocating, retaining a transparent texel
+                // on every side and symmetric padding to preserve fill positioning.
+                let left_padding = left - stroke.placement.left;
+                let top_padding = stroke.placement.top - top;
+                let right_padding = stroke.placement.width as i32 - width as i32 - left_padding;
+                let bottom_padding = stroke.placement.height as i32 - height as i32 - top_padding;
+                let stroke_padding = left_padding
+                    .max(top_padding)
+                    .max(right_padding)
+                    .max(bottom_padding)
+                    .max(0) as u32;
+                padding = stroke_padding + 1;
+            }
             apply_font_smoothing(&mut image.data, font_smoothing);
-            let fill_alpha = if text_effect_padding {
+            let fill_alpha = if padding != 0 {
                 width += padding * 2;
                 height += padding * 2;
                 pad_glyph::<1>(
@@ -318,39 +334,28 @@ pub fn get_outlined_glyph_texture(
                 image.data
             };
 
-            let outline_alpha = outline_width
-                .filter(|outline_width| 0.0 < *outline_width)
-                .map(|outline_width| {
-                    let stroke = swash::scale::Render::new(&[swash::scale::Source::Outline])
-                        .format(swash::zeno::Format::Alpha)
-                        .style(
-                            swash::zeno::Stroke::new(outline_width * 2.0)
-                                .join(swash::zeno::Join::Round),
-                        )
-                        .render(scaler, glyph_id)
-                        .ok_or(TextError::FailedToGetGlyphImage(glyph_id))?;
-                    let padding = padding as i32;
-                    let mut alpha = vec![0; (width * height) as usize];
-                    let offset_x = stroke.placement.left - left + padding;
-                    let offset_y = top - stroke.placement.top + padding;
-                    assert!(
-                        offset_x >= 0
-                            && offset_y >= 0
-                            && offset_x as u32 + stroke.placement.width <= width
-                            && offset_y as u32 + stroke.placement.height <= height,
-                        "text stroke exceeds glyph atlas padding"
-                    );
-                    let stroke_width = stroke.placement.width as usize;
-                    for y in 0..stroke.placement.height as usize {
-                        let target = (y + offset_y as usize) * width as usize + offset_x as usize;
-                        let source = y * stroke_width;
-                        alpha[target..target + stroke_width]
-                            .copy_from_slice(&stroke.data[source..source + stroke_width]);
-                    }
-                    apply_font_smoothing(&mut alpha, font_smoothing);
-                    Ok::<_, TextError>(alpha)
-                })
-                .transpose()?;
+            let outline_alpha = stroke.map(|stroke| {
+                let padding = padding as i32;
+                let mut alpha = vec![0; (width * height) as usize];
+                let offset_x = stroke.placement.left - left + padding;
+                let offset_y = top - stroke.placement.top + padding;
+                assert!(
+                    offset_x >= 0
+                        && offset_y >= 0
+                        && offset_x as u32 + stroke.placement.width <= width
+                        && offset_y as u32 + stroke.placement.height <= height,
+                    "text stroke exceeds glyph atlas padding"
+                );
+                let stroke_width = stroke.placement.width as usize;
+                for y in 0..stroke.placement.height as usize {
+                    let target = (y + offset_y as usize) * width as usize + offset_x as usize;
+                    let source = y * stroke_width;
+                    alpha[target..target + stroke_width]
+                        .copy_from_slice(&stroke.data[source..source + stroke_width]);
+                }
+                apply_font_smoothing(&mut alpha, font_smoothing);
+                alpha
+            });
 
             (
                 pack_text_glyph_texture(&fill_alpha, outline_alpha.as_deref()),
@@ -358,7 +363,7 @@ pub fn get_outlined_glyph_texture(
             )
         }
         swash::scale::image::Content::Color | swash::scale::image::Content::SubpixelMask => {
-            let data = if text_effect_padding {
+            let data = if padding != 0 {
                 width += padding * 2;
                 height += padding * 2;
                 pad_glyph::<4>(
@@ -389,6 +394,7 @@ pub fn get_outlined_glyph_texture(
         ),
         Vec2::new(left as f32, -top as f32),
         is_alpha_mask,
+        padding,
     ))
 }
 
@@ -454,6 +460,7 @@ pub fn get_glyph_atlas_info(
                 rect: atlas.texture_atlas.textures[location.glyph_index].as_rect(),
                 texture: atlas.texture.id(),
                 is_alpha_mask: location.is_alpha_mask,
+                padding: location.padding,
             })
     })
 }
@@ -478,26 +485,26 @@ mod tests {
         }
     }
 
-    fn glyph(width: f32) -> Image {
+    fn glyph(width: f32) -> (Image, u32) {
         let font = swash::FontRef::from_index(include_bytes!("FiraMono-subset.ttf"), 0).unwrap();
         let mut context = swash::scale::ScaleContext::new();
         let mut scaler = context.builder(font).size(32.0).hint(false).build();
-        get_outlined_glyph_texture(
+        let (image, _, _, padding) = get_outlined_glyph_texture(
             &mut scaler,
             font.charmap().map('A'),
             FontSmoothing::AntiAliased,
             true,
             Some(width),
         )
-        .unwrap()
-        .0
+        .unwrap();
+        (image, padding)
     }
 
     #[test]
     fn fractional_strokes_grow_smoothly_without_changing_the_fill() {
         let mut previous_coverage = 0;
-        let face = |image: &Image, width: f32| {
-            let padding = glyph_effect_padding(true, Some(width)) as usize;
+        let face = |image: &Image, padding: u32| {
+            let padding = padding as usize;
             let stride = image.width() as usize;
             let data = image.data.as_ref().unwrap();
             (padding..image.height() as usize - padding)
@@ -506,23 +513,27 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let fill = face(&glyph(0.1), 0.1);
+        let (image, padding) = glyph(0.1);
+        let fill = face(&image, padding);
         for width in [0.1, 0.2, 0.3, 0.49, 0.51, 0.7, 1.0, 2.0] {
-            let image = glyph(width);
+            let (image, padding) = glyph(width);
             let data = image.data.as_ref().unwrap();
             let coverage: u64 = data.chunks_exact(4).map(|pixel| u64::from(pixel[0])).sum();
             assert!(
                 coverage > previous_coverage,
                 "stroke did not grow at {width}"
             );
-            assert!(face(&image, width) == fill, "stroke changed the glyph face");
+            assert!(
+                face(&image, padding) == fill,
+                "stroke changed the glyph face"
+            );
             previous_coverage = coverage;
         }
     }
 
     #[test]
     fn stroke_covers_antialiased_fill_edges_without_subtracting_them() {
-        let data = glyph(2.0).data.unwrap();
+        let data = glyph(2.0).0.data.unwrap();
         let mut edges = 0;
         for pixel in data.chunks_exact(4) {
             if (1..255).contains(&pixel[3]) {
@@ -538,15 +549,13 @@ mod tests {
 
     #[test]
     fn large_strokes_have_transparent_atlas_borders() {
-        let width = 24.5;
-        assert_eq!(
-            text_effect_outline_extent(width * 2.0, 1.0, Entity::PLACEHOLDER, "test"),
-            Some(width)
-        );
-        let image = glyph(width);
+        assert_transparent_border(&glyph(24.5).0);
+    }
+
+    fn assert_transparent_border(image: &Image) {
         let stride = image.width() as usize;
         let height = image.height() as usize;
-        let data = image.data.unwrap();
+        let data = image.data.as_ref().unwrap();
         for (i, pixel) in data.chunks_exact(4).enumerate() {
             if i < stride
                 || i >= stride * (height - 1)
@@ -560,6 +569,68 @@ mod tests {
     }
 
     #[test]
+    fn curved_stroke_bounds_determine_atlas_padding() {
+        let font = swash::FontRef::from_index(include_bytes!("FiraMono-subset.ttf"), 0).unwrap();
+        let mut context = swash::scale::ScaleContext::new();
+        let mut scaler = context.builder(font).size(12.0).hint(false).build();
+        let glyph_id = font.charmap().map('$');
+        let extent = 24.5;
+        let (image, offset, is_alpha_mask, padding) = get_outlined_glyph_texture(
+            &mut scaler,
+            glyph_id,
+            FontSmoothing::AntiAliased,
+            true,
+            Some(extent),
+        )
+        .unwrap();
+        // This glyph exceeds the old nominal stroke-radius-plus-one margin.
+        assert!(padding > extent.ceil() as u32 + 1);
+        assert_transparent_border(&image);
+
+        let mut textures = Assets::default();
+        let mut atlases = Vec::new();
+        let atlas = add_glyph_to_atlas(
+            &mut atlases,
+            &mut textures,
+            &mut scaler,
+            FontSmoothing::AntiAliased,
+            glyph_id,
+            true,
+            Some(extent),
+        )
+        .unwrap();
+        assert!(is_alpha_mask);
+        assert_eq!(atlas.padding, padding);
+        assert_eq!(atlas.offset, offset);
+        assert_eq!(
+            atlas.rect.size(),
+            Vec2::new(image.width() as f32, image.height() as f32)
+                - Vec2::splat(2.0 * padding as f32)
+        );
+    }
+
+    #[test]
+    fn effects_without_strokes_only_need_a_filtering_texel() {
+        let font = swash::FontRef::from_index(include_bytes!("FiraMono-subset.ttf"), 0).unwrap();
+        let mut context = swash::scale::ScaleContext::new();
+        let mut scaler = context.builder(font).size(32.0).hint(false).build();
+        for enabled in [false, true] {
+            let (image, _, _, padding) = get_outlined_glyph_texture(
+                &mut scaler,
+                font.charmap().map('A'),
+                FontSmoothing::AntiAliased,
+                enabled,
+                None,
+            )
+            .unwrap();
+            assert_eq!(padding, u32::from(enabled));
+            if enabled {
+                assert_transparent_border(&image);
+            }
+        }
+    }
+
+    #[test]
     fn shadow_displacement_is_not_limited_by_atlas_padding() {
         let entity = Entity::PLACEHOLDER;
         let offset = Vec2::new(80.0, -48.0);
@@ -567,7 +638,5 @@ mod tests {
             text_effect_shadow_offset(offset, 2.0, entity, "test"),
             Some(offset * 2.0)
         );
-        assert_eq!(glyph_effect_padding(true, None), 1);
-        assert_eq!(glyph_effect_padding(true, Some(1.25)), 3);
     }
 }
