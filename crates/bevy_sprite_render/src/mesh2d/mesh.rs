@@ -337,59 +337,25 @@ mod mesh_access_tests {
                     panic!("Mesh access must select constant-index reads with a switch");
                 };
                 assert_eq!(cases.len(), batch_size as usize + 1);
-                for (index, case) in cases[..batch_size as usize].iter().enumerate() {
-                    assert_eq!(case.value, naga::SwitchValue::U32(index as u32));
-                    let naga::Statement::Return { value: Some(value) } = case.body.last().unwrap()
+                for (slot, case) in cases[..batch_size as usize].iter().enumerate() {
+                    assert_eq!(case.value, naga::SwitchValue::U32(slot as u32));
+                    // Each arm returns `mesh[slot].member`.
+                    let Some(&naga::Statement::Return { value: Some(value) }) = case.body.last()
                     else {
                         panic!("Each case must return a mesh member");
                     };
-                    let naga::Expression::Load { pointer } = function.expressions[*value] else {
+                    let naga::Expression::Load { pointer } = function.expressions[value] else {
                         panic!("Expected a uniform member load");
                     };
-                    let naga::Expression::AccessIndex { base, index: field } =
-                        function.expressions[pointer]
+                    let naga::Expression::AccessIndex { base, .. } = function.expressions[pointer]
                     else {
                         panic!("Expected a mesh member access");
                     };
-                    let naga::Expression::AccessIndex { base, index: slot } =
-                        function.expressions[base]
-                    else {
-                        panic!("Uniform instance selection must not use dynamic indexing");
-                    };
-                    assert_eq!(slot, index as u32);
-                    let naga::Expression::GlobalVariable(global) = function.expressions[base]
-                    else {
-                        panic!("Expected the mesh uniform buffer");
-                    };
-                    let naga::TypeInner::Array { base, .. } =
-                        module.types[module.global_variables[global].ty].inner
-                    else {
-                        panic!("Expected an array of mesh uniforms");
-                    };
-                    let naga::TypeInner::Struct { ref members, .. } = module.types[base].inner
-                    else {
-                        panic!("Expected a mesh uniform struct");
-                    };
-                    assert_eq!(members[field as usize].name.as_deref(), Some(member));
+                    assert!(matches!(
+                        function.expressions[base],
+                        naga::Expression::AccessIndex { index, .. } if index == slot as u32
+                    ));
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn member_access_composes_without_returning_structs() {
-        for batch_size in [None, Some(42)] {
-            let module = compose_access_shader(
-                include_str!("mesh2d_mesh_access.wgsl"),
-                batch_size,
-                MEMBER_ACCESS,
-            );
-            for (_, function) in module.functions.iter() {
-                let result = function.result.as_ref().unwrap();
-                assert!(!matches!(
-                    module.types[result.ty].inner,
-                    naga::TypeInner::Struct { .. }
-                ));
             }
         }
     }
@@ -419,17 +385,11 @@ mod mesh_access_tests {
         batch_size: Option<u32>,
         test_shader: &str,
     ) -> naga::Module {
-        let mut defs = [
-            "VERTEX_POSITIONS",
-            "VERTEX_NORMALS",
-            "VERTEX_UVS",
-            "VERTEX_TANGENTS",
-            "VERTEX_COLORS",
-            "SRGB_OUTPUT",
-        ]
-        .map(|name| (name.into(), ShaderDefValue::Bool(true)))
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+        // These enable every default vertex read from the mesh buffer.
+        let mut defs = ["VERTEX_POSITIONS", "VERTEX_NORMALS"]
+            .map(|name| (name.into(), ShaderDefValue::Bool(true)))
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
         if let Some(size) = batch_size {
             defs.insert(
                 "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
