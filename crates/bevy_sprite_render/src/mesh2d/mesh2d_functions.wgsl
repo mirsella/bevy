@@ -2,12 +2,12 @@
 
 #import bevy_sprite::{
     mesh2d_view_bindings::view,
-    mesh2d_mesh_access::get_mesh,
+    mesh2d_mesh_access,
 }
 #import bevy_render::maths::{affine3_to_square, mat2x4_f32_to_mat3x3_unpack}
 
 fn get_world_from_local(instance_index: u32) -> mat4x4<f32> {
-    return affine3_to_square(get_mesh(instance_index).world_from_local);
+    return affine3_to_square(mesh2d_mesh_access::get_world_from_local(instance_index));
 }
 
 fn mesh2d_position_local_to_world(world_from_local: mat4x4<f32>, vertex_position: vec4<f32>) -> vec4<f32> {
@@ -27,10 +27,9 @@ fn mesh2d_position_local_to_clip(world_from_local: mat4x4<f32>, vertex_position:
 }
 
 fn mesh2d_normal_local_to_world(vertex_normal: vec3<f32>, instance_index: u32) -> vec3<f32> {
-    let mesh = get_mesh(instance_index);
     return mat2x4_f32_to_mat3x3_unpack(
-        mesh.local_from_world_transpose_a,
-        mesh.local_from_world_transpose_b,
+        mesh2d_mesh_access::get_local_from_world_transpose_a(instance_index),
+        mesh2d_mesh_access::get_local_from_world_transpose_b(instance_index),
     ) * vertex_normal;
 }
 
@@ -46,5 +45,5 @@ fn mesh2d_tangent_local_to_world(world_from_local: mat4x4<f32>, vertex_tangent: 
 }
 
 fn get_tag(instance_index: u32) -> u32 {
-    return get_mesh(instance_index).tag;
+    return mesh2d_mesh_access::get_tag(instance_index);
 }
