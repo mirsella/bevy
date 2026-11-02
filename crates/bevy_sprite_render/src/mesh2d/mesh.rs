@@ -255,25 +255,46 @@ fn mesh2d_uniform_access_shader(batch_size: u32) -> String {
 
     let mut source = String::from(
         "#define_import_path bevy_sprite::mesh2d_mesh_access\n\
-         #import bevy_sprite::{mesh2d_types::Mesh2d, mesh2d_bindings::mesh}\n\
-         fn get_mesh(instance_index: u32) -> Mesh2d {\n\
-         switch instance_index {\n",
+         #import bevy_sprite::mesh2d_bindings::mesh\n",
     );
-    for index in 0..batch_size {
-        writeln!(source, "case {index}u: {{ return mesh[{index}u]; }}").unwrap();
+    for (member, ty) in [
+        ("world_from_local", "mat3x4<f32>"),
+        ("local_from_world_transpose_a", "mat2x4<f32>"),
+        ("local_from_world_transpose_b", "f32"),
+        ("tag", "u32"),
+    ] {
+        writeln!(
+            source,
+            "fn get_{member}(instance_index: u32) -> {ty} {{\nswitch instance_index {{"
+        )
+        .unwrap();
+        for index in 0..batch_size {
+            writeln!(
+                source,
+                "case {index}u: {{ return mesh[{index}u].{member}; }}"
+            )
+            .unwrap();
+        }
+        // Batching guarantees in-range indices; WGSL still requires a default arm.
+        writeln!(source, "default: {{ return {ty}(); }}\n}}\n}}").unwrap();
     }
-    // Batching guarantees in-range indices; WGSL still requires a default arm.
-    source.push_str("default: { return Mesh2d(); }\n}\n}\n");
     source
 }
 
 #[cfg(test)]
-mod uniform_index_tests {
+mod mesh_access_tests {
     use super::{mesh2d_uniform_access_shader, needs_mesh2d_uniform_index_workaround};
     use bevy_render::settings::Backends;
     use naga_oil::compose::{
         ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue,
     };
+
+    const MEMBER_ACCESS: &str = "#import bevy_sprite::mesh2d_mesh_access\n\
+        @vertex fn vertex(@builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+        return mesh2d_mesh_access::get_world_from_local(i)[0]\n\
+        + mesh2d_mesh_access::get_local_from_world_transpose_a(i)[0]\n\
+        + vec4<f32>(mesh2d_mesh_access::get_local_from_world_transpose_b(i)\n\
+        + f32(mesh2d_mesh_access::get_tag(i)));\n}\n";
 
     #[test]
     fn only_identified_adreno_gl_adapters_need_workaround() {
@@ -293,64 +314,117 @@ mod uniform_index_tests {
     }
 
     #[test]
-    fn composed_uniform_switch_maps_each_instance_to_its_literal_slot() {
+    fn uniform_switches_read_each_member_from_its_literal_instance_slot() {
         for batch_size in [1, 2, 24, 42, 64] {
             let source = mesh2d_uniform_access_shader(batch_size);
-            let module = compose_access_shader(&source, Some(batch_size));
-            let (_, function) = module
-                .functions
-                .iter()
-                .find(|(_, function)| function.name.as_deref().unwrap().starts_with("get_mesh"))
-                .unwrap();
-            let naga::Statement::Switch { cases, .. } = &function.body[0] else {
-                panic!("Mesh access must select constant-index reads with a switch");
-            };
-            assert_eq!(cases.len(), batch_size as usize + 1);
-            for (index, case) in cases[..batch_size as usize].iter().enumerate() {
-                assert_eq!(case.value, naga::SwitchValue::U32(index as u32));
-                let naga::Statement::Return { value: Some(value) } = case.body.last().unwrap()
-                else {
-                    panic!("Each case must return the entire Mesh2d value");
+            let module = compose_access_shader(&source, Some(batch_size), MEMBER_ACCESS);
+            for member in [
+                "world_from_local",
+                "local_from_world_transpose_a",
+                "local_from_world_transpose_b",
+                "tag",
+            ] {
+                let name = format!("get_{member}");
+                let (_, function) = module
+                    .functions
+                    .iter()
+                    .find(|(_, function)| function.name.as_deref().unwrap().starts_with(&name))
+                    .unwrap();
+                assert!(function.expressions.iter().all(|(_, expression)| {
+                    !matches!(expression, naga::Expression::Access { .. })
+                }));
+                let naga::Statement::Switch { cases, .. } = &function.body[0] else {
+                    panic!("Mesh access must select constant-index reads with a switch");
                 };
-                let naga::Expression::Load { pointer } = function.expressions[*value] else {
-                    panic!("Expected a uniform load");
-                };
-                let naga::Expression::AccessIndex { base, index: slot } =
-                    function.expressions[pointer]
-                else {
-                    panic!("Uniform instance selection must not use dynamic indexing");
-                };
-                assert_eq!(slot, index as u32);
-                assert!(matches!(
-                    function.expressions[base],
-                    naga::Expression::GlobalVariable(_)
-                ));
+                assert_eq!(cases.len(), batch_size as usize + 1);
+                for (slot, case) in cases[..batch_size as usize].iter().enumerate() {
+                    assert_eq!(case.value, naga::SwitchValue::U32(slot as u32));
+                    // Each arm returns `mesh[slot].member`.
+                    let Some(&naga::Statement::Return { value: Some(value) }) = case.body.last()
+                    else {
+                        panic!("Each case must return a mesh member");
+                    };
+                    let naga::Expression::Load { pointer } = function.expressions[value] else {
+                        panic!("Expected a uniform member load");
+                    };
+                    let naga::Expression::AccessIndex { base, .. } = function.expressions[pointer]
+                    else {
+                        panic!("Expected a mesh member access");
+                    };
+                    assert!(matches!(
+                        function.expressions[base],
+                        naga::Expression::AccessIndex { index, .. } if index == slot as u32
+                    ));
+                }
             }
         }
     }
 
     #[test]
-    fn ordinary_accessor_composes_for_uniform_and_storage_buffers() {
-        for batch_size in [None, Some(42)] {
-            compose_access_shader(include_str!("mesh2d_mesh_access.wgsl"), batch_size);
+    fn default_vertex_avoids_mesh_struct_returns_for_all_buffer_paths() {
+        let generated = mesh2d_uniform_access_shader(42);
+        for (source, batch_size) in [
+            (include_str!("mesh2d_mesh_access.wgsl"), None),
+            (include_str!("mesh2d_mesh_access.wgsl"), Some(42)),
+            (generated.as_str(), Some(42)),
+        ] {
+            let module = compose_access_shader(source, batch_size, include_str!("mesh2d.wgsl"));
+            for (_, function) in module.functions.iter() {
+                if let Some(result) = &function.result {
+                    assert!(!module.types[result.ty]
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("Mesh2d")));
+                }
+            }
         }
     }
 
-    fn compose_access_shader(source: &str, batch_size: Option<u32>) -> naga::Module {
-        let defs = batch_size
-            .map(|size| {
-                (
-                    "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
-                    ShaderDefValue::UInt(size),
-                )
-            })
+    fn compose_access_shader(
+        source: &str,
+        batch_size: Option<u32>,
+        test_shader: &str,
+    ) -> naga::Module {
+        // These enable every default vertex read from the mesh buffer.
+        let mut defs = ["VERTEX_POSITIONS", "VERTEX_NORMALS"]
+            .map(|name| (name.into(), ShaderDefValue::Bool(true)))
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
+        if let Some(size) = batch_size {
+            defs.insert(
+                "PER_OBJECT_BUFFER_BATCH_SIZE".into(),
+                ShaderDefValue::UInt(size),
+            );
+        }
         let mut composer = Composer::default();
         for (source, file_path) in [
+            (
+                include_str!("../../../bevy_render/src/maths.wgsl"),
+                "maths.wgsl",
+            ),
+            (
+                include_str!("../../../bevy_render/src/view/view.wgsl"),
+                "view.wgsl",
+            ),
+            (
+                include_str!("../../../bevy_render/src/globals.wgsl"),
+                "globals.wgsl",
+            ),
             (include_str!("mesh2d_types.wgsl"), "mesh2d_types.wgsl"),
             (include_str!("mesh2d_bindings.wgsl"), "mesh2d_bindings.wgsl"),
             (source, "mesh2d_mesh_access.wgsl"),
+            (
+                include_str!("mesh2d_view_bindings.wgsl"),
+                "mesh2d_view_bindings.wgsl",
+            ),
+            (
+                include_str!("mesh2d_functions.wgsl"),
+                "mesh2d_functions.wgsl",
+            ),
+            (
+                include_str!("mesh2d_vertex_output.wgsl"),
+                "mesh2d_vertex_output.wgsl",
+            ),
         ] {
             composer
                 .add_composable_module(ComposableModuleDescriptor {
@@ -361,16 +435,14 @@ mod uniform_index_tests {
                 })
                 .unwrap();
         }
-        composer.make_naga_module(NagaModuleDescriptor {
-            source: "#import bevy_sprite::mesh2d_mesh_access::get_mesh\n\
-                @vertex fn vertex(@builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> {\n\
-                let m = get_mesh(i);\n\
-                return m.world_from_local[0] + m.local_from_world_transpose_a[0]\n\
-                + vec4<f32>(m.local_from_world_transpose_b + f32(m.flags) + f32(m.tag));\n}\n",
-            file_path: "mesh_access_test.wgsl",
-            shader_defs: defs,
-            ..Default::default()
-        }).unwrap()
+        composer
+            .make_naga_module(NagaModuleDescriptor {
+                source: test_shader,
+                file_path: "mesh_access_test.wgsl",
+                shader_defs: defs,
+                ..Default::default()
+            })
+            .unwrap()
     }
 }
 
