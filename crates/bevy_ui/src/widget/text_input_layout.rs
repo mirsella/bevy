@@ -297,6 +297,11 @@ pub fn update_editable_text_layout(
         placeholder,
     ) in input_field_query.iter_mut()
     {
+        // Width and layout refreshes update the editor's derived caches, not its
+        // text or configuration. Marking EditableText changed here makes the next
+        // frame reinstall its ContentSize measure and relayout the entire UI root.
+        // Input edits and style/configuration changes retain their own change ticks.
+        let editable_text = editable_text.bypass_change_detection();
         let cursor_width = editable_text.cursor_width;
         let cursor_height = editable_text.cursor_height;
         let cursor_blink_period = editable_text.cursor_blink_period;
@@ -546,7 +551,7 @@ pub fn update_editable_text_layout(
                 let placeholder = placeholder.as_deref().expect("placeholder is visible");
                 update_editable_text_placeholder_layout(
                     placeholder,
-                    &editable_text,
+                    editable_text,
                     &text_layout,
                     text_font,
                     *hinting,
@@ -843,6 +848,64 @@ fn scroll_axis(v_min: f32, v_max: f32, t_min: f32, t_max: f32) -> f32 {
 mod tests {
     use super::*;
     use bevy_app::{App, Update};
+    use bevy_ecs::{prelude::Resource, schedule::IntoScheduleConfigs};
+
+    #[test]
+    fn idle_editor_layout_preserves_content_size_change_detection() {
+        #[derive(Resource, Default)]
+        struct Changes(Vec<(bool, bool)>);
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Font>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<FontAtlasSet>()
+            .init_resource::<FontCx>()
+            .init_resource::<LayoutCx>()
+            .init_resource::<ScaleCx>()
+            .init_resource::<RemSize>()
+            .init_resource::<Time<Real>>()
+            .init_resource::<Changes>()
+            .add_systems(
+                Update,
+                (
+                    update_editable_text_content_size,
+                    update_editable_text_layout,
+                    |query: Query<(Ref<EditableText>, Ref<ContentSize>)>,
+                     mut changes: ResMut<Changes>| {
+                        let (editor, content) = query.single().unwrap();
+                        changes.0.push((editor.is_changed(), content.is_changed()));
+                    },
+                )
+                    .chain(),
+            );
+        let entity = app
+            .world_mut()
+            .spawn((
+                EditableText {
+                    visible_lines: Some(1.),
+                    ..Default::default()
+                },
+                Node::default(),
+                ContentSize::default(),
+                TextLayoutInfo::default(),
+                EditableTextGeneration::default(),
+            ))
+            .id();
+
+        app.update();
+        app.update();
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .visible_lines = Some(2.);
+        app.update();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<Changes>().0,
+            [(true, true), (false, false), (true, true), (false, false)]
+        );
+    }
 
     #[test]
     fn cursor_height_is_relative_to_line_bounds() {
