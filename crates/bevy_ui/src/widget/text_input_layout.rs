@@ -785,7 +785,16 @@ pub fn scroll_editable_text(
             continue;
         };
 
-        let Some((line_min, line_max)) = find_visual_line_bounds(layout, cursor.center().y) else {
+        // `info.cursor` is in render space, where vertically centered text is
+        // offset from the layout. Find the cursor's line in layout space.
+        let focus = editable_text
+            .editor
+            .raw_selection()
+            .focus()
+            .geometry(layout, 0.);
+        let Some((line_min, line_max)) =
+            find_visual_line_bounds(layout, bounding_box_to_rect(focus).center().y)
+        else {
             continue;
         };
 
@@ -905,6 +914,69 @@ mod tests {
             app.world().resource::<Changes>().0,
             [(true, true), (false, false), (true, true), (false, false)]
         );
+    }
+
+    #[test]
+    fn centered_input_taller_than_its_line_scrolls_to_the_cursor() {
+        let mut fonts = FontCx::default();
+        let font =
+            Font::from_bytes(include_bytes!("../../../bevy_text/src/FiraMono-subset.ttf").to_vec());
+        fonts.collection.register_fonts(font.data, None);
+        fonts.set_sans_serif_family("Fira Mono").unwrap();
+        let mut layout_cx = LayoutCx::default();
+        let mut editable_text =
+            EditableText::new("hello hello hello hello hello hello hello hello");
+        editable_text.editor_mut().set_width(None);
+        let (cursor, line_height) = {
+            let mut driver = editable_text
+                .editor_mut()
+                .driver(&mut fonts, &mut layout_cx);
+            driver.move_to_text_end();
+            let layout = driver.layout();
+            let line_height = layout.lines().next().unwrap().metrics().line_height;
+            (layout.len(), line_height)
+        };
+        assert_eq!(cursor, 1);
+        let layout = editable_text.editor.try_layout().unwrap();
+        let cursor = bounding_box_to_rect(
+            editable_text
+                .editor
+                .raw_selection()
+                .focus()
+                .geometry(layout, 2.),
+        );
+        // A centered input whose content box is several lines tall draws the
+        // cursor at its middle, below the single line of text.
+        let view = Vec2::new(100., line_height * 3.);
+        assert!(cursor.max.x > view.x);
+        let rendered = offset_rect_y(cursor, view.y * 0.5 - cursor.center().y);
+        assert!(rendered.center().y > line_height);
+
+        let mut app = App::new();
+        app.add_systems(Update, scroll_editable_text);
+        let entity = app
+            .world_mut()
+            .spawn((
+                editable_text,
+                EditableTextGeneration::default(),
+                TextScroll::default(),
+                ComputedNode {
+                    size: view,
+                    ..Default::default()
+                },
+                TextLayoutInfo {
+                    size: Vec2::new(cursor.max.x, line_height),
+                    cursor: Some((true, rendered)),
+                    ..Default::default()
+                },
+            ))
+            .id();
+        app.insert_resource(InputFocus::from_entity(entity));
+        app.update();
+
+        let scroll = app.world().get::<TextScroll>(entity).unwrap().0;
+        assert!(scroll.x >= cursor.max.x - view.x - 1., "{scroll:?}");
+        assert_eq!(scroll.y, 0.);
     }
 
     #[test]
