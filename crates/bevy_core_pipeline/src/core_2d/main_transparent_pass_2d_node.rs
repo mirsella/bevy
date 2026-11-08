@@ -1,4 +1,4 @@
-use crate::core_2d::Transparent2d;
+use crate::core_2d::{Empty2dPassSettings, Transparent2d};
 use bevy_ecs::prelude::*;
 use bevy_log::error;
 #[cfg(feature = "trace")]
@@ -21,6 +21,7 @@ pub fn main_transparent_pass_2d(
         &ViewDepthTexture,
     )>,
     transparent_phases: Res<ViewSortedRenderPhases<Transparent2d>>,
+    settings: Option<Res<Empty2dPassSettings>>,
     mut ctx: RenderContext,
 ) {
     let view_entity = view.entity();
@@ -31,11 +32,33 @@ pub fn main_transparent_pass_2d(
         return;
     };
 
+    let empty = transparent_phase.items.is_empty();
+    if empty
+        && settings
+            .as_ref()
+            .is_some_and(|settings| settings.skip_no_clear)
+        && camera.viewport.is_none()
+        && matches!(camera.clear_color, bevy_camera::ClearColorConfig::None)
+    {
+        return;
+    }
+
     #[cfg(feature = "trace")]
     let _span = info_span!("main_transparent_pass_2d").entered();
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
+
+    // Tile stores are outside in-pass timestamps on the FP3's Adreno driver.
+    let boundary = diagnostics.map(|recorder| {
+        recorder.time_span(
+            ctx.command_encoder(),
+            format!(
+                "core2d_boundary/camera_{}_{view_entity:?}/transparent",
+                camera.order
+            ),
+        )
+    });
 
     let color_attachments = [Some(target.get_color_attachment())];
     // NOTE: For the transparent pass we load the depth buffer. There should be no
@@ -44,7 +67,15 @@ pub fn main_transparent_pass_2d(
     // so that wgpu does not clear the depth buffer.
     // As the opaque and alpha mask passes run first, opaque meshes can occlude
     // transparent ones.
-    let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
+    let depth_stencil_attachment = if empty
+        && settings
+            .as_ref()
+            .is_some_and(|settings| settings.depth_free_clear)
+    {
+        None
+    } else {
+        Some(depth.get_attachment(StoreOp::Store))
+    };
 
     {
         let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
@@ -70,6 +101,9 @@ pub fn main_transparent_pass_2d(
         }
 
         pass_span.end(&mut render_pass);
+    }
+    if let Some(boundary) = boundary {
+        boundary.end(ctx.command_encoder());
     }
 
     // WebGL2 quirk: if ending with a render pass with a custom viewport, the viewport isn't

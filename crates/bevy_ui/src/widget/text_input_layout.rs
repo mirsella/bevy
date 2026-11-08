@@ -5,9 +5,9 @@ use crate::{AlignItems, ComputedNode, ComputedUiRenderTargetInfo, ContentSize, N
 use bevy_asset::Assets;
 
 use bevy_ecs::{
-    change_detection::{DetectChanges, DetectChangesMut},
+    change_detection::{DetectChanges, DetectChangesMut, Tick},
     component::Component,
-    entity::Entity,
+    entity::{Entity, EntityHashMap},
     reflect::ReflectComponent,
     system::{Local, Query, Res, ResMut},
     world::Ref,
@@ -67,22 +67,31 @@ impl crate::Measure for TextInputMeasure {
 /// - node width as `advance('0') * visible_width`, where `advance('0')` is looked up from font metrics.
 pub fn update_editable_text_content_size(
     mut text_input_query: Query<(
+        Entity,
         Ref<EditableText>,
         Ref<TextFont>,
         Ref<LineHeight>,
         Ref<ComputedUiRenderTargetInfo>,
+        Ref<Node>,
         &mut ContentSize,
     )>,
     fonts: Res<Assets<Font>>,
     mut font_cx: ResMut<FontCx>,
     rem_size: Res<RemSize>,
+    mut previous: Local<EntityHashMap<(Option<f32>, Option<f32>, Tick)>>,
 ) {
-    for (editable_text, text_font, line_height, target, mut content_size) in &mut text_input_query {
+    previous.retain(|entity, _| text_input_query.contains(*entity));
+    for (entity, editable_text, text_font, line_height, target, node, mut content_size) in
+        &mut text_input_query
+    {
         if !(editable_text.is_changed()
             || text_font.is_changed()
             || line_height.is_changed()
             || target.is_changed()
-            || rem_size.is_changed())
+            || rem_size.is_changed()
+            || fonts.is_changed()
+            || content_size.is_added()
+            || node.is_added())
         {
             continue;
         }
@@ -147,13 +156,23 @@ pub fn update_editable_text_content_size(
             visible_lines * logical_line_height * target.scale_factor()
         });
 
-        if width.is_some() || height.is_some() {
-            content_size.set(NodeMeasure::Custom(Box::new(TextInputMeasure {
-                width,
-                height,
-            })));
-        } else {
-            content_size.clear();
+        // Editor layout/caret maintenance can mark EditableText changed without
+        // changing its intrinsic dimensions. Replacing the same measure dirties
+        // Taffy all the way to the root, including offscreen input fields.
+        // Keep the tick too: replacing ContentSize externally must not hide a
+        // later update, and layout consumes the pending measure without a tick.
+        if node.is_added()
+            || previous.get(&entity) != Some(&(width, height, content_size.last_changed()))
+        {
+            if width.is_some() || height.is_some() {
+                content_size.set(NodeMeasure::Custom(Box::new(TextInputMeasure {
+                    width,
+                    height,
+                })));
+            } else {
+                content_size.clear();
+            }
+            previous.insert(entity, (width, height, content_size.last_changed()));
         }
     }
 }
@@ -977,6 +996,119 @@ mod tests {
         let scroll = app.world().get::<TextScroll>(entity).unwrap().0;
         assert!(scroll.x >= cursor.max.x - view.x - 1., "{scroll:?}");
         assert_eq!(scroll.y, 0.);
+    }
+    #[test]
+    fn editor_maintenance_preserves_measure_but_sizing_changes_replace_it() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Font>>()
+            .init_resource::<FontCx>()
+            .init_resource::<RemSize>()
+            .add_systems(Update, update_editable_text_content_size);
+        let entity = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                EditableText::new("hello"),
+                TextFont::from_font_size(20.),
+                LineHeight::RelativeToFont(1.),
+                ComputedUiRenderTargetInfo::default(),
+                ContentSize::default(),
+            ))
+            .id();
+        let tick = |app: &App| {
+            app.world()
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .last_changed()
+        };
+        app.update();
+        let original = tick(&app);
+        // Layout consumes the pending measurement. Keeping this None is essential:
+        // setting an equal new measure still invalidates the entire Taffy root.
+        app.world_mut()
+            .get_mut::<ContentSize>(entity)
+            .unwrap()
+            .bypass_change_detection()
+            .measure
+            .take();
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .set_changed();
+        app.update();
+        assert_eq!(tick(&app), original);
+        assert!(app
+            .world()
+            .get::<ContentSize>(entity)
+            .unwrap()
+            .measure
+            .is_none());
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .visible_lines = Some(2.);
+        app.update();
+        assert_ne!(tick(&app), original);
+        let sized = tick(&app);
+        app.world_mut()
+            .get_mut::<ComputedUiRenderTargetInfo>(entity)
+            .unwrap()
+            .scale_factor = 2.;
+        app.update();
+        assert_ne!(tick(&app), sized);
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .visible_lines = None;
+        app.update();
+        assert!(app
+            .world()
+            .get::<ContentSize>(entity)
+            .unwrap()
+            .measure
+            .is_none());
+        let cleared = tick(&app);
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .set_changed();
+        app.update();
+        assert_eq!(tick(&app), cleared);
+        app.world_mut()
+            .get_mut::<EditableText>(entity)
+            .unwrap()
+            .visible_lines = Some(1.);
+        app.update();
+        app.world_mut()
+            .entity_mut(entity)
+            .remove::<ContentSize>()
+            .insert(ContentSize::default());
+        app.update();
+        assert!(app
+            .world()
+            .get::<ContentSize>(entity)
+            .unwrap()
+            .measure
+            .is_some());
+        app.world_mut()
+            .get_mut::<ContentSize>(entity)
+            .unwrap()
+            .bypass_change_detection()
+            .measure
+            .take();
+        app.world_mut().entity_mut(entity).remove::<Node>();
+        app.update();
+        app.world_mut().entity_mut(entity).insert(Node::default());
+        app.update();
+        assert!(
+            app.world()
+                .get::<ContentSize>(entity)
+                .unwrap()
+                .measure
+                .is_some(),
+            "recreated layout nodes need their consumed intrinsic measurement restored"
+        );
     }
 
     #[test]

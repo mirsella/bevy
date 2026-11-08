@@ -164,7 +164,7 @@ where
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
+        let shader_defs = ui_color_shader_defs(key.target_format);
 
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
@@ -584,7 +584,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     pipeline_cache: Res<PipelineCache>,
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    render_views: Query<(&UiCameraView, &UiShaderVariants), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
@@ -596,8 +596,8 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             continue;
         };
 
-        let Ok(default_camera_view) =
-            render_views.get_mut(extracted_uinode.extracted_camera_entity)
+        let Ok((default_camera_view, variants)) =
+            render_views.get(extracted_uinode.extracted_camera_entity)
         else {
             continue;
         };
@@ -615,7 +615,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             &pipeline_cache,
             &ui_material_pipeline,
             UiMaterialKey {
-                target_format: ui_render_target_format(view.target_format),
+                target_format: variants.render_target_format(view.target_format),
                 bind_group_data: material.key.clone(),
             },
         );
@@ -634,5 +634,48 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
             index,
             indexed: false,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_reflect::TypePath;
+
+    #[derive(Asset, AsBindGroup, TypePath, Clone)]
+    struct TestMaterial {}
+
+    impl UiMaterial for TestMaterial {}
+
+    #[test]
+    fn material_format_keys_isolate_linear_color_and_shader_definitions() {
+        let pipeline = UiMaterialPipeline::<TestMaterial> {
+            ui_layout: BindGroupLayoutDescriptor::new("test_material", &[]),
+            view_layout: BindGroupLayoutDescriptor::new("test_view", &[]),
+            vertex_shader: Handle::default(),
+            fragment_shader: Handle::default(),
+            marker: PhantomData,
+        };
+        let keys =
+            [TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb].map(|target_format| {
+                UiMaterialKey::<TestMaterial> {
+                    target_format,
+                    bind_group_data: (),
+                }
+            });
+        assert!(keys[0] != keys[1]);
+        for key in keys {
+            let format = key.target_format;
+            let descriptor = pipeline.specialize(key);
+            let fragment = descriptor.fragment.unwrap();
+            assert_eq!(descriptor.vertex.shader_defs, fragment.shader_defs);
+            assert_eq!(fragment.targets[0].as_ref().unwrap().format, format);
+            assert_eq!(
+                fragment
+                    .shader_defs
+                    .contains(&MANUAL_SRGB_SHADER_DEF.into()),
+                !format.is_srgb()
+            );
+        }
     }
 }

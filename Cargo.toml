@@ -744,6 +744,7 @@ tracing = { version = "0.1", default-features = false, optional = true }
 bevy_dylib = { path = "crates/bevy_dylib", version = "0.19.1", default-features = false, optional = true }
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.10.0"
 chacha20 = { version = "0.10.0", default-features = false, features = ["rng"] }
 ron = "0.12"
@@ -784,6 +785,11 @@ getrandom = { version = "0.4", default-features = false, features = [
 ] }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["Window"] }
+
+[[test]]
+name = "ui_output_fusion"
+path = "tests/ui_output_fusion.rs"
+required-features = ["std", "bevy_ui_render", "bevy_sprite_render", "bevy_core_pipeline", "bevy_log"]
 
 [[example]]
 name = "context_menu"

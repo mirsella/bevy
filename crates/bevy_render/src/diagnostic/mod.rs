@@ -21,7 +21,7 @@ use wgpu::{BufferSlice, CommandEncoder};
 use bevy_app::{App, Plugin, PreUpdate};
 
 use crate::{
-    renderer::{PendingCommandBuffers, RenderGraph, RenderGraphSystems},
+    renderer::{PendingCommandBuffers, RenderGraph, RenderGraphSystems, RenderQueue},
     GpuResourceAppExt, RenderApp,
 };
 
@@ -39,6 +39,14 @@ use crate::renderer::RenderDevice;
 ///
 /// To access the diagnostics, you can use the [`DiagnosticsStore`](bevy_diagnostic::DiagnosticsStore) resource,
 /// add [`LogDiagnosticsPlugin`](bevy_diagnostic::LogDiagnosticsPlugin), or use [Tracy](https://github.com/bevyengine/bevy/blob/main/docs/profiling.md#tracy-renderqueue).
+///
+/// `render/frame/elapsed_gpu` brackets the render graph's command buffers with
+/// encoder timestamps, once per frame. It includes all cameras and overlapping
+/// inner spans exactly once, and survives exhaustion of the detailed query pool.
+/// This is GPU elapsed time, including pipeline bubbles or gaps between early
+/// submissions, not hardware busy time. Asset uploads outside the graph, screenshot
+/// readbacks and presentation are excluded. It is absent when encoder timestamps
+/// are unavailable (and on macOS, where encoder timestamps are disabled).
 ///
 /// To record diagnostics in your own passes:
 ///  1. First, obtain the diagnostic recorder using [`RenderContext::diagnostic_recorder`](crate::renderer::RenderContext::diagnostic_recorder).
@@ -84,10 +92,10 @@ impl Plugin for RenderDiagnosticsPlugin {
         render_app.add_systems(
             RenderGraph,
             (
-                begin_diagnostics_frame.in_set(RenderGraphSystems::Begin),
+                begin_diagnostics_frame.before(RenderGraphSystems::Begin),
                 resolve_encoder
-                    .after(RenderGraphSystems::Render)
-                    .before(RenderGraphSystems::Submit),
+                    .after(RenderGraphSystems::Submit)
+                    .before(RenderGraphSystems::Finish),
                 finish_diagnostics_frame.in_set(RenderGraphSystems::Finish),
             ),
         );
@@ -101,20 +109,34 @@ impl FromWorld for DiagnosticsRecorder {
 }
 
 /// Starts the diagnostics recorder for the frame.
-pub fn begin_diagnostics_frame(mut recorder: ResMut<DiagnosticsRecorder>) {
+pub fn begin_diagnostics_frame(
+    mut recorder: ResMut<DiagnosticsRecorder>,
+    render_device: Res<RenderDevice>,
+    mut pending_buffers: ResMut<PendingCommandBuffers>,
+) {
     recorder.begin_frame();
+    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("render_frame_start"),
+    });
+    if recorder.begin_gpu_frame(&mut encoder) {
+        // Prepend even if a plugin has already queued preparation commands. Use a
+        // finished buffer: pending encoders are appended after finished buffers.
+        let queued = pending_buffers.take();
+        pending_buffers.push(core::iter::once(encoder.finish()).chain(queued));
+    }
 }
 
 /// Resolves the encoder used for diagnostic recording
 pub fn resolve_encoder(
     mut recorder: ResMut<DiagnosticsRecorder>,
     render_device: Res<RenderDevice>,
-    mut pending_buffers: ResMut<PendingCommandBuffers>,
+    render_queue: Res<RenderQueue>,
 ) {
     let mut encoder =
         render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     recorder.resolve(&mut encoder);
-    pending_buffers.push_encoder(encoder);
+    // Include both the camera submission and any uncovered-window clear passes.
+    render_queue.submit([encoder.finish()]);
 }
 
 /// Ends the current frame for the diagnostics recorder and syncs it with the main world.
@@ -148,6 +170,11 @@ pub trait RecordDiagnostics: Send + Sync {
 
     /// Begin a pass span, which will record elapsed CPU and GPU time,
     /// as well as pipeline statistics on supported platforms.
+    ///
+    /// On some tiled GPUs, timestamps written inside a render pass describe only
+    /// one tile rather than the whole pass. For whole-pass GPU timing, surround
+    /// the render pass with [`Self::time_span`] on its command encoder instead.
+    /// Do not add overlapping inner and outer spans to obtain a frame total.
     ///
     /// Returns a guard, which will panic on drop unless you end the span.
     fn pass_span<P, N>(&self, pass: &mut P, name: N) -> PassSpanGuard<'_, Self, P>

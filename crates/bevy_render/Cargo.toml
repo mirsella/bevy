@@ -30,6 +30,9 @@ shader_format_spirv = ["bevy_shader/shader_format_spirv", "wgpu/spirv"]
 # Enable SPIR-V shader passthrough
 spirv_shader_passthrough = ["wgpu/spirv"]
 
+# Explicit, Vulkan-only shader precision experiment; never enabled by default.
+experimental_relaxed_precision = ["naga/spv-out", "dep:spirv"]
+
 # Statically linked DXC shader compiler for DirectX 12
 # TODO: When wgpu switches to DirectX 12 instead of Vulkan by default on windows, make this a default feature
 statically-linked-dxc = ["wgpu/static-dxc"]
@@ -105,6 +108,7 @@ wgpu = { version = "29.0.3", default-features = false, features = [
 ] }
 wgpu-types = { version = "29.0.3", default-features = false }
 naga = { version = "29.0.3", features = ["wgsl-in"] }
+spirv = { version = "0.4", optional = true }
 bytemuck = { version = "1.5", features = ["derive", "must_cast"] }
 downcast-rs = { version = "2", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false }

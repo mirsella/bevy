@@ -12,11 +12,12 @@ pub use window::*;
 use crate::{
     camera::{ExtractedCamera, MipBias, NormalizedRenderTargetExt as _, TemporalJitter},
     extract_component::ExtractComponentPlugin,
+    extract_resource::ExtractResource,
     occlusion_culling::OcclusionCulling,
     render_asset::RenderAssets,
     render_phase::ViewRangefinder3d,
     render_resource::{DynamicUniformBuffer, ShaderType, Texture, TextureView},
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderAdapter, RenderDevice, RenderQueue},
     sync_world::MainEntity,
     texture::{
         CachedTexture, ColorAttachment, DepthAttachment, GpuImage, ManualTextureViews,
@@ -41,8 +42,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use wgpu::{
-    BufferUsages, Color as WgpuColor, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    BufferUsages, Color as WgpuColor, DownlevelFlags, RenderPassColorAttachment,
+    RenderPassDepthStencilAttachment, StoreOp, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages,
 };
 
 /// The matrix that converts from the RGB to the LMS color space.
@@ -1194,12 +1196,26 @@ type MainTextureKey = (
     TextureUsages,
     TextureFormat,
     Msaa,
+    bool,
 );
+
+/// Opts sRGB main textures into compatible UNORM attachment views. Disabled by
+/// default: mutable-format allocations can affect compression on mobile GPUs.
+/// The application must extract this resource before preparing view targets.
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+pub struct SrgbMainTextureUnormView(pub bool);
+
+/// A render-world replacement has taken responsibility for this view's output.
+/// Insert only after its output pipeline is ready; remove when restoring upscaling.
+#[derive(Component)]
+pub struct SkipViewUpscaling;
 
 pub fn prepare_view_targets(
     mut commands: Commands,
     clear_color_global: Res<ClearColor>,
     render_device: Res<RenderDevice>,
+    render_adapter: Res<RenderAdapter>,
+    unorm_views: Option<Res<SrgbMainTextureUnormView>>,
     mut texture_cache: ResMut<TextureCache>,
     cameras: Query<(
         Entity,
@@ -1212,6 +1228,11 @@ pub fn prepare_view_targets(
     mut main_texture_atomics: Local<HashMap<MainTextureKey, Weak<AtomicUsize>>>,
 ) {
     main_texture_atomics.retain(|_, weak| weak.strong_count() > 0);
+    let supports_view_formats = render_adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(DownlevelFlags::VIEW_FORMATS);
+    let unorm_views = supports_view_formats && unorm_views.is_some_and(|views| views.0);
 
     let mut textures = <HashMap<_, _>>::default();
     for (entity, camera, view, texture_usage, msaa) in cameras.iter() {
@@ -1255,6 +1276,7 @@ pub fn prepare_view_targets(
             texture_usage.0,
             main_texture_format,
             *msaa,
+            unorm_views,
         );
         let (a, b, sampled, main_texture) = textures.entry(key.clone()).or_insert_with(|| {
             let descriptor = TextureDescriptor {
@@ -1265,10 +1287,20 @@ pub fn prepare_view_targets(
                 dimension: TextureDimension::D2,
                 format: main_texture_format,
                 usage: texture_usage.0,
-                view_formats: match main_texture_format {
-                    TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
-                    TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
-                    _ => &[],
+                view_formats: if supports_view_formats {
+                    match main_texture_format {
+                        TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
+                        TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
+                        TextureFormat::Bgra8UnormSrgb if unorm_views => {
+                            &[TextureFormat::Bgra8Unorm]
+                        }
+                        TextureFormat::Rgba8UnormSrgb if unorm_views => {
+                            &[TextureFormat::Rgba8Unorm]
+                        }
+                        _ => &[],
+                    }
+                } else {
+                    &[]
                 },
             };
             let a = texture_cache.get(

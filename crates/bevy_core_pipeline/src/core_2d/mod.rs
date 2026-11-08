@@ -44,6 +44,16 @@ use bevy_render::{
 
 pub const CORE_2D_DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 
+/// Opt-in diagnostic controls for passes with no transparent draws.
+/// Defaults preserve the reference renderer. Clear-only passes still clear color.
+#[derive(Resource, Clone, Copy, Debug, Default, bevy_render::extract_resource::ExtractResource)]
+pub struct Empty2dPassSettings {
+    /// Omit an empty pass only when neither color clearing nor viewport reset is needed.
+    pub skip_no_clear: bool,
+    /// Do not load/store depth when the transparent phase contains no draws.
+    pub depth_free_clear: bool,
+}
+
 pub struct Core2dPlugin;
 
 impl Plugin for Core2dPlugin {

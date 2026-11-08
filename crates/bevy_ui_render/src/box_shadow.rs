@@ -33,8 +33,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{
     clipping::clip_polygon,
-    pipeline::{ui_color_target_state, ui_render_target_format, MANUAL_SRGB_SHADER_DEF},
-    BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap,
+    pipeline::{ui_color_shader_defs, ui_color_target_state},
+    BoxShadowSamples, RenderUiSystems, TransparentUi, UiCameraMap, UiShaderVariants,
 };
 
 use super::{stack_z_offsets, UiCameraView, QUAD_VERTEX_POSITIONS};
@@ -131,10 +131,11 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
                 VertexFormat::Float32x2,
             ],
         );
-        let shader_defs = vec![
-            ShaderDefVal::UInt("SHADOW_SAMPLES".to_string(), key.samples),
-            MANUAL_SRGB_SHADER_DEF.into(),
-        ];
+        let mut shader_defs = vec![ShaderDefVal::UInt(
+            "SHADOW_SAMPLES".to_string(),
+            key.samples,
+        )];
+        shader_defs.extend(ui_color_shader_defs(key.target_format));
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -307,7 +308,10 @@ pub fn queue_shadows(
     box_shadow_pipeline: Res<BoxShadowPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BoxShadowPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, Option<&BoxShadowSamples>, &UiShaderVariants),
+        With<ExtractedView>,
+    >,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -315,7 +319,7 @@ pub fn queue_shadows(
     let draw_function = draw_functions.read().id::<DrawBoxShadows>();
     for (index, extracted_shadow) in extracted_box_shadows.box_shadows.iter().enumerate() {
         let entity = extracted_shadow.render_entity;
-        let Ok((default_camera_view, shadow_samples)) =
+        let Ok((default_camera_view, shadow_samples, variants)) =
             render_views.get(extracted_shadow.extracted_camera_entity)
         else {
             continue;
@@ -334,7 +338,7 @@ pub fn queue_shadows(
             &pipeline_cache,
             &box_shadow_pipeline,
             BoxShadowPipelineKey {
-                target_format: ui_render_target_format(view.target_format),
+                target_format: variants.render_target_format(view.target_format),
                 samples: shadow_samples.copied().unwrap_or_default().0,
             },
         );

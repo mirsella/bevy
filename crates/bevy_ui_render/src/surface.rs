@@ -3,18 +3,20 @@
 
 use crate::{
     clipping::{clip_polygon, rect_is_clipped, rect_without_hole, rounded_inner_rect},
-    pipeline::{ui_color_target_state, ui_render_target_format, UiPipelineKey},
+    pipeline::{ui_color_target_state, UiPipelineKey},
     render_pass::TransparentUi,
     stack_z_offsets,
     ui_mesh::{DrawUiMesh, UiMesh},
-    RenderUiSystems, UiAntiAlias, UiCameraMap, UiCameraView, QUAD_VERTEX_POSITIONS,
+    RenderUiSystems, UiAntiAlias, UiCameraMap, UiCameraView, UiShaderVariants,
+    QUAD_VERTEX_POSITIONS,
 };
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_camera::visibility::InheritedVisibility;
-use bevy_color::LinearRgba;
+use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::prelude::*;
 use bevy_math::{ops, Affine2, FloatOrd, Rect, Vec2};
+use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_phase::{
         AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, SetItemPipeline,
@@ -36,7 +38,9 @@ use bevy_ui::{
     ComputedStackIndex, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiGlobalTransform,
 };
 use bytemuck::{Pod, Zeroable};
+use core::ops::Range;
 
+pub(crate) mod cache;
 mod gradient;
 use gradient::GradientExtractor;
 
@@ -47,15 +51,18 @@ pub(crate) struct SurfacePlugin;
 
 impl Plugin for SurfacePlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(cache::SurfaceCachePlugin);
         load_shader_library!(app, "paint.wgsl");
         load_shader_library!(app, "gradient.wgsl");
         embedded_asset!(app, "surface.wgsl");
+        embedded_asset!(app, "surface_fill.wgsl");
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<ExtractedSurfaces>()
                 .init_gpu_resource::<SurfacePaint>()
                 .init_gpu_resource::<UiMesh<SurfaceVertex>>()
                 .init_gpu_resource::<SpecializedRenderPipelines<SurfacePipeline>>()
+                .init_gpu_resource::<SurfacePipelineVariants>()
                 .add_render_command::<TransparentUi, (SetItemPipeline, DrawUiMesh<SurfaceVertex>)>()
                 .add_systems(RenderStartup, init_surface_pipeline)
                 .add_systems(
@@ -98,8 +105,10 @@ struct SurfaceVertex {
 }
 
 struct ExtractedSurface {
+    shader: SurfaceShader,
     size: Vec2,
     paint: u32,
+    paint_range: Range<usize>,
     transform: Affine2,
     clip: Option<CalculatedClip>,
     camera: Entity,
@@ -108,6 +117,93 @@ struct ExtractedSurface {
     z_order: f32,
     hole: Option<Rect>,
 }
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[repr(usize)]
+enum SurfaceShader {
+    Full,
+    Solid,
+    RoundedFill,
+    RectFill,
+}
+
+impl SurfaceShader {
+    // Each shader supports every paint supported by the shaders to its right.
+    const ALL: [Self; 4] = [Self::Full, Self::Solid, Self::RoundedFill, Self::RectFill];
+
+    fn is_fill(self) -> bool {
+        matches!(self, Self::RoundedFill | Self::RectFill)
+    }
+}
+
+fn surface_shader(data: &GpuSurface) -> SurfaceShader {
+    // Border gradients are shared by all four sides. Test extracted layer counts,
+    // not source components, alpha, addresses or whether a side happens to show.
+    if data.background_gradients[1] != 0 || data.border_gradients[1] != 0 {
+        return SurfaceShader::Full;
+    }
+    // The full shader clamps the inset radii. Only specialize when that clamp
+    // is an identity, so its inner and outer SDFs really are equivalent.
+    let max_radius = data.size[0].min(data.size[1]) * 0.5;
+    if data.border != [0.; 4]
+        || data.background[3] == 0.
+        || data
+            .radius
+            .iter()
+            .any(|r| !r.is_finite() || *r < 0. || *r > max_radius)
+    {
+        SurfaceShader::Solid
+    } else if data.radius == [0.; 4] {
+        SurfaceShader::RectFill
+    } else {
+        SurfaceShader::RoundedFill
+    }
+}
+
+fn select_surface_shader(
+    shader: SurfaceShader,
+    variants: UiShaderVariants,
+    ready: impl Fn(SurfaceShader) -> bool,
+) -> SurfaceShader {
+    // Keep a compiled reference available, including when the solid experiment
+    // is enabled independently of the existing fill experiment.
+    if ready(SurfaceShader::Full) {
+        if variants.surfaces
+            && shader.is_fill()
+            && ready(SurfaceShader::RoundedFill)
+            && ready(SurfaceShader::RectFill)
+        {
+            return shader;
+        }
+        if variants.solid_surfaces && shader != SurfaceShader::Full && ready(SurfaceShader::Solid) {
+            return SurfaceShader::Solid;
+        }
+    }
+    SurfaceShader::Full
+}
+
+fn common_surface_pipeline(
+    choices: &[CachedRenderPipelineId; 4],
+    a: CachedRenderPipelineId,
+    b: CachedRenderPipelineId,
+) -> CachedRenderPipelineId {
+    let rank = |id| {
+        choices
+            .iter()
+            .position(|candidate| *candidate == id)
+            .expect("queued surface pipeline belongs to this view")
+    };
+    choices[rank(a).min(rank(b))]
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct SurfacePipelineKey {
+    ui: UiPipelineKey,
+    shader: SurfaceShader,
+}
+
+#[derive(Resource, Default)]
+struct SurfacePipelineVariants(HashMap<Entity, [CachedRenderPipelineId; 4]>);
 
 #[derive(Resource, Default)]
 struct ExtractedSurfaces {
@@ -199,6 +295,14 @@ fn gamma_color(color: LinearRgba) -> [f32; 4] {
     ]
 }
 
+fn surface_color(color: LinearRgba, linear_color: bool) -> [f32; 4] {
+    if linear_color {
+        color.to_f32_array()
+    } else {
+        gamma_color(color)
+    }
+}
+
 fn extract_surfaces(
     mut commands: Commands,
     mut extracted: ResMut<ExtractedSurfaces>,
@@ -221,6 +325,7 @@ fn extract_surfaces(
         )>,
     >,
     cameras: Extract<UiCameraMap>,
+    variants: Extract<Query<&UiShaderVariants>>,
     mut gradients: Local<GradientExtractor>,
 ) {
     let mut cameras = cameras.get_mapper();
@@ -249,7 +354,14 @@ fn extract_surfaces(
         let Some(camera) = cameras.map(camera) else {
             continue;
         };
-        let background = background.map_or([0.; 4], |c| gamma_color(c.0.to_linear()));
+        let linear_color = variants
+            .get(cameras.current_camera())
+            .is_ok_and(|variants| variants.linear_color);
+        let background =
+            background.map_or([0.; 4], |c| surface_color(c.0.to_linear(), linear_color));
+        // Each extraction appends all referenced gradient/stop records before
+        // its surface header. Keep their exact bytes for cache invalidation.
+        let paint_start = texels.len();
         let background_gradients = gradients.extract(
             background_gradient.map_or(&[], |g| g.0.as_slice()),
             node.size(),
@@ -261,7 +373,8 @@ fn extract_surfaces(
         } else {
             (
                 border.map_or([[0.; 4]; 4], |c| {
-                    [c.left, c.top, c.right, c.bottom].map(|color| gamma_color(color.to_linear()))
+                    [c.left, c.top, c.right, c.bottom]
+                        .map(|color| surface_color(color.to_linear(), linear_color))
                 }),
                 gradients.extract(
                     border_gradient.map_or(&[], |g| g.0.as_slice()),
@@ -292,9 +405,12 @@ fn extract_surfaces(
             border_gradients,
             padding: [0; 2],
         };
+        let paint = append_paint(texels, core::slice::from_ref(&data));
         surfaces.push(ExtractedSurface {
+            shader: surface_shader(&data),
             size: node.size(),
-            paint: append_paint(texels, core::slice::from_ref(&data)),
+            paint,
+            paint_range: paint_start..texels.len(),
             transform: transform.into(),
             clip: clip.cloned(),
             camera,
@@ -314,6 +430,7 @@ fn extract_surfaces(
 struct SurfacePipeline {
     layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
+    fill_shader: Handle<Shader>,
 }
 
 fn init_surface_pipeline(mut commands: Commands, assets: Res<AssetServer>) {
@@ -332,25 +449,43 @@ fn init_surface_pipeline(mut commands: Commands, assets: Res<AssetServer>) {
             ),
         ),
         shader: load_embedded_asset!(assets.as_ref(), "surface.wgsl"),
+        fill_shader: load_embedded_asset!(assets.as_ref(), "surface_fill.wgsl"),
     });
 }
 
 impl SpecializedRenderPipeline for SurfacePipeline {
-    type Key = UiPipelineKey;
+    type Key = SurfacePipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.ui.anti_alias {
             vec!["ANTI_ALIAS".into()]
         } else {
             vec![]
         };
-        let mut target = ui_color_target_state(key.target_format);
+        if key.ui.target_format.is_srgb() {
+            shader_defs.push("LINEAR_COLOR".into());
+        }
+        match key.shader {
+            SurfaceShader::Full => (),
+            SurfaceShader::Solid => shader_defs.push("SURFACE_SOLID".into()),
+            SurfaceShader::RectFill => shader_defs.push("SURFACE_RECT_FILL".into()),
+            SurfaceShader::RoundedFill => shader_defs.push("SURFACE_ROUNDED_FILL".into()),
+        }
+        if key.ui.rect_math && key.shader == SurfaceShader::RectFill {
+            shader_defs.push("CHEAP_RECT_DISTANCE".into());
+        }
+        let shader = if key.ui.lean_io && key.shader.is_fill() {
+            &self.fill_shader
+        } else {
+            &self.shader
+        };
+        let mut target = ui_color_target_state(key.ui.target_format);
         target.blend = Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING);
         RenderPipelineDescriptor {
             label: Some("ui_surface_pipeline".into()),
             layout: vec![self.layout.clone()],
             vertex: VertexState {
-                shader: self.shader.clone(),
+                shader: shader.clone(),
                 shader_defs: shader_defs.clone(),
                 buffers: vec![bevy_mesh::VertexBufferLayout::from_vertex_formats(
                     VertexStepMode::Vertex,
@@ -363,7 +498,7 @@ impl SpecializedRenderPipeline for SurfacePipeline {
                 ..Default::default()
             },
             fragment: Some(FragmentState {
-                shader: self.shader.clone(),
+                shader: shader.clone(),
                 shader_defs,
                 targets: vec![Some(target)],
                 ..Default::default()
@@ -378,34 +513,91 @@ fn queue_surfaces(
     pipeline: Res<SurfacePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SurfacePipeline>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    ui_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
-    views: Query<&ExtractedView>,
+    ui_views: Query<
+        (
+            Entity,
+            &UiCameraView,
+            Option<&UiAntiAlias>,
+            &UiShaderVariants,
+        ),
+        With<ExtractedView>,
+    >,
+    views: Query<(&ExtractedView, Has<cache::UiCachedSurfaces>)>,
     cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
+    mut prepared: ResMut<SurfacePipelineVariants>,
 ) {
+    prepared.0.clear();
+    for surface in &extracted.nodes {
+        let Ok((entity, camera, antialias, variants)) = ui_views.get(surface.camera) else {
+            continue;
+        };
+        if prepared.0.contains_key(&entity) {
+            continue;
+        }
+        let Ok((view, _)) = views.get(camera.0) else {
+            continue;
+        };
+        let ui = UiPipelineKey {
+            basic_image: false,
+            encoded_image: false,
+            relaxed_precision: false,
+            relaxed_colors: false,
+            target_format: variants.render_target_format(view.target_format),
+            anti_alias: matches!(antialias, None | Some(UiAntiAlias::On)),
+            image_rect: false,
+            pixel_aligned: false,
+            implicit_aligned: false,
+            rect_math: false,
+            lean_io: false,
+        };
+        prepared.0.insert(
+            entity,
+            SurfaceShader::ALL.map(|shader| {
+                // Do not compile another pipeline for default cameras.
+                let shader = if (shader == SurfaceShader::Solid && !variants.solid_surfaces)
+                    || (shader.is_fill() && !variants.surfaces)
+                {
+                    SurfaceShader::Full
+                } else {
+                    shader
+                };
+                let ui = UiPipelineKey {
+                    rect_math: shader == SurfaceShader::RectFill && variants.rect_math,
+                    lean_io: shader.is_fill() && variants.lean_io,
+                    ..ui
+                };
+                pipelines.specialize(&cache, &pipeline, SurfacePipelineKey { ui, shader })
+            }),
+        );
+    }
     let draw_function = draw_functions
         .read()
         .id::<(SetItemPipeline, DrawUiMesh<SurfaceVertex>)>();
+    let cached_draw_function = draw_functions.read().id::<cache::DrawCachedSurface>();
     for (index, surface) in extracted.nodes.iter().enumerate() {
-        let Ok((camera, antialias)) = ui_views.get(surface.camera) else {
+        let Ok((_, camera, _, variants)) = ui_views.get(surface.camera) else {
             continue;
         };
-        let Ok(view) = views.get(camera.0) else {
+        let Ok((view, cached)) = views.get(camera.0) else {
             continue;
         };
         let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-        let pipeline = pipelines.specialize(
-            &cache,
-            &pipeline,
-            UiPipelineKey {
-                target_format: ui_render_target_format(view.target_format),
-                anti_alias: matches!(antialias, None | Some(UiAntiAlias::On)),
-            },
-        );
+        let choices = prepared.0[&surface.camera];
+        let shader = select_surface_shader(surface.shader, *variants, |shader| {
+            cache
+                .get_render_pipeline(choices[shader as usize])
+                .is_some()
+        });
+        let pipeline = choices[shader as usize];
         phase.add_transient(TransparentUi {
-            draw_function,
+            draw_function: if cached {
+                cached_draw_function
+            } else {
+                draw_function
+            },
             pipeline,
             entity: (surface.render_entity, surface.entity),
             sort_key: FloatOrd(surface.z_order),
@@ -428,8 +620,12 @@ fn prepare_surfaces(
     view_uniforms: Res<ViewUniforms>,
     pipeline: Res<SurfacePipeline>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    prepared: Res<SurfacePipelineVariants>,
+    separate_views: Query<&ExtractedView, With<crate::UiSeparateBatches>>,
+    mut caching: cache::SurfaceCachePreparation,
 ) {
     let ExtractedSurfaces { nodes, texels } = &mut *extracted;
+    caching.begin_frame(nodes);
     if let Some(view_binding) = view_uniforms.uniforms.binding()
         && !nodes.is_empty()
     {
@@ -442,8 +638,11 @@ fn prepare_surfaces(
             &BindGroupEntries::sequential((view_binding, paint_view)),
         ));
         let mut batches = Vec::new();
-        for phase in phases.values_mut() {
-            let mut first = None;
+        for (view_entity, phase) in &mut phases.0 {
+            let separate = separate_views
+                .iter()
+                .any(|view| &view.retained_view_entity == view_entity);
+            let mut first: Option<usize> = None;
             for item_index in 0..phase.items.len() {
                 let item = &phase.items[item_index];
                 let Some(surface) = nodes
@@ -453,6 +652,7 @@ fn prepare_surfaces(
                     continue;
                 };
                 let start = mesh.indices.len() as u32;
+                let vertex_start = mesh.vertices.len();
                 for part in rect_without_hole(surface.size, surface.hole) {
                     let corners = QUAD_VERTEX_POSITIONS.map(|p| {
                         let point = part.center() + p * part.size();
@@ -467,6 +667,45 @@ fn prepare_surfaces(
                         }
                     }));
                 }
+                let isolated = caching.is_enabled(surface.camera)
+                    && caching.prepare(
+                        &mut commands,
+                        &device,
+                        &queue,
+                        &cache,
+                        surface,
+                        phase.items[item_index].pipeline,
+                        &mesh.vertices.values()[vertex_start..],
+                        vertex_start as u32,
+                        &mesh.indices.values()[start as usize..],
+                        start..mesh.indices.len() as u32,
+                        &texels[surface.paint_range.clone()],
+                    );
+                if isolated {
+                    // Only actual cached draws own a separate texture. Warming
+                    // and unsupported items keep ordinary reference batching.
+                    first = None;
+                }
+                // Preserve the original draw count: adjacent compatible paints
+                // can share the least general shader that supports the batch.
+                // Full > Solid > RoundedFill > RectFill. A gradient in any item
+                // promotes the entire batch to Full, never to Solid. Consequently
+                // this experiment cannot help an uninterrupted mixed paint batch
+                // unless UiSeparateBatches (additional draws) is also requested.
+                if !separate
+                    && !isolated
+                    && start != mesh.indices.len() as u32
+                    && let Some(first_index) = first
+                    && phase.items[first_index].batch_range.end == item_index as u32
+                {
+                    let common = common_surface_pipeline(
+                        &prepared.0[&surface.camera],
+                        phase.items[first_index].pipeline,
+                        phase.items[item_index].pipeline,
+                    );
+                    phase.items[first_index].pipeline = common;
+                    phase.items[item_index].pipeline = common;
+                }
                 mesh.finish_batch(
                     &mut phase.items,
                     &mut first,
@@ -474,12 +713,16 @@ fn prepare_surfaces(
                     start,
                     &mut batches,
                 );
+                if isolated {
+                    first = None;
+                }
             }
         }
         mesh.vertices.write_buffer(&device, &queue);
         mesh.indices.write_buffer(&device, &queue);
         commands.try_insert_batch(batches);
     }
+    caching.finish_frame();
     nodes.clear();
     texels.clear();
 }

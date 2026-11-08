@@ -122,10 +122,30 @@ impl LayoutCache {
 }
 
 fn load_module(
-    render_device: &RenderDevice,
+    (render_device, _backend): &(RenderDevice, wgpu::Backend),
     shader_source: ShaderCacheSource,
     validate_shader: &ValidateShader,
 ) -> Result<WgpuShaderModule, ShaderCacheError> {
+    #[cfg(not(feature = "decoupled_naga"))]
+    if matches!(
+        shader_source,
+        ShaderCacheSource::NagaRelaxedFragment(_) | ShaderCacheSource::NagaRelaxedColorFragment(_)
+    ) {
+        let (module, colors_only) = match shader_source {
+            ShaderCacheSource::NagaRelaxedFragment(module) => (module, false),
+            ShaderCacheSource::NagaRelaxedColorFragment(module) => (module, true),
+            _ => unreachable!("checked precision source"),
+        };
+        #[cfg(feature = "experimental_relaxed_precision")]
+        return relaxed_precision::load(render_device, *_backend, module, colors_only);
+        #[cfg(not(feature = "experimental_relaxed_precision"))]
+        {
+            let _ = (module, colors_only);
+            return Err(ShaderCacheError::CreateShaderModule(
+                "enable bevy_render/experimental_relaxed_precision for this opt-in shader".into(),
+            ));
+        }
+    }
     let shader_source = match shader_source {
         #[cfg(feature = "shader_format_spirv")]
         ShaderCacheSource::SpirV(data) => wgpu::util::make_spirv(data),
@@ -136,6 +156,11 @@ fn load_module(
         ShaderCacheSource::Wgsl(src) => ShaderSource::Wgsl(Cow::Owned(src)),
         #[cfg(not(feature = "decoupled_naga"))]
         ShaderCacheSource::Naga(src) => ShaderSource::Naga(Cow::Owned(src)),
+        #[cfg(not(feature = "decoupled_naga"))]
+        ShaderCacheSource::NagaRelaxedFragment(_)
+        | ShaderCacheSource::NagaRelaxedColorFragment(_) => {
+            unreachable!("handled before ordinary shaders")
+        }
     };
     let module_descriptor = ShaderModuleDescriptor {
         label: None,
@@ -172,6 +197,10 @@ fn load_module(
 
     Ok(shader_module)
 }
+
+#[cfg(feature = "experimental_relaxed_precision")]
+#[path = "relaxed_precision.rs"]
+mod relaxed_precision;
 
 #[derive(Default)]
 struct BindGroupLayoutCache {
@@ -210,7 +239,7 @@ impl BindGroupLayoutCache {
 pub struct PipelineCache {
     layout_cache: Arc<Mutex<LayoutCache>>,
     bindgroup_layout_cache: Arc<Mutex<BindGroupLayoutCache>>,
-    shader_cache: Arc<Mutex<ShaderCache<WgpuShaderModule, RenderDevice>>>,
+    shader_cache: Arc<Mutex<ShaderCache<WgpuShaderModule, (RenderDevice, wgpu::Backend)>>>,
     device: RenderDevice,
     pipelines: Vec<CachedPipeline>,
     waiting_pipelines: HashSet<CachedPipelineId>,
@@ -259,7 +288,7 @@ impl PipelineCache {
 
         Self {
             shader_cache: Arc::new(Mutex::new(ShaderCache::new(
-                device.clone(),
+                (device.clone(), render_adapter.get_info().backend),
                 device.features(),
                 render_adapter.get_downlevel_capabilities().flags,
                 load_module,
@@ -477,6 +506,10 @@ impl PipelineCache {
         id: CachedPipelineId,
         descriptor: RenderPipelineDescriptor,
     ) -> CachedPipelineState {
+        #[cfg(feature = "experimental_relaxed_precision")]
+        if let Err(error) = relaxed_precision::validate_layout(&descriptor) {
+            return CachedPipelineState::Err(error);
+        }
         let device = self.device.clone();
         let shader_cache = self.shader_cache.clone();
         let layout_cache = self.layout_cache.clone();

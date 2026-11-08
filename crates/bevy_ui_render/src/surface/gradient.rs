@@ -19,6 +19,17 @@ struct GpuGradient {
     stops_count: u32,
 }
 
+/// Convert only addresses, preserving all gradient/stop payload bits for cache keys.
+pub(super) fn relativize_stops(texels: &mut [[u32; 4]], count: u32, base: u32) {
+    let len = count as usize * size_of::<GpuGradient>() / size_of::<[u32; 4]>();
+    for gradient in bytemuck::cast_slice_mut::<_, GpuGradient>(&mut texels[..len]) {
+        gradient.stops_start = gradient
+            .stops_start
+            .checked_sub(base)
+            .expect("gradient stops belong to the surface paint range");
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuColorStop {
