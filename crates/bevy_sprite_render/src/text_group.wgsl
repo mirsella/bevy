@@ -33,7 +33,7 @@ fn fragment(in: Output) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv);
     if in.coverage.x == 4u {
         let size = bitcast<vec2<f32>>(in.coverage.yz);
-        let edge = clamp(min(in.uv + vec2(0.5), size - in.uv + vec2(0.5)), vec2(0.), vec2(1.));
+        let edge = clamp(min(in.uv + vec2(0.5), size) - max(in.uv - vec2(0.5), vec2(0.)), vec2(0.), vec2(1.));
         return vec4(in.color.rgb, in.color.a * edge.x * edge.y);
     }
     let sample = textureSampleGrad(atlas, atlas_sampler, in.uv, dx, dy);
