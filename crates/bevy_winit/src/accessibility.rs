@@ -2,7 +2,10 @@
 
 use alloc::{collections::VecDeque, sync::Arc};
 use bevy_input_focus::InputFocus;
-use core::cell::RefCell;
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use std::sync::Mutex;
 use winit::event_loop::ActiveEventLoop;
 
@@ -17,7 +20,12 @@ use bevy_a11y::{
 };
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{entity::EntityHashMap, prelude::*, system::NonSendMarker};
+use bevy_ecs::{
+    entity::EntityHashMap,
+    entity_disabling::Disabled,
+    prelude::*,
+    system::{NonSendMarker, SystemParam},
+};
 use bevy_window::{PrimaryWindow, Window, WindowClosed};
 
 thread_local! {
@@ -87,6 +95,7 @@ impl AccessKitState {
 
     fn build_initial_tree(&mut self) -> TreeUpdate {
         self.requested.set(true);
+        INITIAL_TREE_SENT.store(true, Ordering::Relaxed);
         window_tree_update(self.entity, &self.name, self.root_bounds)
     }
 }
@@ -183,21 +192,94 @@ fn poll_receivers(
     }
 }
 
-fn should_update_accessibility_nodes(
-    accessibility_requested: Res<AccessibilityRequested>,
-    manage_accessibility_updates: Res<ManageAccessibilityUpdates>,
-) -> bool {
-    accessibility_requested.get() && manage_accessibility_updates.get()
+/// Inputs of the window node, compared each frame because unrelated `Window`
+/// fields such as the cursor position change constantly.
+#[derive(Default, PartialEq)]
+struct WindowSemantics {
+    focused: bool,
+    size: bevy_math::UVec2,
+    title: String,
+}
+
+/// Tracks whether the published tree may differ from the ECS state.
+#[derive(Default)]
+struct TreeSync {
+    stale: bool,
+    window: WindowSemantics,
+}
+
+/// Set when an adapter publishes its window-only initial tree, for example after the window is
+/// recreated, so the nodes must be sent again.
+static INITIAL_TREE_SENT: AtomicBool = AtomicBool::new(false);
+
+/// Everything except the window that the published tree is built from or reset by.
+#[derive(SystemParam)]
+struct TreeChanges<'w, 's> {
+    focus: Option<Res<'w, InputFocus>>,
+    nodes: Query<'w, 's, (), With<AccessibilityNode>>,
+    changed_nodes: Query<'w, 's, (), Changed<AccessibilityNode>>,
+    changed_hierarchy: Query<'w, 's, Entity, Changed<Children>>,
+    parents: Query<'w, 's, &'static ChildOf>,
+    removed_nodes: RemovedComponents<'w, 's, AccessibilityNode>,
+    removed_hierarchy: RemovedComponents<'w, 's, Children>,
+    // Disabling hides an entity from the tree queries without a change tick, and a layout-only
+    // entity still links the nodes around it. Custom disabling components are not tracked.
+    disabled: Query<'w, 's, (), Added<Disabled>>,
+    enabled: RemovedComponents<'w, 's, Disabled>,
+    actions: MessageReader<'w, 's, ActionRequestWrapper>,
+}
+
+impl TreeChanges<'_, '_> {
+    /// Whether anything changed since the last call.
+    fn any(&mut self) -> bool {
+        // Only children of semantic nodes, or of layout entities below one, shape the tree.
+        let in_tree = |entity: Entity| {
+            self.nodes.contains(entity)
+                || self
+                    .parents
+                    .iter_ancestors(entity)
+                    .any(|parent| self.nodes.contains(parent))
+        };
+        // Drain the removals and messages on every call so old ones never trigger later updates.
+        let removed = self.removed_nodes.read().count() + self.enabled.read().count() > 0;
+        let removed = self
+            .removed_hierarchy
+            .read()
+            .fold(removed, |removed, entity| removed | in_tree(entity));
+        // The app may reject an action, such as an edit, without changing the tree, so the
+        // adapter must restore the DOM the action came from.
+        let acted = self.actions.read().count() > 0;
+        INITIAL_TREE_SENT.swap(false, Ordering::Relaxed)
+            || acted
+            || removed
+            || self.focus.as_ref().is_some_and(DetectChanges::is_changed)
+            || !self.changed_nodes.is_empty()
+            || !self.disabled.is_empty()
+            || self.changed_hierarchy.iter().any(in_tree)
+    }
 }
 
 fn update_accessibility_nodes(
+    accessibility_requested: Res<AccessibilityRequested>,
+    manage_accessibility_updates: Res<ManageAccessibilityUpdates>,
     focus: Option<Res<InputFocus>>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
     nodes: Query<(Entity, &AccessibilityNode)>,
     parents: Query<&ChildOf>,
     children: Query<&Children>,
+    mut changes: TreeChanges,
+    mut sync: Local<TreeSync>,
     _non_send_marker: NonSendMarker,
 ) {
+    // Rebuilding clones every node and makes the platform adapter diff the
+    // whole tree, so only do it when its inputs changed. The flag persists
+    // through the early returns below until an update is published.
+    sync.stale |= changes.any();
+    if !(accessibility_requested.get() && manage_accessibility_updates.get()) {
+        // Another owner or a fresh activation may replace the published tree.
+        sync.stale = true;
+        return;
+    }
     ACCESS_KIT_ADAPTERS.with_borrow_mut(|adapters| {
         let Ok((primary_window_id, primary_window)) = primary_window.single() else {
             return;
@@ -208,27 +290,40 @@ fn update_accessibility_nodes(
         let Some(focus) = focus else {
             return;
         };
-        if focus.is_changed() || !nodes.is_empty() {
-            // Don't panic if the focused entity does not currently exist
-            // It's probably waiting to be spawned
-            if let Some(focused_entity) = focus.get()
-                && focused_entity != primary_window_id
-                && !nodes.contains(focused_entity)
-            {
-                return;
-            }
-
-            adapter.update_if_active(|| {
-                update_adapter(
-                    nodes,
-                    parents,
-                    children,
-                    primary_window,
-                    primary_window_id,
-                    focus,
-                )
-            });
+        let window_changed = sync.window.focused != primary_window.focused
+            || sync.window.size != primary_window.physical_size()
+            || sync.window.title != primary_window.title;
+        if window_changed {
+            sync.window = WindowSemantics {
+                focused: primary_window.focused,
+                size: primary_window.physical_size(),
+                title: primary_window.title.clone(),
+            };
         }
+        sync.stale |= window_changed;
+        if !sync.stale {
+            return;
+        }
+        // Don't panic if the focused entity does not currently exist
+        // It's probably waiting to be spawned
+        if let Some(focused_entity) = focus.get()
+            && focused_entity != primary_window_id
+            && !nodes.contains(focused_entity)
+        {
+            return;
+        }
+
+        sync.stale = false;
+        adapter.update_if_active(|| {
+            update_adapter(
+                nodes,
+                parents,
+                children,
+                primary_window,
+                primary_window_id,
+                focus,
+            )
+        });
     });
 }
 
@@ -329,7 +424,6 @@ impl Plugin for AccessKitPlugin {
                 (
                     poll_receivers,
                     update_accessibility_nodes
-                        .run_if(should_update_accessibility_nodes)
                         // This is unlikely to result in real conflicts,
                         // as FocusChangeEvents only mutates internal state of InputFocus,
                         // and update_accessibility_nodes only reads from it.
@@ -411,5 +505,34 @@ mod tests {
         assert_eq!(children(root), ids(&[list, panel]));
         assert_eq!(children(list), ids(&[first, second]));
         assert_eq!(children(panel), ids(&[button]));
+    }
+
+    #[derive(Resource, Default)]
+    struct Stale(bool);
+
+    #[test]
+    fn disabling_a_layout_entity_invalidates_the_tree() {
+        let mut world = World::new();
+        world.init_resource::<Messages<ActionRequestWrapper>>();
+        world.init_resource::<Stale>();
+        let root = world.spawn(AccessibilityNode(Node::new(Role::Group))).id();
+        let layout = world.spawn(ChildOf(root)).id();
+        world.spawn((AccessibilityNode(Node::new(Role::Button)), ChildOf(layout)));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(|mut changes: TreeChanges, mut stale: ResMut<Stale>| {
+            stale.0 = changes.any();
+        });
+        let mut stale = |world: &mut World| {
+            schedule.run(world);
+            world.resource::<Stale>().0
+        };
+        assert!(stale(&mut world));
+        assert!(!stale(&mut world));
+        world.entity_mut(layout).insert(Disabled);
+        assert!(stale(&mut world));
+        assert!(!stale(&mut world));
+        world.entity_mut(layout).remove::<Disabled>();
+        assert!(stale(&mut world));
+        assert!(!stale(&mut world));
     }
 }
