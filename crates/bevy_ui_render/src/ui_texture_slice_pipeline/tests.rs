@@ -35,20 +35,6 @@ fn node() -> ExtractedUiTextureSlice {
 }
 
 #[test]
-fn cpu_slices_are_opt_in_in_every_constant() {
-    for variants in [
-        UiShaderVariants::default(),
-        UiShaderVariants::FULL,
-        UiShaderVariants::ALL,
-        UiShaderVariants::IMAGES,
-        UiShaderVariants::SURFACES,
-    ] {
-        assert!(!variants.cpu_slices);
-        assert!(!variants.approximate_cpu_slices);
-    }
-}
-
-#[test]
 fn eligibility_rejects_tiling_even_when_repeat_is_one() {
     let mut node = node();
     let size = Vec2::splat(64.);
@@ -368,7 +354,7 @@ fn batch_boundaries_isolate_buffers_images_target_formats_and_foreign_items() {
 }
 
 #[test]
-fn pipeline_keys_share_explicit_bindings_but_isolate_colour_and_vertex_formats() {
+fn pipeline_keys_share_explicit_bindings_but_isolate_vertex_formats() {
     let mut shaders = Assets::<Shader>::default();
     let pipeline = UiTextureSlicePipeline {
         view_layout: BindGroupLayoutDescriptor::new("view", &[]),
@@ -376,30 +362,39 @@ fn pipeline_keys_share_explicit_bindings_but_isolate_colour_and_vertex_formats()
         shader: shaders.add(Shader::from_wgsl("", "full")),
         cpu_shader: shaders.add(Shader::from_wgsl("", "cpu")),
     };
-    for target_format in [TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb] {
-        for cpu_slices in [false, true] {
-            let descriptor = pipeline.specialize(UiTextureSlicePipelineKey {
-                target_format,
-                cpu_slices,
-            });
-            assert_eq!(
-                descriptor.layout,
-                [pipeline.view_layout.clone(), pipeline.image_layout.clone()]
-            );
-            assert_eq!(
-                descriptor.vertex.buffers[0].array_stride,
-                if cpu_slices {
-                    size_of::<CpuSliceVertex>()
-                } else {
-                    size_of::<UiTextureSliceVertex>()
-                } as u64
-            );
-            let fragment = descriptor.fragment.unwrap();
-            assert_eq!(fragment.targets[0].as_ref().unwrap().format, target_format);
-            assert_eq!(
-                fragment.shader_defs.contains(&"MANUAL_SRGB".into()),
-                !target_format.is_srgb()
-            );
-        }
+    for cpu_slices in [false, true] {
+        let descriptor = pipeline.specialize(UiTextureSlicePipelineKey {
+            target_format: TextureFormat::Rgba8Unorm,
+            cpu_slices,
+        });
+        assert_eq!(
+            descriptor.layout,
+            [pipeline.view_layout.clone(), pipeline.image_layout.clone()]
+        );
+        assert_eq!(
+            descriptor.vertex.shader,
+            if cpu_slices {
+                pipeline.cpu_shader.clone()
+            } else {
+                pipeline.shader.clone()
+            }
+        );
+        assert_eq!(
+            descriptor.vertex.buffers[0].array_stride,
+            if cpu_slices {
+                size_of::<CpuSliceVertex>()
+            } else {
+                size_of::<UiTextureSliceVertex>()
+            } as u64
+        );
+        let fragment = descriptor.fragment.unwrap();
+        assert_eq!(descriptor.vertex.shader, fragment.shader);
+        assert_eq!(
+            fragment.targets[0].as_ref().unwrap().format,
+            TextureFormat::Rgba8Unorm
+        );
+        assert!(fragment
+            .shader_defs
+            .contains(&MANUAL_SRGB_SHADER_DEF.into()));
     }
 }

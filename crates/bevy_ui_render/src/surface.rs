@@ -3,7 +3,7 @@
 
 use crate::{
     clipping::{clip_polygon, rect_is_clipped, rect_without_hole, rounded_inner_rect},
-    pipeline::{ui_color_target_state, UiPipelineKey},
+    pipeline::{ui_color_target_state, ui_render_target_format},
     render_pass::TransparentUi,
     stack_z_offsets,
     ui_mesh::{DrawUiMesh, UiMesh},
@@ -13,7 +13,7 @@ use crate::{
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_camera::visibility::InheritedVisibility;
-use bevy_color::{ColorToComponents, LinearRgba};
+use bevy_color::LinearRgba;
 use bevy_ecs::prelude::*;
 use bevy_math::{ops, Affine2, FloatOrd, Rect, Vec2};
 use bevy_platform::collections::HashMap;
@@ -55,7 +55,6 @@ impl Plugin for SurfacePlugin {
         load_shader_library!(app, "paint.wgsl");
         load_shader_library!(app, "gradient.wgsl");
         embedded_asset!(app, "surface.wgsl");
-        embedded_asset!(app, "surface_fill.wgsl");
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_resource::<ExtractedSurfaces>()
@@ -122,14 +121,13 @@ struct ExtractedSurface {
 #[repr(usize)]
 enum SurfaceShader {
     Full,
-    Solid,
     RoundedFill,
     RectFill,
 }
 
 impl SurfaceShader {
     // Each shader supports every paint supported by the shaders to its right.
-    const ALL: [Self; 4] = [Self::Full, Self::Solid, Self::RoundedFill, Self::RectFill];
+    const ALL: [Self; 3] = [Self::Full, Self::RoundedFill, Self::RectFill];
 
     fn is_fill(self) -> bool {
         matches!(self, Self::RoundedFill | Self::RectFill)
@@ -137,22 +135,20 @@ impl SurfaceShader {
 }
 
 fn surface_shader(data: &GpuSurface) -> SurfaceShader {
-    // Border gradients are shared by all four sides. Test extracted layer counts,
-    // not source components, alpha, addresses or whether a side happens to show.
-    if data.background_gradients[1] != 0 || data.border_gradients[1] != 0 {
-        return SurfaceShader::Full;
-    }
     // The full shader clamps the inset radii. Only specialize when that clamp
     // is an identity, so its inner and outer SDFs really are equivalent.
     let max_radius = data.size[0].min(data.size[1]) * 0.5;
-    if data.border != [0.; 4]
+    // Gradients are found by extracted layer counts; an address is not a layer.
+    if data.background_gradients[1] != 0
+        || data.border_gradients[1] != 0
+        || data.border != [0.; 4]
         || data.background[3] == 0.
         || data
             .radius
             .iter()
             .any(|r| !r.is_finite() || *r < 0. || *r > max_radius)
     {
-        SurfaceShader::Solid
+        SurfaceShader::Full
     } else if data.radius == [0.; 4] {
         SurfaceShader::RectFill
     } else {
@@ -165,25 +161,17 @@ fn select_surface_shader(
     variants: UiShaderVariants,
     ready: impl Fn(SurfaceShader) -> bool,
 ) -> SurfaceShader {
-    // Keep a compiled reference available, including when the solid experiment
-    // is enabled independently of the existing fill experiment.
-    if ready(SurfaceShader::Full) {
-        if variants.surfaces
-            && shader.is_fill()
-            && ready(SurfaceShader::RoundedFill)
-            && ready(SurfaceShader::RectFill)
-        {
-            return shader;
-        }
-        if variants.solid_surfaces && shader != SurfaceShader::Full && ready(SurfaceShader::Solid) {
-            return SurfaceShader::Solid;
-        }
+    // Batches are promoted to the most general shader they contain, so
+    // specialize only once the reference and both fills are compiled.
+    if variants.surfaces && shader.is_fill() && SurfaceShader::ALL.into_iter().all(ready) {
+        shader
+    } else {
+        SurfaceShader::Full
     }
-    SurfaceShader::Full
 }
 
 fn common_surface_pipeline(
-    choices: &[CachedRenderPipelineId; 4],
+    choices: &[CachedRenderPipelineId; 3],
     a: CachedRenderPipelineId,
     b: CachedRenderPipelineId,
 ) -> CachedRenderPipelineId {
@@ -198,12 +186,13 @@ fn common_surface_pipeline(
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct SurfacePipelineKey {
-    ui: UiPipelineKey,
+    target_format: TextureFormat,
+    anti_alias: bool,
     shader: SurfaceShader,
 }
 
 #[derive(Resource, Default)]
-struct SurfacePipelineVariants(HashMap<Entity, [CachedRenderPipelineId; 4]>);
+struct SurfacePipelineVariants(HashMap<Entity, [CachedRenderPipelineId; 3]>);
 
 #[derive(Resource, Default)]
 struct ExtractedSurfaces {
@@ -295,14 +284,6 @@ fn gamma_color(color: LinearRgba) -> [f32; 4] {
     ]
 }
 
-fn surface_color(color: LinearRgba, linear_color: bool) -> [f32; 4] {
-    if linear_color {
-        color.to_f32_array()
-    } else {
-        gamma_color(color)
-    }
-}
-
 fn extract_surfaces(
     mut commands: Commands,
     mut extracted: ResMut<ExtractedSurfaces>,
@@ -325,7 +306,6 @@ fn extract_surfaces(
         )>,
     >,
     cameras: Extract<UiCameraMap>,
-    variants: Extract<Query<&UiShaderVariants>>,
     mut gradients: Local<GradientExtractor>,
 ) {
     let mut cameras = cameras.get_mapper();
@@ -354,11 +334,7 @@ fn extract_surfaces(
         let Some(camera) = cameras.map(camera) else {
             continue;
         };
-        let linear_color = variants
-            .get(cameras.current_camera())
-            .is_ok_and(|variants| variants.linear_color);
-        let background =
-            background.map_or([0.; 4], |c| surface_color(c.0.to_linear(), linear_color));
+        let background = background.map_or([0.; 4], |c| gamma_color(c.0.to_linear()));
         // Each extraction appends all referenced gradient/stop records before
         // its surface header. Keep their exact bytes for cache invalidation.
         let paint_start = texels.len();
@@ -373,8 +349,7 @@ fn extract_surfaces(
         } else {
             (
                 border.map_or([[0.; 4]; 4], |c| {
-                    [c.left, c.top, c.right, c.bottom]
-                        .map(|color| surface_color(color.to_linear(), linear_color))
+                    [c.left, c.top, c.right, c.bottom].map(|color| gamma_color(color.to_linear()))
                 }),
                 gradients.extract(
                     border_gradient.map_or(&[], |g| g.0.as_slice()),
@@ -430,7 +405,6 @@ fn extract_surfaces(
 struct SurfacePipeline {
     layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
-    fill_shader: Handle<Shader>,
 }
 
 fn init_surface_pipeline(mut commands: Commands, assets: Res<AssetServer>) {
@@ -449,7 +423,6 @@ fn init_surface_pipeline(mut commands: Commands, assets: Res<AssetServer>) {
             ),
         ),
         shader: load_embedded_asset!(assets.as_ref(), "surface.wgsl"),
-        fill_shader: load_embedded_asset!(assets.as_ref(), "surface_fill.wgsl"),
     });
 }
 
@@ -457,35 +430,23 @@ impl SpecializedRenderPipeline for SurfacePipeline {
     type Key = SurfacePipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let mut shader_defs = if key.ui.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec!["ANTI_ALIAS".into()]
         } else {
             vec![]
         };
-        if key.ui.target_format.is_srgb() {
-            shader_defs.push("LINEAR_COLOR".into());
-        }
         match key.shader {
             SurfaceShader::Full => (),
-            SurfaceShader::Solid => shader_defs.push("SURFACE_SOLID".into()),
             SurfaceShader::RectFill => shader_defs.push("SURFACE_RECT_FILL".into()),
             SurfaceShader::RoundedFill => shader_defs.push("SURFACE_ROUNDED_FILL".into()),
         }
-        if key.ui.rect_math && key.shader == SurfaceShader::RectFill {
-            shader_defs.push("CHEAP_RECT_DISTANCE".into());
-        }
-        let shader = if key.ui.lean_io && key.shader.is_fill() {
-            &self.fill_shader
-        } else {
-            &self.shader
-        };
-        let mut target = ui_color_target_state(key.ui.target_format);
+        let mut target = ui_color_target_state(key.target_format);
         target.blend = Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING);
         RenderPipelineDescriptor {
             label: Some("ui_surface_pipeline".into()),
             layout: vec![self.layout.clone()],
             vertex: VertexState {
-                shader: shader.clone(),
+                shader: self.shader.clone(),
                 shader_defs: shader_defs.clone(),
                 buffers: vec![bevy_mesh::VertexBufferLayout::from_vertex_formats(
                     VertexStepMode::Vertex,
@@ -498,7 +459,7 @@ impl SpecializedRenderPipeline for SurfacePipeline {
                 ..Default::default()
             },
             fragment: Some(FragmentState {
-                shader: shader.clone(),
+                shader: self.shader.clone(),
                 shader_defs,
                 targets: vec![Some(target)],
                 ..Default::default()
@@ -538,36 +499,26 @@ fn queue_surfaces(
         let Ok((view, _)) = views.get(camera.0) else {
             continue;
         };
-        let ui = UiPipelineKey {
-            basic_image: false,
-            encoded_image: false,
-            relaxed_precision: false,
-            relaxed_colors: false,
-            target_format: variants.render_target_format(view.target_format),
-            anti_alias: matches!(antialias, None | Some(UiAntiAlias::On)),
-            image_rect: false,
-            pixel_aligned: false,
-            implicit_aligned: false,
-            rect_math: false,
-            lean_io: false,
-        };
+        let target_format = ui_render_target_format(view.target_format);
+        let anti_alias = matches!(antialias, None | Some(UiAntiAlias::On));
         prepared.0.insert(
             entity,
             SurfaceShader::ALL.map(|shader| {
                 // Do not compile another pipeline for default cameras.
-                let shader = if (shader == SurfaceShader::Solid && !variants.solid_surfaces)
-                    || (shader.is_fill() && !variants.surfaces)
-                {
+                let shader = if shader.is_fill() && !variants.surfaces {
                     SurfaceShader::Full
                 } else {
                     shader
                 };
-                let ui = UiPipelineKey {
-                    rect_math: shader == SurfaceShader::RectFill && variants.rect_math,
-                    lean_io: shader.is_fill() && variants.lean_io,
-                    ..ui
-                };
-                pipelines.specialize(&cache, &pipeline, SurfacePipelineKey { ui, shader })
+                pipelines.specialize(
+                    &cache,
+                    &pipeline,
+                    SurfacePipelineKey {
+                        target_format,
+                        anti_alias,
+                        shader,
+                    },
+                )
             }),
         );
     }
@@ -621,7 +572,6 @@ fn prepare_surfaces(
     pipeline: Res<SurfacePipeline>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     prepared: Res<SurfacePipelineVariants>,
-    separate_views: Query<&ExtractedView, With<crate::UiSeparateBatches>>,
     mut caching: cache::SurfaceCachePreparation,
 ) {
     let ExtractedSurfaces { nodes, texels } = &mut *extracted;
@@ -638,10 +588,7 @@ fn prepare_surfaces(
             &BindGroupEntries::sequential((view_binding, paint_view)),
         ));
         let mut batches = Vec::new();
-        for (view_entity, phase) in &mut phases.0 {
-            let separate = separate_views
-                .iter()
-                .any(|view| &view.retained_view_entity == view_entity);
+        for phase in phases.values_mut() {
             let mut first: Option<usize> = None;
             for item_index in 0..phase.items.len() {
                 let item = &phase.items[item_index];
@@ -688,12 +635,10 @@ fn prepare_surfaces(
                 }
                 // Preserve the original draw count: adjacent compatible paints
                 // can share the least general shader that supports the batch.
-                // Full > Solid > RoundedFill > RectFill. A gradient in any item
-                // promotes the entire batch to Full, never to Solid. Consequently
-                // this experiment cannot help an uninterrupted mixed paint batch
-                // unless UiSeparateBatches (additional draws) is also requested.
-                if !separate
-                    && !isolated
+                // Full > RoundedFill > RectFill. A gradient or border in any item
+                // promotes the entire batch to Full. Consequently the fill shaders
+                // cannot help an uninterrupted mixed paint batch.
+                if !isolated
                     && start != mesh.indices.len() as u32
                     && let Some(first_index) = first
                     && phase.items[first_index].batch_range.end == item_index as u32

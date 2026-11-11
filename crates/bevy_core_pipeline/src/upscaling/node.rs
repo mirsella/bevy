@@ -16,11 +16,9 @@ pub struct UpscalingBindGroupCache {
 
 pub fn upscaling(
     view: ViewQuery<(
-        Entity,
         &ViewTarget,
         &ViewUpscalingPipeline,
         Option<&ExtractedCamera>,
-        Has<bevy_render::view::SkipViewUpscaling>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     blit_pipeline: Res<BlitPipeline>,
@@ -28,10 +26,7 @@ pub fn upscaling(
     mut cache: Local<UpscalingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (entity, target, upscaling_target, camera, replacement) = view.into_inner();
-    if replacement {
-        return;
-    }
+    let (target, upscaling_target, camera) = view.into_inner();
 
     let clear_color = if let Some(camera) = camera {
         match camera.output_mode {
@@ -88,15 +83,7 @@ pub fn upscaling(
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
-    // DiagnosticsStore averages repeated paths; sharing one across views loses
-    // their total cost when an optimization changes the number of output passes.
-    let time_span = diagnostics.map(|recorder| {
-        let label = camera.map_or_else(
-            || format!("upscaling/view_{entity:?}"),
-            |camera| format!("upscaling/camera_{}_view_{entity:?}", camera.order),
-        );
-        recorder.time_span(ctx.command_encoder(), label)
-    });
+    let time_span = diagnostics.time_span(ctx.command_encoder(), "upscaling");
 
     {
         let mut render_pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
@@ -114,7 +101,5 @@ pub fn upscaling(
         render_pass.draw(0..3, 0..1);
     }
 
-    if let Some(time_span) = time_span {
-        time_span.end(ctx.command_encoder());
-    }
+    time_span.end(ctx.command_encoder());
 }

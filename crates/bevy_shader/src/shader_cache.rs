@@ -16,13 +16,6 @@ use wgpu_types::{DownlevelFlags, Features};
 ///
 /// Any necessary shader translation (e.g. from WGSL to SPIR-V or vice versa)
 /// must be done internally by the renderer.
-#[cfg_attr(
-    not(feature = "decoupled_naga"),
-    expect(
-        clippy::large_enum_variant,
-        reason = "naga modules are the most common use, and are large"
-    )
-)]
 #[derive(Clone, Debug)]
 pub enum ShaderCacheSource<'a> {
     /// SPIR-V module represented as a slice of words.
@@ -33,12 +26,10 @@ pub enum ShaderCacheSource<'a> {
     #[cfg(not(feature = "decoupled_naga"))]
     Naga(naga::Module),
     /// Experimental fragment-only SPIR-V compilation with reduced floating-point
-    /// precision. The backend must explicitly support it; never silently falls
-    /// back to ordinary compilation. Vertex stages must use a separate key.
-    #[cfg(not(feature = "decoupled_naga"))]
-    NagaRelaxedFragment(naga::Module),
-    /// Fragment experiment limited to sampled colors and named gamma helpers.
-    /// Coordinates, coverage and vertex stages retain ordinary precision.
+    /// precision, limited to sampled colors and named gamma helpers. Coordinates,
+    /// coverage and vertex stages retain ordinary precision and must use a
+    /// separate key. The backend must explicitly support it; never silently
+    /// falls back to ordinary compilation.
     #[cfg(not(feature = "decoupled_naga"))]
     NagaRelaxedColorFragment(naga::Module),
 }
@@ -213,10 +204,10 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
             let (ShaderDefVal::Bool(name, _)
             | ShaderDefVal::Int(name, _)
             | ShaderDefVal::UInt(name, _)) = def;
-            name == EXPERIMENTAL_RELAXED_FRAGMENT || name == EXPERIMENTAL_RELAXED_COLOR_FRAGMENT
+            name == EXPERIMENTAL_RELAXED_COLOR_FRAGMENT
         }) {
             return Err(ShaderCacheError::CreateShaderModule(
-                "experimental precision flags belong on fragment pipeline definitions, where layout compatibility is validated; shader assets cannot override them".into(),
+                "the experimental precision flag belongs on fragment pipeline definitions, where layout compatibility is validated; shader assets cannot override it".into(),
             ));
         }
 
@@ -309,8 +300,6 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
                             })
                             .collect::<std::collections::HashMap<_, _>>();
 
-                        let relaxed_fragment = shader_defs.get(EXPERIMENTAL_RELAXED_FRAGMENT)
-                            == Some(&naga_oil::compose::ShaderDefValue::Bool(true));
                         let relaxed_colors = shader_defs.get(EXPERIMENTAL_RELAXED_COLOR_FRAGMENT)
                             == Some(&naga_oil::compose::ShaderDefValue::Bool(true));
                         let naga = self
@@ -325,8 +314,6 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
                         {
                             if relaxed_colors {
                                 ShaderCacheSource::NagaRelaxedColorFragment(naga)
-                            } else if relaxed_fragment {
-                                ShaderCacheSource::NagaRelaxedFragment(naga)
                             } else {
                                 ShaderCacheSource::Naga(naga)
                             }
@@ -334,7 +321,7 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
 
                         #[cfg(feature = "decoupled_naga")]
                         {
-                            if relaxed_fragment || relaxed_colors {
+                            if relaxed_colors {
                                 return Err(ShaderCacheError::CreateShaderModule(
                                     "experimental fragment precision requires coupled Naga".into(),
                                 ));
@@ -502,34 +489,26 @@ pub enum ShaderCacheError {
     CreateShaderModule(String),
 }
 
-/// Opt-in backend experiment. Only fragment pipeline shader definitions may
-/// contain this flag, because the resulting module has no vertex entry point.
-pub const EXPERIMENTAL_RELAXED_FRAGMENT: &str = "EXPERIMENTAL_RELAXED_FRAGMENT";
-
-/// Opt-in precision experiment for sampled colors and named gamma helpers only.
-/// Must only appear in fragment-stage shader definitions.
+/// Opt-in backend precision experiment for sampled colors and named gamma
+/// helpers only. Only fragment pipeline shader definitions may contain this
+/// flag, because the resulting module has no vertex entry point.
 pub const EXPERIMENTAL_RELAXED_COLOR_FRAGMENT: &str = "EXPERIMENTAL_RELAXED_COLOR_FRAGMENT";
 
 #[test]
-fn asset_precision_flags_cannot_bypass_pipeline_layout_validation() {
+fn asset_precision_flag_cannot_bypass_pipeline_layout_validation() {
     let mut cache =
         ShaderCache::<(), ()>::new((), Features::empty(), DownlevelFlags::empty(), |_, _, _| {
             panic!("invalid asset precision must not reach backend shader creation")
         });
-    for flag in [
-        EXPERIMENTAL_RELAXED_FRAGMENT,
-        EXPERIMENTAL_RELAXED_COLOR_FRAGMENT,
-    ] {
-        let shader = Shader::from_wgsl_with_defs(
-            "@fragment fn fragment() -> @location(0) vec4<f32> { return vec4(1.0); }",
-            "precision-test.wgsl",
-            vec![flag.into()],
-        );
-        let id = AssetId::default();
-        cache.set_shader(id, shader);
-        assert!(matches!(
-            cache.get(0, id, &[]),
-            Err(ShaderCacheError::CreateShaderModule(_))
-        ));
-    }
+    let shader = Shader::from_wgsl_with_defs(
+        "@fragment fn fragment() -> @location(0) vec4<f32> { return vec4(1.0); }",
+        "precision-test.wgsl",
+        vec![EXPERIMENTAL_RELAXED_COLOR_FRAGMENT.into()],
+    );
+    let id = AssetId::default();
+    cache.set_shader(id, shader);
+    assert!(matches!(
+        cache.get(0, id, &[]),
+        Err(ShaderCacheError::CreateShaderModule(_))
+    ));
 }

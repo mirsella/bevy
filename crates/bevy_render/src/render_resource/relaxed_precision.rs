@@ -11,8 +11,7 @@ pub(super) fn validate_layout(
     let enabled = descriptor.fragment.as_ref().is_some_and(|fragment| {
         fragment.shader_defs.iter().any(|def| {
             matches!(def, super::ShaderDefVal::Bool(name, true)
-                if name == bevy_shader::EXPERIMENTAL_RELAXED_FRAGMENT
-                    || name == bevy_shader::EXPERIMENTAL_RELAXED_COLOR_FRAGMENT)
+                if name == bevy_shader::EXPERIMENTAL_RELAXED_COLOR_FRAGMENT)
         })
     });
     if enabled
@@ -38,7 +37,7 @@ pub(super) fn validate_layout(
 fn instructions(words: &[u32]) -> impl Iterator<Item = (usize, Op, &[u32])> {
     assert_eq!(words[0], 0x0723_0203, "invalid generated SPIR-V");
     let mut offset = 5;
-    std::iter::from_fn(move || {
+    core::iter::from_fn(move || {
         if offset == words.len() {
             return None;
         }
@@ -54,7 +53,7 @@ fn instructions(words: &[u32]) -> impl Iterator<Item = (usize, Op, &[u32])> {
     })
 }
 
-fn words(module: &naga::Module, colors_only: bool) -> Result<Vec<u32>, String> {
+fn words(module: &naga::Module) -> Result<Vec<u32>, String> {
     let mut fragments = module
         .entry_points
         .iter()
@@ -123,8 +122,7 @@ fn words(module: &naga::Module, colors_only: bool) -> Result<Vec<u32>, String> {
         if op == Op::FunctionEnd {
             in_color_helper = false;
         }
-        if colors_only
-            && !in_color_helper
+        if !in_color_helper
             && !matches!(op, Op::ImageSampleImplicitLod | Op::ImageSampleExplicitLod)
         {
             continue;
@@ -176,7 +174,6 @@ pub(super) fn load(
     device: &RenderDevice,
     backend: wgpu::Backend,
     module: naga::Module,
-    colors_only: bool,
 ) -> Result<WgpuShaderModule, ShaderCacheError> {
     if backend != wgpu::Backend::Vulkan
         || !device
@@ -187,7 +184,7 @@ pub(super) fn load(
             "experimental precision requires advertised Vulkan SPIR-V passthrough".into(),
         ));
     }
-    let words = words(&module, colors_only).map_err(ShaderCacheError::CreateShaderModule)?;
+    let words = words(&module).map_err(ShaderCacheError::CreateShaderModule)?;
     let scope = device
         .wgpu_device()
         .push_error_scope(wgpu::ErrorFilter::Validation);
@@ -223,7 +220,7 @@ mod tests {
         use super::super::{BindGroupLayoutDescriptor, FragmentState, RenderPipelineDescriptor};
         let mut descriptor = RenderPipelineDescriptor {
             fragment: Some(FragmentState {
-                shader_defs: vec![bevy_shader::EXPERIMENTAL_RELAXED_FRAGMENT.into()],
+                shader_defs: vec![bevy_shader::EXPERIMENTAL_RELAXED_COLOR_FRAGMENT.into()],
                 ..Default::default()
             }),
             layout: vec![BindGroupLayoutDescriptor::new(
@@ -252,14 +249,14 @@ mod tests {
             .as_mut()
             .unwrap()
             .shader_defs
-            .push(bevy_shader::EXPERIMENTAL_RELAXED_FRAGMENT.into());
+            .push(bevy_shader::EXPERIMENTAL_RELAXED_COLOR_FRAGMENT.into());
         descriptor.layout[0].entries[0].binding = 0;
         assert!(validate_layout(&descriptor).is_ok());
     }
     #[test]
     fn color_policy_leaves_coordinate_and_coverage_instructions_undecorated() {
         let module = naga::front::wgsl::parse_str("fn manual_srgb(c: vec3<f32>) -> vec3<f32> { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); } @fragment fn fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { let point = uv * vec2(2000.0) - vec2(1000.0); let coverage = clamp(0.5 - length(point), 0.0, 1.0); return vec4(manual_srgb(vec3(0.2, 0.4, 0.8)), coverage); }").unwrap();
-        let words = words(&module, true).unwrap();
+        let words = words(&module).unwrap();
         let annotations = instructions(&words)
             .filter_map(|(_, op, w)| {
                 if op == Op::Decorate && w[2] == Decoration::RelaxedPrecision as u32 {
@@ -317,31 +314,6 @@ mod tests {
                 &words
                     .iter()
                     .flat_map(|word| word.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        assert!(validation.wait().unwrap().success());
-    }
-
-    #[test]
-    fn annotation_preserves_fragment_interface_and_valid_spirv() {
-        let module = naga::front::wgsl::parse_str("@fragment fn fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4(pow(uv.x, 2.2), uv.y, 0.5, 1.0); }").unwrap();
-        let words = words(&module, false).unwrap();
-        assert!(instructions(&words)
-            .any(|(_, op, w)| op == Op::Decorate && w[2] == Decoration::RelaxedPrecision as u32));
-        let mut validation = Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.0", "-"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("install spirv-val for precision experiment validation");
-        validation
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(
-                &words
-                    .into_iter()
-                    .flat_map(u32::to_le_bytes)
                     .collect::<Vec<_>>(),
             )
             .unwrap();

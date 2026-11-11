@@ -22,7 +22,6 @@ use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     camera::ExtractedCamera,
-    diagnostic::RecordDiagnostics,
     view::{RenderVisibleEntities, RetainedViewEntity},
 };
 use bevy_render::{
@@ -341,12 +340,6 @@ impl SpecializedRenderPipeline for SrgbCompositePipeline {
 #[derive(Component)]
 pub struct SrgbCompositePipelineId(CachedRenderPipelineId);
 
-/// Render-world opt-in for applications that supply their own gamma sprite
-/// attachment/pass. Insert only after that target is ready; removing it restores
-/// the reference intermediate and composite on the same frame.
-#[derive(Component)]
-pub struct NoSrgbSpriteIntermediate;
-
 pub fn queue_srgb_composite_pipelines(
     mut commands: Commands,
     composite_pipeline: Res<SrgbCompositePipeline>,
@@ -356,8 +349,6 @@ pub fn queue_srgb_composite_pipelines(
     srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
 ) {
     for (entity, view, msaa) in &views {
-        // Keep the reference specialization warm while direct rendering is active.
-        // Restoring its intermediate must not wait for asynchronous compilation.
         if !srgb_phases.contains_key(&view.retained_view_entity) {
             continue;
         }
@@ -1075,17 +1066,10 @@ pub fn prepare_srgb_sprite_textures(
         &ExtractedView,
         &Msaa,
         Option<&SrgbSpriteTexture>,
-        Has<NoSrgbSpriteIntermediate>,
     )>,
     srgb_phases: Res<ViewSortedRenderPhases<SrgbTransparent2d>>,
 ) {
-    for (entity, camera, view, msaa, current_texture, direct) in &views {
-        if direct {
-            if current_texture.is_some() {
-                commands.entity(entity).remove::<SrgbSpriteTexture>();
-            }
-            continue;
-        }
+    for (entity, camera, view, msaa, current_texture) in &views {
         if !srgb_phases.contains_key(&view.retained_view_entity) {
             continue;
         }
@@ -1177,14 +1161,6 @@ pub fn srgb_sprite_pass(
         return;
     }
 
-    let diagnostics = ctx.diagnostic_recorder();
-    let boundary = diagnostics.as_deref().map(|recorder| {
-        recorder.time_span(
-            ctx.command_encoder(),
-            format!("sprite_boundary/view_{view_entity:?}/draw"),
-        )
-    });
-
     let color_attachment = RenderPassColorAttachment {
         view: &srgb_texture.texture.default_view,
         resolve_target: srgb_texture
@@ -1211,10 +1187,6 @@ pub fn srgb_sprite_pass(
     if let Err(err) = phase.render(&mut render_pass, world, view_entity) {
         tracing::error!("Error rendering sRGB sprite phase: {err:?}");
     }
-    drop(render_pass);
-    if let Some(boundary) = boundary {
-        boundary.end(ctx.command_encoder());
-    }
 }
 
 pub fn srgb_composite_pass(
@@ -1228,7 +1200,6 @@ pub fn srgb_composite_pass(
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let view_entity = view.entity();
     let (view_target, srgb_texture, composite_pipeline_id, view) = view.into_inner();
 
     let Some(phase) = srgb_phases.get(&view.retained_view_entity) else {
@@ -1254,13 +1225,6 @@ pub fn srgb_composite_pass(
     };
 
     let color_attachments = [Some(view_target.get_color_attachment())];
-    let diagnostics = ctx.diagnostic_recorder();
-    let boundary = diagnostics.as_deref().map(|recorder| {
-        recorder.time_span(
-            ctx.command_encoder(),
-            format!("sprite_boundary/view_{view_entity:?}/composite"),
-        )
-    });
 
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("srgb_composite_pass"),
@@ -1274,10 +1238,6 @@ pub fn srgb_composite_pass(
     render_pass.set_render_pipeline(pipeline);
     render_pass.set_bind_group(0, &srgb_texture.composite_bind_group, &[]);
     render_pass.draw(0..3, 0..1);
-    drop(render_pass);
-    if let Some(boundary) = boundary {
-        boundary.end(ctx.command_encoder());
-    }
 }
 
 /// [`RenderCommand`] for sprite rendering.

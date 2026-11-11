@@ -35,10 +35,10 @@ fn timestamp_delta(begin: u64, end: u64) -> Option<u64> {
     if delta.is_none() {
         // Vulkan counters can have fewer than 64 valid bits. wgpu does not
         // expose that width, so wrapping_sub cannot recover this interval.
-        bevy_log::warn!(
+        bevy_log::warn_once!(
             begin,
             end,
-            "GPU timestamp counter wrapped or reset; omitting interval"
+            "GPU timestamp counter wrapped or reset; omitting such intervals"
         );
     }
     delta
@@ -133,23 +133,28 @@ impl DiagnosticsRecorder {
         self.current_frame_mut().resolve(encoder);
     }
 
-    pub(super) fn begin_gpu_frame(&mut self, encoder: &mut CommandEncoder) -> bool {
+    /// Opens the whole-frame GPU interval, returning the commands that must run
+    /// before everything else this frame, or `None` without encoder timestamps.
+    pub(super) fn begin_gpu_frame(&mut self) -> Option<wgpu::CommandBuffer> {
         let frame = self.current_frame_mut();
         if cfg!(target_os = "macos") || !frame.supports_timestamps_inside_encoders {
-            return false;
+            return None;
         }
-        let Some(set) = &frame.timestamps_query_set else {
-            return false;
-        };
+        let set = frame.timestamps_query_set.as_ref()?;
         assert_eq!(
             frame.num_timestamps, 0,
             "frame timestamps must be reserved first"
         );
+        let mut encoder = frame
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_frame_start"),
+            });
+        encoder.write_timestamp(set, 0);
         // Reserve the end query as well: detailed spans may exhaust the pool.
         frame.num_timestamps = 2;
         frame.gpu_frame = true;
-        encoder.write_timestamp(set, 0);
-        true
+        Some(encoder.finish())
     }
 
     /// Finishes recording diagnostics for the current frame.

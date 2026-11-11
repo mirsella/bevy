@@ -111,18 +111,13 @@ impl FromWorld for DiagnosticsRecorder {
 /// Starts the diagnostics recorder for the frame.
 pub fn begin_diagnostics_frame(
     mut recorder: ResMut<DiagnosticsRecorder>,
-    render_device: Res<RenderDevice>,
     mut pending_buffers: ResMut<PendingCommandBuffers>,
 ) {
     recorder.begin_frame();
-    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("render_frame_start"),
-    });
-    if recorder.begin_gpu_frame(&mut encoder) {
-        // Prepend even if a plugin has already queued preparation commands. Use a
-        // finished buffer: pending encoders are appended after finished buffers.
+    if let Some(start) = recorder.begin_gpu_frame() {
+        // Prepend even if a plugin has already queued preparation commands.
         let queued = pending_buffers.take();
-        pending_buffers.push(core::iter::once(encoder.finish()).chain(queued));
+        pending_buffers.push(core::iter::once(start).chain(queued));
     }
 }
 

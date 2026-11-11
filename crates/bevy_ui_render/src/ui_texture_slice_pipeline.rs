@@ -221,14 +221,11 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
         };
         let vertex_layout =
             VertexBufferLayout::from_vertex_formats(VertexStepMode::Vertex, formats);
-        let mut shader_defs = ui_color_shader_defs(key.target_format);
-        if key.cpu_slices {
-            shader_defs.push("CPU_SLICES".into());
-        }
-        let shader = if key.cpu_slices {
-            &self.cpu_shader
+        let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
+        let (shader, label) = if key.cpu_slices {
+            (&self.cpu_shader, "ui_texture_slice_cpu_pipeline")
         } else {
-            &self.shader
+            (&self.shader, "ui_texture_slice_pipeline")
         };
 
         RenderPipelineDescriptor {
@@ -245,7 +242,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
-            label: Some("ui_texture_slice_pipeline".into()),
+            label: Some(label.into()),
             ..default()
         }
     }
@@ -412,22 +409,19 @@ pub fn queue_ui_slices(
         };
 
         let key = UiTextureSlicePipelineKey {
-            target_format: variants.render_target_format(view.target_format),
+            target_format: ui_render_target_format(view.target_format),
             cpu_slices: false,
         };
         let full_pipeline = pipelines.specialize(&pipeline_cache, &ui_slicer_pipeline, key);
-        extracted_slicer.cpu_slices = (variants.cpu_slices || variants.approximate_cpu_slices)
+        extracted_slicer.cpu_slices = variants
+            .cpu_slices
             .then(|| {
                 let image = gpu_images.get(extracted_slicer.image)?;
-                if variants.approximate_cpu_slices {
-                    CpuSlices::new(extracted_slicer, image.size_2d().as_vec2())
-                } else {
-                    CpuSlices::eligible(
-                        extracted_slicer,
-                        image.size_2d().as_vec2(),
-                        image.texture_descriptor.mip_level_count,
-                    )
-                }
+                CpuSlices::eligible(
+                    extracted_slicer,
+                    image.size_2d().as_vec2(),
+                    image.texture_descriptor.mip_level_count,
+                )
             })
             .flatten();
         let pipeline = if extracted_slicer.cpu_slices.is_some() {

@@ -3,7 +3,7 @@ extern crate alloc;
 use super::{append_paint, gradient::GradientExtractor, GpuSurface, SurfaceVertex};
 use crate::QUAD_VERTEX_POSITIONS;
 use alloc::borrow::Cow;
-use bevy_color::{Color, ColorToComponents, LinearRgba};
+use bevy_color::{Color, LinearRgba};
 use bevy_math::{ops, Mat4, Vec2};
 use bevy_ui::{
     AngularColorStop, ColorStop, ComputedUiRenderTargetInfo, ConicGradient, Gradient,
@@ -99,110 +99,8 @@ fn outer_color_has_a_defined_order_between_surface_and_outline() {
 }
 
 #[test]
-fn surface_constants_follow_each_target_camera_and_do_not_reuse_the_previous_mode() {
-    use super::{extract_surfaces, gamma_color, ExtractedSurfaces};
-    use crate::UiShaderVariants;
-    use bevy_app::{App, HierarchyPropagatePlugin, PostUpdate, Update};
-    use bevy_camera::{visibility::InheritedVisibility, Camera};
-    use bevy_ecs::{prelude::*, system::RunSystemOnce};
-    use bevy_render::{sync_world::RenderEntity, MainWorld};
-    use bevy_sprite::BorderRect;
-    use bevy_ui::{
-        update::propagate_ui_target_cameras, BackgroundColor, BorderColor, ComputedNode,
-        ComputedUiTargetCamera, Node, UiGlobalTransform, UiScale, UiTargetCamera,
-    };
-
-    let mut render_world = World::new();
-    let mut app = App::new();
-    app.init_resource::<UiScale>()
-        .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(
-            PostUpdate,
-        ))
-        .add_systems(Update, propagate_ui_target_cameras);
-    let background = LinearRgba::new(0.125, 0.25, 0.5, 0.375);
-    let border = LinearRgba::new(0.0625, 0.125, 0.25, 0.625);
-    let mut cameras = Vec::new();
-    for linear_color in [false, true] {
-        let render_camera = render_world.spawn_empty().id();
-        let camera = app
-            .world_mut()
-            .spawn((
-                Camera::default(),
-                RenderEntity::from(render_camera),
-                UiShaderVariants {
-                    linear_color,
-                    ..UiShaderVariants::ALL
-                },
-            ))
-            .id();
-        cameras.push((camera, render_camera));
-        app.world_mut().spawn((
-            Node::default(),
-            UiTargetCamera(camera),
-            ComputedNode {
-                size: Vec2::new(64., 32.),
-                border: BorderRect::all(2.),
-                ..Default::default()
-            },
-            UiGlobalTransform::default(),
-            InheritedVisibility::VISIBLE,
-            BackgroundColor(background.into()),
-            BorderColor::all(border),
-        ));
-    }
-    app.update();
-    let mut main_world = MainWorld::default();
-    core::mem::swap(&mut *main_world, app.world_mut());
-    render_world.insert_resource(main_world);
-    render_world.init_resource::<ExtractedSurfaces>();
-    for swap_modes in [false, true] {
-        if swap_modes {
-            let mut main = render_world.resource_mut::<MainWorld>();
-            for (camera, _) in &cameras {
-                let mut variants = main.get_mut::<UiShaderVariants>(*camera).unwrap();
-                variants.linear_color = !variants.linear_color;
-            }
-            *render_world.resource_mut::<ExtractedSurfaces>() = ExtractedSurfaces::default();
-        }
-        render_world.run_system_once(extract_surfaces).unwrap();
-        let extracted = render_world.resource::<ExtractedSurfaces>();
-        assert_eq!(extracted.nodes.len(), 2);
-        for (index, (_, render_camera)) in cameras.iter().enumerate() {
-            let linear = (index == 1) != swap_modes;
-            let surface = extracted
-                .nodes
-                .iter()
-                .find(|node| node.camera == *render_camera)
-                .unwrap();
-            let count = size_of::<GpuSurface>() / 16;
-            let data: GpuSurface = bytemuck::pod_read_unaligned(bytemuck::cast_slice(
-                &extracted.texels[surface.paint as usize..surface.paint as usize + count],
-            ));
-            assert_eq!(
-                data.background,
-                if linear {
-                    [0.125, 0.25, 0.5, 0.375]
-                } else {
-                    gamma_color(background)
-                }
-            );
-            assert_eq!(
-                data.border_colors,
-                [if linear {
-                    [0.0625, 0.125, 0.25, 0.625]
-                } else {
-                    gamma_color(border)
-                }; 4]
-            );
-            assert_eq!(data.border, [2.; 4]);
-        }
-    }
-}
-
-#[test]
-fn surface_pipeline_format_keys_isolate_linear_paint_including_full_fallback() {
+fn surface_pipeline_keys_isolate_specialized_shaders() {
     use super::{SurfacePipeline, SurfacePipelineKey, SurfaceShader};
-    use crate::pipeline::UiPipelineKey;
     use bevy_render::render_resource::{
         BindGroupLayoutDescriptor, BlendState, SpecializedRenderPipeline, TextureFormat,
     };
@@ -211,77 +109,40 @@ fn surface_pipeline_format_keys_isolate_linear_paint_including_full_fallback() {
     let pipeline = SurfacePipeline {
         layout: BindGroupLayoutDescriptor::new("test_surface", &[]),
         shader: shaders.add(bevy_shader::Shader::from_wgsl("", "surface.wgsl")),
-        fill_shader: shaders.add(bevy_shader::Shader::from_wgsl("", "surface_fill.wgsl")),
     };
     let mut keys = bevy_platform::collections::HashSet::<SurfacePipelineKey>::default();
-    for target_format in [TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb] {
-        for shader in [
-            SurfaceShader::Full,
-            SurfaceShader::Solid,
-            SurfaceShader::RectFill,
-            SurfaceShader::RoundedFill,
-        ] {
-            let key = SurfacePipelineKey {
-                shader,
-                ui: UiPipelineKey {
-                    target_format,
-                    basic_image: false,
-                    encoded_image: false,
-                    relaxed_precision: false,
-                    relaxed_colors: false,
-                    anti_alias: true,
-                    image_rect: false,
-                    rect_math: true,
-                    lean_io: true,
-                    pixel_aligned: false,
-                    implicit_aligned: false,
-                },
-            };
-            assert!(keys.insert(key));
-            let descriptor = pipeline.specialize(key);
+    for (shader, define) in [
+        (SurfaceShader::Full, None),
+        (SurfaceShader::RectFill, Some("SURFACE_RECT_FILL")),
+        (SurfaceShader::RoundedFill, Some("SURFACE_ROUNDED_FILL")),
+    ] {
+        let key = SurfacePipelineKey {
+            target_format: TextureFormat::Rgba8Unorm,
+            anti_alias: true,
+            shader,
+        };
+        assert!(keys.insert(key));
+        let descriptor = pipeline.specialize(key);
+        assert_eq!(descriptor.vertex.shader, pipeline.shader);
+        let fragment = descriptor.fragment.unwrap();
+        assert_eq!(descriptor.vertex.shader_defs, fragment.shader_defs);
+        assert_eq!(descriptor.vertex.shader, fragment.shader);
+        for name in ["SURFACE_RECT_FILL", "SURFACE_ROUNDED_FILL"] {
             assert_eq!(
-                descriptor.vertex.shader,
-                if shader.is_fill() {
-                    pipeline.fill_shader.clone()
-                } else {
-                    pipeline.shader.clone()
-                },
-                "lean_io must never select the fill-only shader for Solid"
+                fragment.shader_defs.contains(&name.into()),
+                define == Some(name)
             );
-            let fragment = descriptor.fragment.unwrap();
-            assert_eq!(descriptor.vertex.shader_defs, fragment.shader_defs);
-            assert_eq!(descriptor.vertex.shader, fragment.shader);
-            assert_eq!(
-                fragment.shader_defs.contains(&"CHEAP_RECT_DISTANCE".into()),
-                shader == SurfaceShader::RectFill
-            );
-            assert_eq!(
-                fragment.shader_defs.contains(&"SURFACE_SOLID".into()),
-                shader == SurfaceShader::Solid
-            );
-            assert_eq!(
-                fragment.shader_defs.contains(&"LINEAR_COLOR".into()),
-                target_format.is_srgb()
-            );
-            let target = fragment.targets[0].as_ref().unwrap();
-            assert_eq!(target.format, target_format);
-            assert_eq!(target.blend, Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING));
         }
+        let target = fragment.targets[0].as_ref().unwrap();
+        assert_eq!(target.format, TextureFormat::Rgba8Unorm);
+        assert_eq!(target.blend, Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING));
     }
-    assert_eq!(keys.len(), 8);
+    assert_eq!(keys.len(), 3);
 }
 
-fn shader_with_defs(source: &str, antialias: bool, defines: &[&str]) -> naga::Module {
+pub(super) fn shader_with_defs(source: &str, antialias: bool, defines: &[&str]) -> naga::Module {
     let mut composer = Composer::default();
     for (source, path) in [
-        (
-            include_str!("../../../bevy_render/src/globals.wgsl"),
-            "globals.wgsl",
-        ),
-        (
-            include_str!("../ui_vertex_output.wgsl"),
-            "ui_vertex_output.wgsl",
-        ),
         (
             "#define_import_path bevy_render::view\nstruct View { clip_from_world: mat4x4<f32> }",
             "test_view.wgsl",
@@ -315,7 +176,6 @@ fn shader_with_defs(source: &str, antialias: bool, defines: &[&str]) -> naga::Mo
                 .copied()
                 .chain(antialias.then_some("ANTI_ALIAS"))
                 .map(|name| (name.into(), ShaderDefValue::Bool(true)))
-                .chain([("SHADOW_SAMPLES".into(), ShaderDefValue::UInt(4))])
                 .collect(),
             ..Default::default()
         })
@@ -326,86 +186,23 @@ fn shader_with_defs(source: &str, antialias: bool, defines: &[&str]) -> naga::Mo
 fn ui_shaders_validate_with_and_without_antialiasing() {
     use wgpu::naga::{back::glsl, valid, ShaderStage};
     for (source, defines, antialias) in [
-        (include_str!("../box_shadow.wgsl"), &[][..]),
-        (include_str!("../box_shadow.wgsl"), &["MANUAL_SRGB"][..]),
-        (include_str!("../ui_texture_slice.wgsl"), &[][..]),
-        (
-            include_str!("../ui_texture_slice.wgsl"),
-            &["MANUAL_SRGB"][..],
-        ),
-        (include_str!("../ui_material.wgsl"), &[][..]),
-        (include_str!("../ui_material.wgsl"), &["MANUAL_SRGB"][..]),
         (include_str!("../surface.wgsl"), &[][..]),
-        (include_str!("../surface.wgsl"), &["LINEAR_COLOR"][..]),
-        (include_str!("../surface.wgsl"), &["SURFACE_SOLID"][..]),
-        (
-            include_str!("../surface.wgsl"),
-            &["LINEAR_COLOR", "SURFACE_SOLID"][..],
-        ),
-        (include_str!("cached.wgsl"), &[][..]),
-        (include_str!("cached.wgsl"), &["LINEAR_COLOR"][..]),
-        (
-            include_str!("../surface.wgsl"),
-            &["LINEAR_COLOR", "SURFACE_RECT_FILL"][..],
-        ),
-        (
-            include_str!("../surface.wgsl"),
-            &["LINEAR_COLOR", "SURFACE_ROUNDED_FILL"][..],
-        ),
         (include_str!("../surface.wgsl"), &["SURFACE_RECT_FILL"][..]),
         (
             include_str!("../surface.wgsl"),
             &["SURFACE_ROUNDED_FILL"][..],
         ),
+        (include_str!("cached.wgsl"), &[][..]),
         (include_str!("../ui.wgsl"), &[][..]),
         (include_str!("../ui.wgsl"), &["MANUAL_SRGB"][..]),
-        (include_str!("../image_basic.wgsl"), &[][..]),
-        (include_str!("../image_basic.wgsl"), &["MANUAL_SRGB"][..]),
-        (
-            include_str!("../image_basic.wgsl"),
-            &["IMAGE_BASIC_ENCODED"][..],
-        ),
         (include_str!("../ui.wgsl"), &["IMAGE_RECT"][..]),
         (
             include_str!("../ui.wgsl"),
-            &["IMAGE_RECT", "CHEAP_RECT_DISTANCE"][..],
-        ),
-        (
-            include_str!("../image_rect.wgsl"),
             &["IMAGE_RECT", "MANUAL_SRGB"][..],
-        ),
-        (include_str!("../image_rect.wgsl"), &["IMAGE_RECT"][..]),
-        (
-            include_str!("../image_rect.wgsl"),
-            &["IMAGE_RECT", "CHEAP_RECT_DISTANCE"][..],
-        ),
-        (
-            include_str!("../image_rect.wgsl"),
-            &["IMAGE_RECT", "MANUAL_SRGB", "CHEAP_RECT_DISTANCE"][..],
-        ),
-        (
-            include_str!("../surface_fill.wgsl"),
-            &["SURFACE_RECT_FILL"][..],
-        ),
-        (
-            include_str!("../surface_fill.wgsl"),
-            &["LINEAR_COLOR", "SURFACE_RECT_FILL"][..],
-        ),
-        (
-            include_str!("../surface_fill.wgsl"),
-            &["LINEAR_COLOR", "SURFACE_ROUNDED_FILL"][..],
-        ),
-        (
-            include_str!("../surface_fill.wgsl"),
-            &["SURFACE_RECT_FILL", "CHEAP_RECT_DISTANCE"][..],
-        ),
-        (
-            include_str!("../surface_fill.wgsl"),
-            &["SURFACE_ROUNDED_FILL"][..],
         ),
         (
             include_str!("../ui.wgsl"),
-            &["IMAGE_RECT", "MANUAL_SRGB"][..],
+            &["IMAGE_RECT", "MANUAL_SRGB", "IMAGE_PIXEL_ALIGNED"][..],
         ),
     ]
     .into_iter()
@@ -456,125 +253,6 @@ fn ui_shaders_validate_with_and_without_antialiasing() {
 }
 
 #[test]
-fn linear_shaders_omit_output_gamma_but_keep_text_group_decoding() {
-    fn powers(module: &naga::Module, name: &str) -> usize {
-        module
-            .functions
-            .iter()
-            .filter(|(_, function)| {
-                function
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with(name))
-            })
-            .map(|(_, function)| {
-                function
-                    .expressions
-                    .iter()
-                    .filter(|(_, expression)| {
-                        matches!(
-                            expression,
-                            naga::Expression::Math {
-                                fun: naga::MathFunction::Pow,
-                                ..
-                            }
-                        )
-                    })
-                    .count()
-            })
-            .sum::<usize>()
-            + module
-                .entry_points
-                .iter()
-                .filter(|entry| entry.name == name)
-                .map(|entry| {
-                    entry
-                        .function
-                        .expressions
-                        .iter()
-                        .filter(|(_, expression)| {
-                            matches!(
-                                expression,
-                                naga::Expression::Math {
-                                    fun: naga::MathFunction::Pow,
-                                    ..
-                                }
-                            )
-                        })
-                        .count()
-                })
-                .sum::<usize>()
-    }
-    for (source, function, gamma_defs, linear_defs) in [
-        (
-            include_str!("../image_basic.wgsl"),
-            "manual_srgb",
-            &["MANUAL_SRGB"][..],
-            &[][..],
-        ),
-        (
-            include_str!("../ui.wgsl"),
-            "manual_srgb",
-            &["MANUAL_SRGB"][..],
-            &[][..],
-        ),
-        (
-            include_str!("../box_shadow.wgsl"),
-            "linear_to_gamma_2_2",
-            &["MANUAL_SRGB"][..],
-            &[][..],
-        ),
-        (
-            include_str!("../ui_texture_slice.wgsl"),
-            "linear_to_gamma_2_2",
-            &["MANUAL_SRGB"][..],
-            &[][..],
-        ),
-        (
-            include_str!("../surface.wgsl"),
-            "paint",
-            &[][..],
-            &["LINEAR_COLOR"][..],
-        ),
-    ] {
-        assert_eq!(
-            powers(&shader_with_defs(source, true, gamma_defs), function),
-            1
-        );
-        assert_eq!(
-            powers(&shader_with_defs(source, true, linear_defs), function),
-            0
-        );
-    }
-    let source = include_str!("../ui.wgsl");
-    assert_eq!(powers(&shader_with_defs(source, true, &[]), "fragment"), 1);
-    assert_eq!(
-        powers(
-            &shader_with_defs(source, true, &["MANUAL_SRGB"]),
-            "fragment"
-        ),
-        0
-    );
-}
-
-#[test]
-fn composite_lookup_shader_validates() {
-    let source = include_str!("../srgb_ui_composite.wgsl").replace(
-        "#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput",
-        "struct FullscreenVertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };",
-    );
-    for defines in [&[][..], &["UI_COMPOSITE_LOOKUP"][..]] {
-        let module = shader_with_defs(&source, false, defines);
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
-        )
-        .validate(&module)
-        .expect("both composite paths must validate");
-    }
-}
-
-#[test]
 fn specialized_surfaces_reject_incompatible_geometry_and_paint() {
     use super::{surface_shader, SurfaceShader};
     let fill = GpuSurface {
@@ -612,101 +290,74 @@ fn specialized_surfaces_reject_incompatible_geometry_and_paint() {
             ..fill
         },
     ] {
-        // Solid keeps the full geometry path, including the inset radius clamp.
-        assert_eq!(surface_shader(&incompatible), SurfaceShader::Solid);
+        assert_eq!(surface_shader(&incompatible), SurfaceShader::Full);
     }
-}
-
-#[test]
-fn solid_surfaces_require_zero_extracted_layers_for_background_and_every_border_side() {
-    use super::{surface_shader, SurfaceShader};
-    for border in [[0.; 4], [0.2, 1.5, 4.25, 8.]] {
-        let solid = GpuSurface {
-            size: [64., 32.],
-            border,
-            radius: [0., 3., 12., 16.],
-            background: [0.2, 0.3, 0.6, 0.5],
-            // Addresses do not imply layers. Likewise, transparent paint or a
-            // zero-width side does not make a nonzero layer count safe to ignore.
-            background_gradients: [123, 0],
-            border_gradients: [456, 0],
-            ..Default::default()
-        };
-        assert_ne!(surface_shader(&solid), SurfaceShader::Full);
-        for count in [1, 4, u32::MAX] {
-            for gradients in [
-                GpuSurface {
-                    background_gradients: [0, count],
-                    ..solid
-                },
-                GpuSurface {
-                    border_gradients: [0, count],
-                    ..solid
-                },
-            ] {
-                assert_eq!(surface_shader(&gradients), SurfaceShader::Full);
-            }
+    // Addresses do not imply layers. Likewise, a zero-width border does not
+    // make a nonzero layer count safe to ignore.
+    let addressed = GpuSurface {
+        background_gradients: [123, 0],
+        border_gradients: [456, 0],
+        ..fill
+    };
+    assert_eq!(surface_shader(&addressed), SurfaceShader::RectFill);
+    for count in [1, 4, u32::MAX] {
+        for gradients in [
+            GpuSurface {
+                background_gradients: [0, count],
+                ..addressed
+            },
+            GpuSurface {
+                border_gradients: [0, count],
+                ..addressed
+            },
+        ] {
+            assert_eq!(surface_shader(&gradients), SurfaceShader::Full);
         }
     }
 }
 
 #[test]
-fn surface_selection_preserves_reference_readiness_and_independent_opt_ins() {
+fn surface_selection_preserves_reference_readiness_and_opt_in() {
     use super::{select_surface_shader, SurfaceShader};
     use crate::UiShaderVariants;
     for surfaces in [false, true] {
-        for solid_surfaces in [false, true] {
-            let variants = UiShaderVariants {
-                surfaces,
-                solid_surfaces,
-                ..UiShaderVariants::FULL
-            };
-            for mask in 0..16 {
-                let ready = |shader| mask & (1 << shader as usize) != 0;
-                for candidate in SurfaceShader::ALL {
-                    let selected = select_surface_shader(candidate, variants, ready);
-                    if selected != SurfaceShader::Full {
-                        assert!(ready(SurfaceShader::Full) && ready(selected));
-                        assert_ne!(candidate, SurfaceShader::Full, "gradient paints stay Full");
-                    }
-                    assert!(surfaces || !selected.is_fill());
-                    assert!(solid_surfaces || selected != SurfaceShader::Solid);
-                    if mask == 15 {
-                        let expected = if surfaces && candidate.is_fill() {
-                            candidate
-                        } else if solid_surfaces && candidate != SurfaceShader::Full {
-                            SurfaceShader::Solid
-                        } else {
-                            SurfaceShader::Full
-                        };
-                        assert_eq!(selected, expected);
-                    }
+        let variants = UiShaderVariants {
+            surfaces,
+            ..UiShaderVariants::FULL
+        };
+        for mask in 0..8 {
+            let ready = |shader| mask & (1 << shader as usize) != 0;
+            for candidate in SurfaceShader::ALL {
+                let selected = select_surface_shader(candidate, variants, ready);
+                if selected != SurfaceShader::Full {
+                    assert!(ready(SurfaceShader::Full) && ready(selected));
+                    assert_eq!(selected, candidate);
+                }
+                assert!(surfaces || !selected.is_fill());
+                if mask == 7 {
+                    let expected = if surfaces {
+                        candidate
+                    } else {
+                        SurfaceShader::Full
+                    };
+                    assert_eq!(selected, expected);
                 }
             }
         }
     }
-    let variants = UiShaderVariants {
-        solid_surfaces: true,
-        ..UiShaderVariants::ALL
-    };
-    // Compiled solid is safe while a fill pipeline is pending, but never vice versa.
+    // A fill is never used while the other fill pipeline is pending.
     assert_eq!(
-        select_surface_shader(SurfaceShader::RoundedFill, variants, |s| s
+        select_surface_shader(SurfaceShader::RoundedFill, UiShaderVariants::ALL, |s| s
             != SurfaceShader::RectFill),
-        SurfaceShader::Solid
-    );
-    assert_eq!(
-        select_surface_shader(SurfaceShader::Solid, variants, |s| s
-            != SurfaceShader::Solid),
         SurfaceShader::Full
     );
 }
 
 #[test]
-fn common_surface_pipeline_never_absorbs_gradients_into_solid_batches() {
+fn common_surface_pipeline_promotes_batches_to_the_more_general_shader() {
     use super::{common_surface_pipeline, SurfaceShader};
     use bevy_render::render_resource::CachedRenderPipelineId;
-    let choices = [0, 1, 2, 3].map(CachedRenderPipelineId::new);
+    let choices = [0, 1, 2].map(CachedRenderPipelineId::new);
     for a in SurfaceShader::ALL {
         for b in SurfaceShader::ALL {
             assert_eq!(
@@ -715,86 +366,38 @@ fn common_surface_pipeline_never_absorbs_gradients_into_solid_batches() {
             );
         }
     }
-    // Default cameras alias the unused Solid entry to Full (no extra compilation).
-    let defaults = [choices[0], choices[0], choices[2], choices[3]];
+    // Default cameras alias the unused fill entries to Full (no extra compilation).
+    let defaults = [choices[0]; 3];
     assert_eq!(
-        common_surface_pipeline(&defaults, choices[2], choices[3]),
-        choices[2]
-    );
-    assert_eq!(
-        common_surface_pipeline(&defaults, choices[0], choices[3]),
+        common_surface_pipeline(&defaults, choices[0], choices[0]),
         choices[0]
     );
 }
 
-#[test]
-fn solid_surface_fragment_has_no_gradient_machinery_or_texture_loads() {
-    fn check_function(module: &naga::Module, function: &naga::Function) {
-        for (_, expression) in function.expressions.iter() {
-            match expression {
-                naga::Expression::ImageLoad { .. } | naga::Expression::ImageSample { .. } => {
-                    panic!("solid fragment must not load paint or gradients")
-                }
-                naga::Expression::CallResult(handle) => {
-                    check_function(module, &module.functions[*handle]);
-                }
-                _ => (),
-            }
-        }
-    }
-    for aa in [false, true] {
-        for defines in [
-            &["SURFACE_SOLID"][..],
-            &["SURFACE_SOLID", "LINEAR_COLOR"][..],
-        ] {
-            let module = shader_with_defs(include_str!("../surface.wgsl"), aa, defines);
-            assert!(!module.functions.iter().any(|(_, function)| function
-                .name
-                .as_deref()
-                .is_some_and(
-                    |name| name.starts_with("sample_gradient") || name.starts_with("paint")
-                )));
-            let fragment = module
-                .entry_points
-                .iter()
-                .find(|entry| entry.name == "fragment")
-                .unwrap();
-            check_function(&module, &fragment.function);
-        }
-    }
+pub(super) const WIDTH: u32 = 80;
+pub(super) const HEIGHT: u32 = 48;
+const ROW: u32 = 512;
+
+pub(super) fn projection() -> Mat4 {
+    Mat4::orthographic_rh(0., WIDTH as f32, HEIGHT as f32, 0., -1., 1.)
 }
 
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    format: wgpu::TextureFormat,
+pub(super) struct Gpu {
+    pub(super) device: wgpu::Device,
+    pub(super) queue: wgpu::Queue,
+    pub(super) pipeline: wgpu::RenderPipeline,
 }
 
 impl Gpu {
-    fn new(backends: wgpu::Backends) -> Self {
+    pub(super) fn new(backends: wgpu::Backends) -> Self {
         Self::with_variant(backends, true, &[])
-    }
-
-    fn with_variant(backends: wgpu::Backends, antialias: bool, defines: &[&str]) -> Self {
-        Self::with_source(
-            backends,
-            antialias,
-            defines,
-            include_str!("../surface.wgsl"),
-        )
     }
 
     #[expect(
         clippy::print_stderr,
         reason = "Record which adapter ran the opt-in GPU regression."
     )]
-    fn with_source(
-        backends: wgpu::Backends,
-        antialias: bool,
-        defines: &[&str],
-        source: &str,
-    ) -> Self {
+    fn with_variant(backends: wgpu::Backends, antialias: bool, defines: &[&str]) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -816,14 +419,11 @@ impl Gpu {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("surface regression"),
             source: wgpu::ShaderSource::Naga(Cow::Owned(shader_with_defs(
-                source, antialias, defines,
+                include_str!("../surface.wgsl"),
+                antialias,
+                defines,
             ))),
         });
-        let format = if defines.contains(&"LINEAR_COLOR") {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("surface regression"), layout: None,
             vertex: wgpu::VertexState {
@@ -837,7 +437,7 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &shader, entry_point: Some("fragment"), compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
                     blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -849,7 +449,6 @@ impl Gpu {
             device,
             queue,
             pipeline,
-            format,
         }
     }
 
@@ -865,9 +464,6 @@ impl Gpu {
         angle: f32,
         clipped: bool,
     ) -> Vec<u8> {
-        const WIDTH: u32 = 80;
-        const HEIGHT: u32 = 48;
-        const ROW: u32 = 512;
         let buffer = |bytes: &[u8], usage| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -876,11 +472,6 @@ impl Gpu {
                     usage,
                 })
         };
-        let projection = Mat4::orthographic_rh(0., WIDTH as f32, HEIGHT as f32, 0., -1., 1.);
-        let view = buffer(
-            bytemuck::cast_slice(&projection.to_cols_array()),
-            wgpu::BufferUsages::UNIFORM,
-        );
         // Exercise extraction, nonzero addresses and records crossing texture rows.
         let mut texels = vec![[0; 4]; 3];
         let mut extractor = GradientExtractor::default();
@@ -896,47 +487,7 @@ impl Gpu {
             );
         }
         let address = append_paint(&mut texels, core::slice::from_ref(&surface));
-        let paint_size = wgpu::Extent3d {
-            width: 7,
-            height: texels.len().div_ceil(7) as u32,
-            depth_or_array_layers: 1,
-        };
-        texels.resize((paint_size.width * paint_size.height) as usize, [0; 4]);
-        let paint = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("surface paint regression"),
-            size: paint_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            paint.as_image_copy(),
-            bytemuck::cast_slice(&texels),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(paint_size.width * 16),
-                rows_per_image: None,
-            },
-            paint_size,
-        );
-        let paint_view = paint.create_view(&Default::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: view.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&paint_view),
-                },
-            ],
-        });
+        let bind_group = self.bindings(&texels);
         let size = Vec2::from(surface.size);
         let corners = QUAD_VERTEX_POSITIONS.map(|p| {
             let point = p * size;
@@ -972,26 +523,7 @@ impl Gpu {
         let index_count = indices.len() as u32;
         let vertices = buffer(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
         let indices = buffer(bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
-        let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (ROW * HEIGHT) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let target = self.target();
         let target_view = target.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -1022,6 +554,91 @@ impl Gpu {
                 pass.draw_indexed(0..index_count, 0, 0..1);
             }
         }
+        self.read(encoder, &target)
+    }
+
+    /// The view and paint bindings of the reference pipeline.
+    pub(super) fn bindings(&self, texels: &[[u32; 4]]) -> wgpu::BindGroup {
+        let view = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&projection().to_cols_array()),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let paint_size = wgpu::Extent3d {
+            width: 7,
+            height: texels.len().div_ceil(7) as u32,
+            depth_or_array_layers: 1,
+        };
+        let mut texels = texels.to_vec();
+        texels.resize((paint_size.width * paint_size.height) as usize, [0; 4]);
+        let paint = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("surface paint regression"),
+            size: paint_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            paint.as_image_copy(),
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(paint_size.width * 16),
+                rows_per_image: None,
+            },
+            paint_size,
+        );
+        let paint_view = paint.create_view(&Default::default());
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: view.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&paint_view),
+                },
+            ],
+        })
+    }
+
+    pub(super) fn target(&self) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Submits `encoder` and returns the tightly packed pixels of `target`.
+    pub(super) fn read(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+    ) -> Vec<u8> {
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (ROW * HEIGHT) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         encoder.copy_texture_to_buffer(
             target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -1102,94 +719,6 @@ fn gpu_surface_variants_match_reference_gl() {
     check_surface_variants(wgpu::Backends::GL);
 }
 
-#[test]
-#[ignore = "Requires a hardware Vulkan adapter"]
-fn gpu_solid_surfaces_match_reference_vulkan() {
-    check_solid_surface_variants(wgpu::Backends::VULKAN);
-}
-
-#[test]
-#[ignore = "Requires a hardware OpenGL adapter"]
-fn gpu_solid_surfaces_match_reference_gl() {
-    check_solid_surface_variants(wgpu::Backends::GL);
-}
-
-#[expect(
-    clippy::print_stderr,
-    reason = "Report measured hardware image differences"
-)]
-fn check_solid_surface_variants(backend: wgpu::Backends) {
-    let mut maximum = 0;
-    let mut differing_channels = 0;
-    let mut comparisons = 0;
-    for aa in [false, true] {
-        for linear in [false, true] {
-            let mut defines = Vec::new();
-            if linear {
-                defines.push("LINEAR_COLOR");
-            }
-            let reference = Gpu::with_variant(backend, aa, &defines);
-            defines.push("SURFACE_SOLID");
-            let variant = Gpu::with_variant(backend, aa, &defines);
-            for (size, radius, border) in [
-                ([64., 32.], [0.; 4], [0.; 4]),
-                ([64., 32.], [8.; 4], [0.2; 4]),
-                ([64., 32.], [0., 3.5, 11.75, 16.], [1.5; 4]),
-                ([63.25, 31.75], [7.5, 2., 13.25, 4.], [4.25; 4]),
-                ([63.25, 31.75], [0., 16., 2., 9.5], [0., 0.2, 8., 1.5]),
-                // Inner-radius clamp and collapsed inner shape stay on the
-                // reference SDF path; these are not fill-only specializations.
-                ([64., 32.], [18., 24., 40., 2.], [40., 25., 35., 20.]),
-                ([2.5, 1.75], [0.5, 1., 0.25, 0.], [0.2, 1.5, 0., 0.75]),
-            ] {
-                for alpha in [0., 0.375, 1.] {
-                    let paint = |rgba: [f32; 4]| {
-                        super::surface_color(LinearRgba::from_f32_array(rgba), linear)
-                    };
-                    let surface = GpuSurface {
-                        size,
-                        radius,
-                        border,
-                        background: paint([0.125, 0.45, 0.8, alpha]),
-                        border_colors: [
-                            paint([0.9, 0.1, 0.25, 0.25]),
-                            paint([0.2, 0.8, 0.05, 0.625]),
-                            paint([0.1, 0.25, 0.95, 0.]),
-                            paint([0.75, 0.5, 0.15, 1.]),
-                        ],
-                        ..Default::default()
-                    };
-                    assert_ne!(super::surface_shader(&surface), super::SurfaceShader::Full);
-                    for phase in [0., 0.125, 0.5, 0.875] {
-                        for angle in [0., 0.21] {
-                            for clipped in [false, true] {
-                                let expected =
-                                    reference.render_geometry(surface, phase, &[], angle, clipped);
-                                let actual =
-                                    variant.render_geometry(surface, phase, &[], angle, clipped);
-                                let difference = actual
-                                    .iter()
-                                    .zip(&expected)
-                                    .map(|(&a, &b)| a.abs_diff(b))
-                                    .max()
-                                    .unwrap();
-                                maximum = maximum.max(difference);
-                                differing_channels +=
-                                    actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
-                                comparisons += 1;
-                                // Separately compiled hardware programs can round
-                                // across an 8-bit boundary; bound every channel.
-                                assert!(difference <= 1, "SURFACE_SOLID delta={difference}, AA={aa}, linear={linear}, size={size:?}, radius={radius:?}, border={border:?}, alpha={alpha}, phase={phase}, angle={angle}, clipped={clipped}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    eprintln!("SURFACE_SOLID equivalence: {comparisons} image comparisons, maximum channel delta={maximum}/255; differing channels across fixtures={differing_channels}");
-}
-
 fn check_surface_variants(backend: wgpu::Backends) {
     for aa in [false, true] {
         let reference = Gpu::with_variant(backend, aa, &[]);
@@ -1197,33 +726,23 @@ fn check_surface_variants(backend: wgpu::Backends) {
             ("SURFACE_RECT_FILL", [0.; 4]),
             ("SURFACE_ROUNDED_FILL", [4., 8., 12., 16.]),
         ] {
-            for (source, cheap) in [
-                (include_str!("../surface.wgsl"), false),
-                (include_str!("../surface.wgsl"), true),
-                (include_str!("../surface_fill.wgsl"), false),
-                (include_str!("../surface_fill.wgsl"), true),
-            ] {
-                let mut definitions = vec![define];
-                if cheap {
-                    definitions.push("CHEAP_RECT_DISTANCE");
-                }
-                let variant = Gpu::with_source(backend, aa, &definitions, source);
-                for phase in [0., 0.125, 0.5, 0.875] {
-                    for alpha in [0.1, 0.5, 1.] {
-                        let fill = GpuSurface {
-                            size: [64., 32.],
-                            radius,
-                            background: [0.25, 0.5, 0.75, alpha],
-                            ..Default::default()
-                        };
-                        for angle in [0., 0.21] {
-                            for clipped in [false, true] {
-                                assert_eq!(
-                            reference.render_geometry(fill, phase, &[], angle, clipped),
-                            variant.render_geometry(fill, phase, &[], angle, clipped),
-                            "{define}, AA={aa}, phase={phase}, alpha={alpha}, angle={angle}, clipped={clipped}"
-                        );
-                            }
+            let variant = Gpu::with_variant(backend, aa, &[define]);
+            for phase in [0., 0.125, 0.5, 0.875] {
+                for alpha in [0.1, 0.5, 1.] {
+                    let fill = GpuSurface {
+                        size: [64., 32.],
+                        radius,
+                        background: [0.25, 0.5, 0.75, alpha],
+                        ..Default::default()
+                    };
+                    for angle in [0., 0.21] {
+                        for clipped in [false, true] {
+                            // Separate programs may round a blend across an 8-bit boundary.
+                            assert_pixels_close(
+                                &variant.render_geometry(fill, phase, &[], angle, clipped),
+                                &reference.render_geometry(fill, phase, &[], angle, clipped),
+                                &format!("{define}, AA={aa}, phase={phase}, alpha={alpha}, angle={angle}, clipped={clipped}"),
+                            );
                         }
                     }
                 }

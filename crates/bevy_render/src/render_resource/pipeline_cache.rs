@@ -126,26 +126,6 @@ fn load_module(
     shader_source: ShaderCacheSource,
     validate_shader: &ValidateShader,
 ) -> Result<WgpuShaderModule, ShaderCacheError> {
-    #[cfg(not(feature = "decoupled_naga"))]
-    if matches!(
-        shader_source,
-        ShaderCacheSource::NagaRelaxedFragment(_) | ShaderCacheSource::NagaRelaxedColorFragment(_)
-    ) {
-        let (module, colors_only) = match shader_source {
-            ShaderCacheSource::NagaRelaxedFragment(module) => (module, false),
-            ShaderCacheSource::NagaRelaxedColorFragment(module) => (module, true),
-            _ => unreachable!("checked precision source"),
-        };
-        #[cfg(feature = "experimental_relaxed_precision")]
-        return relaxed_precision::load(render_device, *_backend, module, colors_only);
-        #[cfg(not(feature = "experimental_relaxed_precision"))]
-        {
-            let _ = (module, colors_only);
-            return Err(ShaderCacheError::CreateShaderModule(
-                "enable bevy_render/experimental_relaxed_precision for this opt-in shader".into(),
-            ));
-        }
-    }
     let shader_source = match shader_source {
         #[cfg(feature = "shader_format_spirv")]
         ShaderCacheSource::SpirV(data) => wgpu::util::make_spirv(data),
@@ -156,10 +136,21 @@ fn load_module(
         ShaderCacheSource::Wgsl(src) => ShaderSource::Wgsl(Cow::Owned(src)),
         #[cfg(not(feature = "decoupled_naga"))]
         ShaderCacheSource::Naga(src) => ShaderSource::Naga(Cow::Owned(src)),
-        #[cfg(not(feature = "decoupled_naga"))]
-        ShaderCacheSource::NagaRelaxedFragment(_)
-        | ShaderCacheSource::NagaRelaxedColorFragment(_) => {
-            unreachable!("handled before ordinary shaders")
+        #[cfg(all(
+            not(feature = "decoupled_naga"),
+            feature = "experimental_relaxed_precision"
+        ))]
+        ShaderCacheSource::NagaRelaxedColorFragment(module) => {
+            return relaxed_precision::load(render_device, *_backend, module);
+        }
+        #[cfg(all(
+            not(feature = "decoupled_naga"),
+            not(feature = "experimental_relaxed_precision")
+        ))]
+        ShaderCacheSource::NagaRelaxedColorFragment(_) => {
+            return Err(ShaderCacheError::CreateShaderModule(
+                "enable bevy_render/experimental_relaxed_precision for this opt-in shader".into(),
+            ));
         }
     };
     let module_descriptor = ShaderModuleDescriptor {

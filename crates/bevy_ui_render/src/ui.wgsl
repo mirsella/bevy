@@ -228,23 +228,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 #ifdef IMAGE_PIXEL_ALIGNED
     // CPU eligibility proves the original edges lie on physical pixel edges
     // with an identity linear transform. Every covered sample has full coverage.
-#ifdef IMAGE_IMPLICIT_SAMPLING
     let color = in.color * textureSample(sprite_texture, sprite_sampler, in.uv);
-#else
-    let color = in.color * textureSampleGrad(sprite_texture, sprite_sampler, in.uv, dpdx(in.uv), dpdy(in.uv));
-#endif
     return vec4(manual_srgb(color.rgb), saturate(color.a));
 #else
     // Same sampling, gamma and edge coverage as a zero-radius, zero-border
     // textured node, without compiling the text/outline/rounded-shape branches.
     let color = in.color * textureSampleGrad(sprite_texture, sprite_sampler, in.uv, dpdx(in.uv), dpdy(in.uv));
     let q = abs(in.point) - 0.5 * in.size;
-#ifdef CHEAP_RECT_DISTANCE
-    // Covered fragments lie inside the original rectangular geometry.
-    let distance = max(q.x, q.y);
-#else
     let distance = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0);
-#endif
 #ifdef ANTI_ALIAS
     let coverage = antialias(distance);
 #else

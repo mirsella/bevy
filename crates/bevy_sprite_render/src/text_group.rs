@@ -226,8 +226,6 @@ struct Group {
     tiles: Vec<Tile>,
     used: bool,
     dirty: bool,
-    /// Advances only after this group's pixels have been successfully encoded.
-    generation: u64,
 }
 
 /// Actual cache work in the most recently prepared frame.
@@ -289,18 +287,6 @@ impl TextGroupCache {
         self.stats
     }
 
-    /// Revision of a completed tile owned by this text entity, for dependent caches.
-    ///
-    /// Unknown images and dirty groups have no reusable revision. Other groups on
-    /// the same atlas page cannot invalidate this tile: allocations do not overlap.
-    pub fn retained_image_generation(&self, entity: Entity, image: AssetId<Image>) -> Option<u64> {
-        let group = self.groups.get(&entity)?;
-        (!group.dirty
-            && group.generation != 0
-            && group.tiles.iter().any(|t| t.output.image == image))
-        .then_some(group.generation)
-    }
-
     /// Keep an existing group through a fully transparent frame, without building
     /// unseen text. Layout and paint changes are checked when it becomes visible.
     pub fn keep_cached(&mut self, entity: Entity) {
@@ -326,7 +312,6 @@ impl TextGroupCache {
             tiles: Vec::new(),
             used: false,
             dirty: true,
-            generation: 0,
         });
         group.used = true;
         let mut changed = group.layout_tick != Some(layout.last_changed())
@@ -1009,12 +994,7 @@ fn render_groups(
         }
     }
     for entity in &gpu.groups {
-        let group = cache.groups.get_mut(entity).unwrap();
-        group.dirty = false;
-        group.generation = group
-            .generation
-            .checked_add(1)
-            .expect("text group generation overflow");
+        cache.groups.get_mut(entity).unwrap().dirty = false;
     }
 }
 
@@ -1144,38 +1124,6 @@ mod tests {
         assert!(group.dirty);
         assert_eq!(group.quads[0].color, color.to_linear());
         assert_eq!(group.tiles[0].output.bounds.min, Vec2::new(20., 0.));
-    }
-
-    #[test]
-    fn dependent_cache_requires_a_completed_owned_tile_revision() {
-        let mut world = World::new();
-        let entity = world.spawn((glyph_layout(true), TextColor::WHITE)).id();
-        let mut cache = TextGroupCache::default();
-        assert_eq!(extract_test_group(&mut world, &mut cache, entity), 1);
-        let image = cache.groups[&entity].tiles[0].output.image;
-        assert_eq!(cache.retained_image_generation(entity, image), None);
-        {
-            let group = cache.groups.get_mut(&entity).unwrap();
-            group.dirty = false;
-            group.generation = 1;
-        }
-        assert_eq!(cache.retained_image_generation(entity, image), Some(1));
-        assert_eq!(
-            cache.retained_image_generation(Entity::PLACEHOLDER, image),
-            None
-        );
-        assert_eq!(
-            cache.retained_image_generation(entity, AssetId::default()),
-            None
-        );
-        cache.groups.get_mut(&entity).unwrap().dirty = true;
-        assert_eq!(cache.retained_image_generation(entity, image), None);
-        let group = cache.groups.get_mut(&entity).unwrap();
-        group.dirty = false;
-        group.generation = 2;
-        assert_eq!(cache.retained_image_generation(entity, image), Some(2));
-        cache.groups.remove(&entity);
-        assert_eq!(cache.retained_image_generation(entity, image), None);
     }
 
     #[test]

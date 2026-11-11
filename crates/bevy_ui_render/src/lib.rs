@@ -9,15 +9,10 @@
 
 pub mod box_shadow;
 pub mod clipping;
-mod composite_bounds;
-mod retained_layer;
-pub use retained_layer::{UiRetainedLayer, UiRetainedLayerStatus};
 mod pipeline;
 pub mod render_pass;
 mod surface;
-pub use surface::cache::{
-    ui_surface_cache_pass, UiCachedSurfaces, UiSurfaceCachePass, UiSurfaceCacheStatus,
-};
+pub use surface::cache::{UiCachedSurfaces, UiSurfaceCacheState, UiSurfaceCacheStatus};
 mod text;
 pub mod ui_material;
 mod ui_material_pipeline;
@@ -88,13 +83,11 @@ use bytemuck::{Pod, Zeroable};
 use core::ops::Range;
 
 pub use pipeline::*;
-pub mod output_fusion;
 pub use render_pass::*;
 pub use ui_material_pipeline::*;
 use ui_texture_slice_pipeline::UiTextureSlicerPlugin;
 
 use crate::clipping::{clip_polygon, rect_without_hole, rounded_inner_rect};
-use crate::composite_bounds::{CompositeBounds, UiCompositeBounds};
 use crate::text::{calculate_text_scroll_clip, extract_preedit_underlines, extract_text_cursor};
 use crate::ui_mesh::UiMesh;
 
@@ -104,7 +97,7 @@ pub mod prelude {
 
     pub use crate::{
         ui_material::*, ui_material_pipeline::UiMaterialPlugin, BoxShadowSamples, UiAntiAlias,
-        UiCachedSurfaces, UiCompositeLookup, UiCompositeScissor, UiRetainedLayer, UiShaderVariants,
+        UiCachedSurfaces, UiShaderVariants,
     };
 }
 
@@ -182,106 +175,48 @@ pub enum UiAntiAlias {
     Off,
 }
 
-/// Opts a camera into restricting the sRGB UI composite draw to emitted geometry.
+/// Selects cheaper shaders for the parts of a camera's UI that do not need the
+/// general one.
 ///
-/// Only standard UI draws with finite CPU-generated vertices and a full-target,
-/// pixel-matched viewport can use the scissor. Other UI draw functions (including
-/// surfaces, shadows, sliced images, and custom materials) retain the full-screen
-/// composite. UI texture allocation, clearing, and rendering are unchanged.
-#[derive(Component, Clone, Copy, Default, Debug, Reflect)]
-#[reflect(Component, Default, Clone)]
-pub struct UiCompositeScissor;
-
-/// Keep specialized shader batches separate instead of promoting mixed batches
-/// to their common general shader. This trades additional draws for less fragment
-/// work and never reorders transparent items. Opt-in pending device measurements.
-#[derive(Component, Clone, Copy, Default, Debug, Reflect)]
-#[reflect(Component, Default, Clone)]
-pub struct UiSeparateBatches;
-
-/// Selects geometry-equivalent shader specializations for a camera's UI.
-///
-/// `FULL` keeps the reference shaders, for comparisons or driver workarounds.
-/// Specialized pipelines retain antialiasing and color conversion, and fall back
-/// to the reference pipeline until compilation completes. Missing components use
-/// [`Self::FULL`]. The separate `linear_color` experiment changes compositing space
-/// for all UI draws, including materials and text.
+/// Every variant keeps geometry, antialiasing and color conversion. Measured
+/// differences from the general shaders stay within two 8-bit steps on a few
+/// dozen pixels of a full screen. A specialized pipeline is used once it has
+/// compiled, and nodes it cannot draw keep the general shader. Cameras without this component
+/// use [`Self::FULL`].
 #[derive(Component, Clone, Copy, Debug, Reflect, Eq, PartialEq)]
 #[reflect(Component, Default, PartialEq, Clone)]
 pub struct UiShaderVariants {
-    /// Appearance-changing experiment: emit linear colors directly into an
-    /// `Rgba8UnormSrgb` main target, without a UI intermediate or composite.
-    /// Linear alpha blending differs from the reference gamma-space blend.
-    /// Requires the direct-UI pass; incompatible with `encoded_images`.
-    /// Intermediate-only retention, lookup, and composite scissor options are
-    /// unused. Custom material shaders must emit linear colors in this mode.
-    pub linear_color: bool,
-    /// Appearance-changing comparison: ordinary images use sample/tint and
-    /// reference gamma encoding (omitted with `linear_color`), without analytic
-    /// shape AA. Never selected by the default constants.
-    pub basic_images: bool,
-    /// Experimental encoded-view sample/tint shader. Requires direct gamma UI
-    /// and opt-in dual-view immutable images; all other images retain reference.
-    pub encoded_images: bool,
-    /// Opt-in: CPU-tessellate stretched, axis-aligned nine-slice images with
-    /// single-mip, linear-filtered textures. Tiling, rotation/shear, tiny or
-    /// invalid patches, and upper seams near pixel centers retain FULL to avoid
-    /// changing its repeat seam or derivative-dependent filtering. Even eligible
-    /// images can have small floating-point interpolation differences.
+    /// Build stretched, axis-aligned nine-slice images on the CPU instead of
+    /// slicing per fragment. Tiling, rotation or shear, tiny or invalid patches
+    /// and textures with mips or nearest filtering keep the general shader.
+    /// Eligible images can still differ by interpolation rounding.
     pub cpu_slices: bool,
-    /// Appearance-changing opt-in: affine nine-patch sampling, including rotated,
-    /// subpixel and mipmapped images. Keeps geometry/clipping, but replaces FULL's
-    /// wrapped seam and cross-seam derivatives with continuous per-patch UVs.
-    pub approximate_cpu_slices: bool,
+    /// Draw fills with shaders specialized for plain and rounded rectangles.
+    /// Borders, gradients and shadows keep the general shader.
     pub surfaces: bool,
-    /// Opt-in: remove gradient machinery from gradient-free fills and borders,
-    /// retaining reference geometry, coverage, side selection and color space.
-    /// Independent of `surfaces`. Mixed batches promote to the reference shader
-    /// without extra draws; `UiSeparateBatches` trades draws for specialization.
-    /// Moves all four border colors to flat vertex outputs (more vertex work/IO).
-    pub solid_surfaces: bool,
-    /// Diagnostic for [`UiCachedSurfaces`] replay fragments only (never source pixels):
-    /// 0 = unchanged replay, 1 = opaque magenta, 2 = crop origin / (1080, 2160),
-    /// 3 = texture dimensions / 2048, 4 = center texel, 5 = out-of-bounds red.
-    /// Modes 2 and 3 put X/Y in R/G with B = 0 and A = 1. Requires 0..=5.
-    /// Mode 2 uses a fixed diagnostic viewport, not the camera's actual size.
-    pub surface_cache_probe: u32,
+    /// Draw images without rounded corners or borders with a shader that skips
+    /// shape coverage.
     pub images: bool,
-    /// Diagnostic: omit the zero-length term for fragments inside rectangular geometry.
-    pub rect_math: bool,
-    /// Diagnostic: use compact inter-stage interfaces for specialized fills/images.
-    pub lean_io: bool,
-    /// Opt-in: omit shape coverage only for proven pixel-aligned, untransformed images.
+    /// With [`Self::images`], sample untransformed images that land exactly on
+    /// the pixel grid without explicit gradients.
     pub aligned_images: bool,
-    /// Diagnostic: use implicit instead of explicit gradients on aligned images.
-    pub implicit_aligned_images: bool,
-    /// Opt-in: shade large plain image interiors separately from their AA edge band.
-    pub image_interiors: bool,
-    /// Opt-in Vulkan fragment precision experiment; requires the renderer's
-    /// experimental feature and explicit visual approval. Never a default.
-    pub relaxed_precision: bool,
-    /// Fragment-only sampled-color/gamma precision experiment. Coverage and
-    /// texture coordinates keep ordinary precision; requires Vulkan validation.
+    /// Let the driver use reduced precision for sampled colors and the gamma
+    /// conversion in fragment shaders; coordinates and coverage keep full
+    /// precision. Measured only on an Adreno 506, where it changed colors by up
+    /// to four 8-bit steps.
+    ///
+    /// This is a hard requirement, not a hint: without the
+    /// `bevy_render/experimental_relaxed_precision` feature, or off Vulkan with
+    /// SPIR-V passthrough, the pipelines fail and the camera's UI is not drawn.
     pub relaxed_colors: bool,
 }
 
 impl UiShaderVariants {
     pub const FULL: Self = Self {
-        linear_color: false,
-        basic_images: false,
-        encoded_images: false,
         cpu_slices: false,
-        approximate_cpu_slices: false,
         surfaces: false,
-        solid_surfaces: false,
-        surface_cache_probe: 0,
         images: false,
-        rect_math: false,
-        lean_io: false,
         aligned_images: false,
-        implicit_aligned_images: false,
-        image_interiors: false,
-        relaxed_precision: false,
         relaxed_colors: false,
     };
     pub const SURFACES: Self = Self {
@@ -292,31 +227,12 @@ impl UiShaderVariants {
         images: true,
         ..Self::FULL
     };
+    /// Both shape specializations; the remaining fields stay opt-in.
     pub const ALL: Self = Self {
         surfaces: true,
         images: true,
         ..Self::FULL
     };
-
-    pub(crate) fn render_target_format(self, target_format: TextureFormat) -> TextureFormat {
-        assert!(
-            self.surface_cache_probe <= 5,
-            "surface cache probe must be in 0..=5"
-        );
-        assert!(
-            !(self.linear_color && self.encoded_images),
-            "linear-color UI cannot use encoded-image views"
-        );
-        if self.linear_color {
-            assert!(
-                matches!(target_format, TextureFormat::Rgba8UnormSrgb | TextureFormat::Bgra8UnormSrgb),
-                "linear-color UI requires an RGBA8 or BGRA8 sRGB main target, got {target_format:?}"
-            );
-            target_format
-        } else {
-            ui_render_target_format(target_format)
-        }
-    }
 }
 
 impl Default for UiShaderVariants {
@@ -366,8 +282,6 @@ impl Plugin for UiRenderPlugin {
             app.add_plugins(TextGroupPlugin);
         }
         load_shader_library!(app, "ui.wgsl");
-        embedded_asset!(app, "image_rect.wgsl");
-        embedded_asset!(app, "image_basic.wgsl");
         embedded_asset!(app, "srgb_ui_composite.wgsl");
         app.insert_resource(SrgbUiCompositeShader {
             _handle: load_embedded_asset!(app, "srgb_ui_composite.wgsl"),
@@ -387,8 +301,6 @@ impl Plugin for UiRenderPlugin {
             .init_gpu_resource::<ImageNodeBindGroups>()
             .init_gpu_resource::<UiMesh<UiVertex>>()
             .init_resource::<ExtractedUiNodes>()
-            .init_resource::<UiCompositeBounds>()
-            .init_gpu_resource::<retained_layer::RetainedUiLayers>()
             .allow_ambiguous_resource::<ExtractedUiNodes>()
             .init_resource::<DrawFunctions<TransparentUi>>()
             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
@@ -437,13 +349,9 @@ impl Plugin for UiRenderPlugin {
                     queue_uinodes.in_set(RenderSystems::Queue),
                     queue_srgb_ui_composite_pipelines.in_set(RenderSystems::Queue),
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
-                    (
-                        prepare_uinodes,
-                        prepare_srgb_ui_textures,
-                        prepare_srgb_ui_composite_bind_groups,
-                    )
-                        .chain()
-                        .in_set(RenderSystems::PrepareBindGroups),
+                    prepare_srgb_ui_textures.in_set(RenderSystems::PrepareResources),
+                    prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_srgb_ui_composite_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(
@@ -861,17 +769,6 @@ pub struct UiCameraView(pub Entity);
 #[derive(Component)]
 pub struct UiViewTarget(pub Entity);
 
-/// Experimental LDR composite using an 8-bit gamma lookup for opaque pixels.
-///
-/// Leaves translucent pixels, HDR and unmarked cameras on the reference shader. Rounding a filtered
-/// sample back to 8-bit channels can change pixels; callers must validate output.
-#[derive(Component, Clone, Copy, Default)]
-pub struct UiCompositeLookup;
-
-/// Excludes a camera from UI extraction, for example a presentation-only blit camera.
-#[derive(Component, Clone, Copy, Default)]
-pub struct UiRenderingDisabled;
-
 /// Extracts all UI elements associated with a camera into the render world.
 pub fn extract_ui_camera_view(
     mut commands: Commands,
@@ -885,12 +782,7 @@ pub fn extract_ui_camera_view(
                 Option<&UiAntiAlias>,
                 Option<&BoxShadowSamples>,
                 Option<&UiShaderVariants>,
-                Has<UiCompositeScissor>,
-                Has<UiSeparateBatches>,
-                Option<&UiRetainedLayer>,
-                Has<UiCompositeLookup>,
                 Has<UiCachedSurfaces>,
-                Has<UiRenderingDisabled>,
             ),
             Or<(With<Camera2d>, With<Camera3d>)>,
         >,
@@ -907,16 +799,11 @@ pub fn extract_ui_camera_view(
         ui_anti_alias,
         shadow_samples,
         variants,
-        scissor,
-        separate,
-        retained,
-        composite_lookup,
         cached_surfaces,
-        ui_disabled,
     ) in &query
     {
         // ignore inactive cameras
-        if !camera.is_active || ui_disabled {
+        if !camera.is_active {
             commands
                 .get_entity(render_entity)
                 .expect("Camera entity wasn't synced.")
@@ -949,8 +836,6 @@ pub fn extract_ui_camera_view(
                 continue;
             };
             let variants = variants.copied().unwrap_or_default();
-            // Validate before CPU paint extraction or any pipeline specialization.
-            variants.render_target_format(target_format);
 
             // use a projection matrix with the origin in the top left instead of the bottom left that comes with OrthographicProjection
             let projection_matrix = Mat4::orthographic_rh(
@@ -991,21 +876,6 @@ pub fn extract_ui_camera_view(
                     variants,
                 ))
                 .id();
-            if let Some(settings) = retained.filter(|_| !variants.linear_color) {
-                commands.entity(ui_camera_view).insert(*settings);
-            }
-            if composite_lookup && !variants.linear_color {
-                commands.entity(ui_camera_view).insert(UiCompositeLookup);
-            }
-
-            // This view is freshly spawned each frame: removing the camera marker
-            // cannot leave an enabled scissor on a retained render entity.
-            if scissor && !variants.linear_color {
-                commands.entity(ui_camera_view).insert(UiCompositeScissor);
-            }
-            if separate {
-                commands.entity(ui_camera_view).insert(UiSeparateBatches);
-            }
             if cached_surfaces {
                 commands.entity(ui_camera_view).insert(UiCachedSurfaces);
             }
@@ -1816,32 +1686,6 @@ pub struct UiBatch {
     pub image: AssetId<Image>,
 }
 
-/// A coverage-free subdraw inside one transparent item. Its edge draw remains
-/// adjacent, so overlapping images retain their original source-over order.
-#[derive(Component)]
-#[doc(hidden)]
-pub struct UiImageInterior {
-    pub(crate) range: Range<u32>,
-    pub(crate) pipeline: CachedRenderPipelineId,
-}
-
-#[derive(Component)]
-#[doc(hidden)]
-pub struct UiEncodedBatch;
-
-fn has_encoded_view(image: &GpuImage) -> bool {
-    !image.texture_descriptor.format.is_srgb()
-        && image
-            .texture_view_descriptor
-            .as_ref()
-            .and_then(|view| view.format)
-            .is_some_and(|format| format.is_srgb())
-        && !image
-            .texture_descriptor
-            .usage
-            .contains(TextureUsages::RENDER_ATTACHMENT)
-}
-
 impl UiBatch {
     fn append(
         items: &mut SortedPhaseItems<TransparentUi>,
@@ -1925,34 +1769,6 @@ fn is_rect_image(node: &ExtractedUiNode) -> bool {
             && *border_radius == ResolvedBorderRadius::default() && *border == BorderRect::ZERO)
 }
 
-/// The reference rectangular SDF is <= -1 throughout this local rectangle,
-/// leaving a guard outside its half-unit AA band. Clipping and affine transforms
-/// preserve the original interpolated local points; neither needs pixel alignment.
-fn image_interior(node: &ExtractedUiNode) -> Option<Rect> {
-    if !is_rect_image(node) || !node.transform.is_finite() {
-        return None;
-    }
-    let ExtractedUiItem::Node { rect, .. } = &node.item else {
-        return None;
-    };
-    let size = rect.size();
-    let area = (node.transform.matrix2.determinant() * size.x * size.y).abs();
-    if !size.is_finite()
-        || size.min_element() < 8.
-        || size.max_element() > 16384.
-        || !area.is_finite()
-        || area < 4096.
-        || QUAD_VERTEX_POSITIONS.iter().any(|corner| {
-            let p = node.transform.transform_point2(*corner * size);
-            !p.is_finite() || p.abs().max_element() > 16384.
-        })
-    {
-        return None;
-    }
-    let half = 0.5 * size - Vec2::ONE;
-    Some(Rect::from_corners(-half, half))
-}
-
 fn is_pixel_aligned_image(node: &ExtractedUiNode) -> bool {
     if !is_rect_image(node) || node.transform.matrix2 != bevy_math::Mat2::IDENTITY {
         return false;
@@ -1977,13 +1793,10 @@ fn is_pixel_aligned_image(node: &ExtractedUiNode) -> bool {
 
 #[derive(Clone, Copy)]
 struct PreparedUiPipelines {
-    encoded: bool,
-    basic: Option<CachedRenderPipelineId>,
     full: CachedRenderPipelineId,
     rect: Option<CachedRenderPipelineId>,
     images: bool,
     aligned: Option<CachedRenderPipelineId>,
-    interior: Option<CachedRenderPipelineId>,
 }
 
 #[derive(Resource, Default)]
@@ -1991,7 +1804,6 @@ struct PreparedUiPipelines {
 pub struct UiPipelineVariants(HashMap<Entity, PreparedUiPipelines>);
 
 pub fn queue_uinodes(
-    gpu_images: Res<RenderAssets<GpuImage>>,
     extracted_uinodes: Res<ExtractedUiNodes>,
     ui_pipeline: Res<UiPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiPipeline>>,
@@ -2019,17 +1831,10 @@ pub fn queue_uinodes(
             continue;
         };
         let key = UiPipelineKey {
-            basic_image: false,
-            encoded_image: false,
-            relaxed_precision: variants.relaxed_precision,
             relaxed_colors: variants.relaxed_colors,
-            target_format: variants.render_target_format(view.target_format),
+            target_format: ui_render_target_format(view.target_format),
             anti_alias: matches!(antialias, None | Some(UiAntiAlias::On)),
-            image_rect: false,
-            rect_math: false,
-            lean_io: false,
-            pixel_aligned: false,
-            implicit_aligned: false,
+            shader: UiNodeShader::Full,
         };
         let full = pipelines.specialize(&pipeline_cache, &ui_pipeline, key);
         let rect = variants.images.then(|| {
@@ -2037,58 +1842,32 @@ pub fn queue_uinodes(
                 &pipeline_cache,
                 &ui_pipeline,
                 UiPipelineKey {
-                    image_rect: true,
-                    rect_math: variants.rect_math,
-                    lean_io: variants.lean_io,
+                    shader: UiNodeShader::ImageRect,
                     ..key
                 },
             )
         });
-        let coverage_free = ((variants.aligned_images || variants.image_interiors)
-            && view.viewport.x == 0
-            && view.viewport.y == 0)
+        let aligned = (variants.aligned_images && view.viewport.x == 0 && view.viewport.y == 0)
             .then(|| {
                 pipelines.specialize(
                     &pipeline_cache,
                     &ui_pipeline,
                     UiPipelineKey {
-                        image_rect: true,
-                        pixel_aligned: true,
-                        implicit_aligned: variants.implicit_aligned_images,
+                        shader: UiNodeShader::AlignedImageRect,
                         ..key
                     },
                 )
             })
             .filter(|id| pipeline_cache.get_render_pipeline(*id).is_some());
-        let basic = (variants.basic_images && view.viewport.x == 0 && view.viewport.y == 0)
-            .then(|| {
-                pipelines.specialize(
-                    &pipeline_cache,
-                    &ui_pipeline,
-                    UiPipelineKey {
-                        basic_image: true,
-                        encoded_image: variants.encoded_images,
-                        image_rect: true,
-                        ..key
-                    },
-                )
-            })
-            .filter(|id| {
-                pipeline_cache.get_render_pipeline(*id).is_some()
-                    && pipeline_cache.get_render_pipeline(full).is_some()
-            });
         prepared.0.insert(
             entity,
             PreparedUiPipelines {
-                encoded: variants.encoded_images,
-                basic,
                 full,
                 rect,
                 images: variants.images
                     && pipeline_cache.get_render_pipeline(full).is_some()
                     && rect.is_some_and(|id| pipeline_cache.get_render_pipeline(id).is_some()),
-                aligned: coverage_free.filter(|_| variants.aligned_images),
-                interior: coverage_free.filter(|_| variants.image_interiors),
+                aligned,
             },
         );
     }
@@ -2122,18 +1901,8 @@ pub fn queue_uinodes(
 
         let pipeline = if choice.images && is_rect_image(extracted_uinode) {
             choice
-                .basic
-                .filter(|_| {
-                    !choice.encoded
-                        || gpu_images
-                            .get(extracted_uinode.image)
-                            .is_some_and(has_encoded_view)
-                })
-                .or_else(|| {
-                    choice
-                        .aligned
-                        .filter(|_| is_pixel_aligned_image(extracted_uinode))
-                })
+                .aligned
+                .filter(|_| is_pixel_aligned_image(extracted_uinode))
                 .unwrap_or_else(|| choice.rect.expect("image specialization enabled"))
         } else {
             choice.full
@@ -2156,7 +1925,6 @@ pub fn queue_uinodes(
 #[derive(Resource, Default)]
 pub struct ImageNodeBindGroups {
     pub values: HashMap<AssetId<Image>, BindGroup>,
-    pub encoded: HashMap<AssetId<Image>, (TextureView, BindGroup)>,
 }
 
 pub fn prepare_uinodes(
@@ -2175,51 +1943,7 @@ pub fn prepare_uinodes(
     mut previous_len: Local<usize>,
     prepared: Res<UiPipelineVariants>,
     render_views: Query<&UiCameraView>,
-    (
-        scissor_views,
-        mut composite_bounds,
-        draw_functions,
-        separate_views,
-        retained_views,
-        mut retained_layers,
-        targets,
-        text_groups,
-    ): (
-        Query<
-            &ExtractedView,
-            (
-                With<UiViewTarget>,
-                Or<(With<UiCompositeScissor>, With<UiRetainedLayer>)>,
-            ),
-        >,
-        ResMut<UiCompositeBounds>,
-        Res<DrawFunctions<TransparentUi>>,
-        Query<&ExtractedView, With<UiSeparateBatches>>,
-        Query<(&ExtractedView, &UiViewTarget, &UiRetainedLayer)>,
-        ResMut<retained_layer::RetainedUiLayers>,
-        Query<(
-            &bevy_render::view::ViewTarget,
-            &bevy_render::camera::ExtractedCamera,
-        )>,
-        Option<Res<TextGroupCache>>,
-    ),
 ) {
-    // Clear even without a view binding: missing preparation must fall back, not
-    // reuse coverage from an earlier frame.
-    composite_bounds.0.clear();
-    let changed_images: Vec<_> = events
-        .images
-        .iter()
-        .filter_map(|event| match event {
-            AssetEvent::Added { id }
-            | AssetEvent::Modified { id }
-            | AssetEvent::Removed { id }
-            | AssetEvent::Unused { id } => Some(*id),
-            _ => None,
-        })
-        .collect();
-    retained_layers.begin_frame(&changed_images);
-
     // If an image has changed, the GpuImage has (probably) changed
     for event in &events.images {
         match event {
@@ -2228,14 +1952,12 @@ pub fn prepare_uinodes(
             AssetEvent::LoadedWithDependencies { .. } => {}
             AssetEvent::Unused { id } | AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
                 image_bind_groups.values.remove(id);
-                image_bind_groups.encoded.remove(id);
             }
         };
     }
 
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
         let mut batches: Vec<(Entity, UiBatch)> = Vec::with_capacity(*previous_len);
-        let mut encoded_images = HashSet::<AssetId<Image>>::default();
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();
@@ -2245,34 +1967,10 @@ pub fn prepare_uinodes(
             &BindGroupEntries::single(view_binding),
         ));
 
-        if !scissor_views.is_empty() {
-            let draw_ui = draw_functions.read().id::<DrawUi>();
-            for view in &scissor_views {
-                if let Some(phase) = phases.get(&view.retained_view_entity) {
-                    // Inspect every draw before the extracted-node lookup can
-                    // quietly skip foreign items with their own vertex transforms.
-                    composite_bounds.0.insert(
-                        view.retained_view_entity,
-                        CompositeBounds::for_draw_functions(
-                            phase.items.values().map(|item| item.draw_function),
-                            draw_ui,
-                        ),
-                    );
-                }
-            }
-        }
-
-        for (retained_view_entity, ui_phase) in &mut phases.0 {
-            let phase_vertex_start = ui_meta.vertices.len();
-            let phase_index_start = ui_meta.indices.len();
-            let mut cacheable = true;
-            let mut layer_images = Vec::new();
-            let mut interior_pipelines = Vec::new();
-            let mut first: Option<usize> = None;
-            let separate = separate_views
-                .iter()
-                .any(|view| &view.retained_view_entity == retained_view_entity);
-            let mut bounds = composite_bounds.0.get_mut(retained_view_entity);
+        for ui_phase in phases.values_mut() {
+            let mut first = None;
+            // Consecutive items share a camera.
+            let mut choices: Option<(Entity, PreparedUiPipelines)> = None;
 
             for item_index in 0..ui_phase.items.len() {
                 let item = &ui_phase.items[item_index];
@@ -2287,57 +1985,21 @@ pub fn prepare_uinodes(
                 let Some(image) = gpu_images.get(extracted_uinode.image) else {
                     // Asset loading and GPU uploads can lag behind UI extraction.
                     // Retry next frame without batching across this skipped item.
-                    cacheable = false;
                     continue;
                 };
-                if retained_views
-                    .iter()
-                    .any(|(v, _, _)| &v.retained_view_entity == retained_view_entity)
-                {
-                    let generation = if image.texture.usage().intersects(
-                        TextureUsages::RENDER_ATTACHMENT | TextureUsages::STORAGE_BINDING,
-                    ) {
-                        text_groups.as_ref().and_then(|groups| {
-                            groups.retained_image_generation(
-                                extracted_uinode.main_entity.id(),
-                                extracted_uinode.image,
-                            )
-                        })
-                    } else {
-                        Some(0)
-                    };
-                    cacheable &= generation.is_some();
-                    layer_images.push((
-                        extracted_uinode.image,
-                        if prepared.0[&render_views
-                            .get(extracted_uinode.extracted_camera_entity)
-                            .expect("queued view")
-                            .0]
-                            .encoded
-                            && prepared.0[&render_views
-                                .get(extracted_uinode.extracted_camera_entity)
-                                .expect("queued view")
-                                .0]
-                                .basic
-                                == Some(item.pipeline)
-                        {
-                            match image_bind_groups.encoded.get(&extracted_uinode.image) {
-                                Some((view, _)) => view.id(),
-                                None => {
-                                    cacheable = false;
-                                    image.texture_view.id()
-                                }
-                            }
-                        } else {
-                            image.texture_view.id()
-                        },
-                        image.sampler.id(),
-                        generation.unwrap_or(0),
-                    ));
-                }
+                let ui_camera = extracted_uinode.extracted_camera_entity;
+                let choice = match choices {
+                    Some((cached, choice)) if cached == ui_camera => choice,
+                    _ => {
+                        let choice = prepared.0[&render_views
+                            .get(ui_camera)
+                            .expect("queued UI camera exists")
+                            .0];
+                        choices = Some((ui_camera, choice));
+                        choice
+                    }
+                };
                 let start = ui_meta.indices.len() as u32;
-                let vertex_start = ui_meta.vertices.len();
-                let mut interior_draw = None;
                 match &extracted_uinode.item {
                     ExtractedUiItem::Node {
                         atlas_scaling,
@@ -2379,15 +2041,11 @@ pub fn prepare_uinodes(
                         };
 
                         let color = color.to_f32_array();
-                        let choice = prepared.0[&render_views
-                            .get(extracted_uinode.extracted_camera_entity)
-                            .expect("queued UI camera exists")
-                            .0];
-                        assert!(
+                        debug_assert!(
                             Some(item.pipeline) != choice.rect || is_rect_image(extracted_uinode),
                             "IMAGE_RECT pipeline queued for an incompatible UI node"
                         );
-                        assert!(
+                        debug_assert!(
                             choice.aligned != Some(item.pipeline)
                                 || is_pixel_aligned_image(extracted_uinode),
                             "pixel-aligned image pipeline queued without an exact edge proof"
@@ -2395,36 +2053,12 @@ pub fn prepare_uinodes(
 
                         // Outlines have no coverage in the interior.
                         let omit_interior = matches!(node_type, NodeType::Outline);
-                        assert!(
-                            choice.basic != Some(item.pipeline) || is_rect_image(extracted_uinode),
-                            "basic image shader queued for incompatible geometry"
-                        );
-                        let interior = (choice.images
-                            && choice.aligned != Some(item.pipeline)
-                            && choice.basic != Some(item.pipeline))
-                        .then(|| choice.interior.zip(image_interior(extracted_uinode)))
-                        .flatten();
                         let hole = if omit_interior {
                             rounded_inner_rect(rect_size, *border, *border_radius)
-                        } else if let Some((_, rect)) = interior {
-                            Some(rect)
                         } else {
                             None
                         };
-                        let mut parts = rect_without_hole(rect_size, hole);
-                        let edge_parts = parts.len();
-                        if let Some((_, rect)) = interior {
-                            parts.push(rect);
-                        }
-                        for (part_index, part) in parts.into_iter().enumerate() {
-                            if part_index == edge_parts
-                                && let Some((pipeline, _)) = interior
-                            {
-                                interior_draw = Some(UiImageInterior {
-                                    range: ui_meta.indices.len() as u32..0,
-                                    pipeline,
-                                });
-                            }
+                        for part in rect_without_hole(rect_size, hole) {
                             let corners = [0, 1, 2, 3].map(|i| {
                                 let pos = QUAD_VERTEX_POSITIONS[i];
                                 let point = part.center() + pos * part.size();
@@ -2515,47 +2149,6 @@ pub fn prepare_uinodes(
                         }
                     }
                 }
-                // Both nodes and glyphs contribute their actual clipped vertices.
-                // Disabled views never scan geometry or collect bounds.
-                if let Some(bounds) = bounds.as_deref_mut() {
-                    bounds.include_vertices(&ui_meta.vertices.values()[vertex_start..]);
-                }
-                let choices = prepared.0[&render_views
-                    .get(extracted_uinode.extracted_camera_entity)
-                    .expect("queued UI camera exists")
-                    .0];
-                let basic_boundary = first.is_some_and(|previous| {
-                    (Some(ui_phase.items[previous].pipeline) == choices.basic)
-                        != (Some(ui_phase.items[item_index].pipeline) == choices.basic)
-                });
-                if (separate || basic_boundary)
-                    && start != ui_meta.indices.len() as u32
-                    && let Some(previous) = first
-                    && ui_phase.items[previous].pipeline != ui_phase.items[item_index].pipeline
-                {
-                    first = None;
-                }
-                let interior_draw = interior_draw.and_then(|mut interior| {
-                    interior.range.end = ui_meta.indices.len() as u32;
-                    (!interior.range.is_empty()).then_some(interior)
-                });
-                if interior_draw.is_some() {
-                    first = None;
-                }
-                let item_entity = item.entity();
-                let encoded =
-                    choices.encoded && choices.basic == Some(ui_phase.items[item_index].pipeline);
-                if encoded {
-                    assert!(
-                        has_encoded_view(image),
-                        "encoded UI batch lacks a compatible alternate view"
-                    );
-                    encoded_images.insert(extracted_uinode.image);
-                    commands.entity(item_entity).insert(UiEncodedBatch);
-                    // Even an equal texture must never absorb an untextured or
-                    // reference draw and subsequently promote its shader.
-                    first = None;
-                }
                 UiBatch::append(
                     &mut ui_phase.items,
                     &mut first,
@@ -2563,88 +2156,12 @@ pub fn prepare_uinodes(
                     item_index,
                     extracted_uinode.image,
                     start..ui_meta.indices.len() as u32,
-                    prepared.0[&render_views
-                        .get(extracted_uinode.extracted_camera_entity)
-                        .expect("queued UI camera exists")
-                        .0]
-                        .full,
-                );
-                if let Some(interior) = interior_draw {
-                    interior_pipelines.push(interior.pipeline);
-                    commands.entity(item_entity).insert(interior);
-                    first = None;
-                }
-                if encoded {
-                    first = None;
-                }
-            }
-            if let Some((view, target, settings)) = retained_views
-                .iter()
-                .find(|(v, _, _)| &v.retained_view_entity == retained_view_entity)
-                && let Ok((target, camera)) = targets.get(target.0)
-                && camera.viewport.is_none()
-                && let Some(rect) = retained_layer::crop(
-                    bounds.as_deref(),
-                    view.viewport,
-                    bevy_math::UVec2::new(
-                        target.main_texture().width(),
-                        target.main_texture().height(),
-                    ),
-                )
-            {
-                cacheable &= ui_phase
-                    .items
-                    .values()
-                    .all(|item| pipeline_cache.get_render_pipeline(item.pipeline).is_some());
-                let contents = (settings.cache && cacheable).then(|| retained_layer::Contents {
-                    vertices: bytemuck::cast_slice(
-                        &ui_meta.vertices.values()[phase_vertex_start..],
-                    )
-                    .to_vec(),
-                    indices: ui_meta.indices.values()[phase_index_start..]
-                        .iter()
-                        .map(|index| *index - phase_vertex_start as u32)
-                        .collect(),
-                    pipelines: ui_phase
-                        .items
-                        .values()
-                        .map(|item| item.pipeline)
-                        .chain(interior_pipelines)
-                        .collect(),
-                    images: layer_images,
-                });
-                retained_layers.plans.insert(
-                    *retained_view_entity,
-                    retained_layer::Plan {
-                        rect,
-                        full_size: bevy_math::UVec2::new(view.viewport.z, view.viewport.w),
-                        contents,
-                    },
+                    choice.full,
                 );
             }
         }
 
         for (_, batch) in &batches {
-            if let Some(image) = gpu_images
-                .get(batch.image)
-                .filter(|image| encoded_images.contains(&batch.image) && has_encoded_view(image))
-            {
-                image_bind_groups
-                    .encoded
-                    .entry(batch.image)
-                    .or_insert_with(|| {
-                        let mut descriptor =
-                            image.texture_view_descriptor.clone().unwrap_or_default();
-                        descriptor.format = Some(image.texture_descriptor.format);
-                        let view = image.texture.create_view(&descriptor);
-                        let binding = render_device.create_bind_group(
-                            "ui_encoded_image",
-                            &pipeline_cache.get_bind_group_layout(&ui_pipeline.image_layout),
-                            &BindGroupEntries::sequential((&view, &image.sampler)),
-                        );
-                        (view, binding)
-                    });
-            }
             image_bind_groups
                 .values
                 .entry(batch.image)
@@ -2799,50 +2316,6 @@ mod tests {
             if change_image {
                 assert_eq!(items[1].pipeline, full);
             }
-        }
-    }
-
-    #[test]
-    fn image_interior_accepts_fractional_affine_images_but_not_degenerate_or_small_geometry() {
-        let mut images = Assets::<Image>::default();
-        let image = images.add(Image::default());
-        let mut node = ExtractedUiNode {
-            z_order: 0.,
-            image: image.id(),
-            clip: None,
-            extracted_camera_entity: Entity::PLACEHOLDER,
-            main_entity: Entity::PLACEHOLDER.into(),
-            render_entity: Entity::PLACEHOLDER,
-            transform: Affine2::IDENTITY,
-            item: ExtractedUiItem::Node {
-                color: LinearRgba::WHITE,
-                rect: Rect::from_corners(Vec2::ZERO, Vec2::splat(128.)),
-                atlas_scaling: None,
-                flip_x: false,
-                flip_y: false,
-                border_radius: ResolvedBorderRadius::ZERO,
-                border: BorderRect::ZERO,
-                node_type: NodeType::Rect,
-            },
-        };
-        for transform in [
-            Affine2::IDENTITY,
-            Affine2::from_translation(Vec2::splat(0.125)),
-            Affine2::from_angle(0.21),
-            Affine2::from_scale(Vec2::new(0.75, 2.)),
-        ] {
-            node.transform = transform;
-            let interior =
-                image_interior(&node).expect("large affine rectangle has a safe interior");
-            assert_eq!(interior, Rect::new(-63., -63., 63., 63.));
-        }
-        for transform in [
-            Affine2::from_scale(Vec2::splat(0.01)),
-            Affine2::from_scale(Vec2::ZERO),
-            Affine2::from_translation(Vec2::splat(f32::NAN)),
-        ] {
-            node.transform = transform;
-            assert!(image_interior(&node).is_none());
         }
     }
 

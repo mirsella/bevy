@@ -45,15 +45,6 @@ pub fn main_opaque_pass_2d(
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
-    let boundary = diagnostics.map(|recorder| {
-        recorder.time_span(
-            ctx.command_encoder(),
-            format!(
-                "core2d_boundary/camera_{}_{view_entity:?}/opaque",
-                camera.order
-            ),
-        )
-    });
 
     let color_attachments = [Some(target.get_color_attachment())];
     let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
@@ -89,8 +80,4 @@ pub fn main_opaque_pass_2d(
     }
 
     pass_span.end(&mut render_pass);
-    drop(render_pass);
-    if let Some(boundary) = boundary {
-        boundary.end(ctx.command_encoder());
-    }
 }

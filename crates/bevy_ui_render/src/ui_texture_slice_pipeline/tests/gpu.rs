@@ -20,7 +20,7 @@ const WIDTH: u32 = 128;
 const HEIGHT: u32 = 96;
 const ROW: u32 = WIDTH * 4;
 
-fn shader(source: &str, gamma: bool) -> naga::Module {
+fn shader(source: &str) -> naga::Module {
     let mut composer = Composer::default();
     for (source, file_path) in [
         (
@@ -44,37 +44,32 @@ fn shader(source: &str, gamma: bool) -> naga::Module {
         .make_naga_module(NagaModuleDescriptor {
             source,
             file_path: "slice",
-            shader_defs: gamma
-                .then_some(("MANUAL_SRGB".into(), ShaderDefValue::Bool(true)))
-                .into_iter()
-                .collect(),
+            shader_defs: [("MANUAL_SRGB".into(), ShaderDefValue::Bool(true))].into(),
             ..default()
         })
         .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)))
 }
 
 #[test]
-fn compact_slice_shader_validates_both_colour_spaces() {
-    for gamma in [false, true] {
-        let module = shader(include_str!("../../ui_texture_slice_cpu.wgsl"), gamma);
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
-        )
-        .validate(&module)
-        .unwrap();
-        assert_eq!(
-            module
-                .entry_points
-                .iter()
-                .find(|e| e.name == "fragment")
-                .unwrap()
-                .function
-                .arguments
-                .len(),
-            1
-        );
-    }
+fn compact_slice_shader_validates() {
+    let module = shader(include_str!("../../ui_texture_slice_cpu.wgsl"));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+    assert_eq!(
+        module
+            .entry_points
+            .iter()
+            .find(|e| e.name == "fragment")
+            .unwrap()
+            .function
+            .arguments
+            .len(),
+        1
+    );
 }
 
 struct Gpu {
@@ -164,7 +159,7 @@ impl Gpu {
         }
     }
 
-    fn pipeline(&self, cpu: bool, gamma: bool) -> wgpu::RenderPipeline {
+    fn pipeline(&self, cpu: bool) -> wgpu::RenderPipeline {
         let source = if cpu {
             include_str!("../../ui_texture_slice_cpu.wgsl")
         } else {
@@ -174,7 +169,7 @@ impl Gpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("slices"),
-                source: wgpu::ShaderSource::Naga(Cow::Owned(shader(source, gamma))),
+                source: wgpu::ShaderSource::Naga(Cow::Owned(shader(source))),
             });
         let full_attributes = wgpu::vertex_attr_array![0=>Float32x3, 1=>Float32x2, 2=>Float32x4, 3=>Float32x4, 4=>Float32x4, 5=>Float32x4, 6=>Float32x4];
         let cpu_attributes = wgpu::vertex_attr_array![0=>Float32x3, 1=>Float32x2, 2=>Float32x4];
@@ -205,11 +200,7 @@ impl Gpu {
                     entry_point: Some("fragment"),
                     compilation_options: default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: if gamma {
-                            wgpu::TextureFormat::Rgba8Unorm
-                        } else {
-                            wgpu::TextureFormat::Rgba8UnormSrgb
-                        },
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -227,8 +218,6 @@ impl Gpu {
         node: &ExtractedUiTextureSlice,
         pipeline: &wgpu::RenderPipeline,
         cpu: bool,
-        gamma: bool,
-        mips: bool,
     ) -> Vec<u8> {
         let buffer = |bytes: &[u8], usage| {
             self.device
@@ -252,51 +241,41 @@ impl Gpu {
             }],
         });
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("nonuniform sliced texture with authored mips"),
+            label: Some("nonuniform sliced texture"),
             size: wgpu::Extent3d {
                 width: 64,
                 height: 64,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: if mips { 7 } else { 1 },
+            mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for mip in 0..texture.mip_level_count() {
-            let side = 64 >> mip;
-            let pixels: Vec<u8> = (0..side)
-                .flat_map(|y| {
-                    (0..side).flat_map(move |x| {
-                        [
-                            (20 + (x * 113 + y * 37) % 215) as u8,
-                            (20 + (y * 97 + x * 17) % 215) as u8,
-                            (220 - mip * 28) as u8,
-                            (60 + (x * 31 + y * 23 + mip * 17) % 195) as u8,
-                        ]
-                    })
+        let pixels: Vec<u8> = (0..64)
+            .flat_map(|y| {
+                (0..64).flat_map(move |x| {
+                    [
+                        (20 + (x * 113 + y * 37) % 215) as u8,
+                        (20 + (y * 97 + x * 17) % 215) as u8,
+                        220,
+                        (60 + (x * 31 + y * 23) % 195) as u8,
+                    ]
                 })
-                .collect();
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    mip_level: mip,
-                    ..texture.as_image_copy()
-                },
-                &pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(side * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: side,
-                    height: side,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+            })
+            .collect();
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 4),
+                rows_per_image: None,
+            },
+            texture.size(),
+        );
         let texture_view = texture.create_view(&default());
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -386,11 +365,7 @@ impl Gpu {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: if gamma {
-                wgpu::TextureFormat::Rgba8Unorm
-            } else {
-                wgpu::TextureFormat::Rgba8UnormSrgb
-            },
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -458,158 +433,172 @@ impl Gpu {
     }
 }
 
+/// A node of the comparison matrix.
+struct Case {
+    node: ExtractedUiTextureSlice,
+    size: Vec2,
+    phase: f32,
+    rotated: bool,
+    atlas_flip_clip: bool,
+}
+
+fn cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for size in [
+        Vec2::new(90., 64.),
+        Vec2::new(36., 24.),
+        Vec2::new(12., 10.),
+    ] {
+        for phase in [0., 0.125, 0.5] {
+            for rotated in [false, true] {
+                for atlas_flip_clip in [false, true] {
+                    let mut node = node();
+                    node.rect.max = size;
+                    node.transform = Affine2::from_angle(if rotated { 0.23 } else { 0. });
+                    node.transform.translation = Vec2::new(64. + phase, 48. + phase);
+                    if atlas_flip_clip {
+                        node.atlas_rect = Some(Rect::new(8., 12., 56., 52.));
+                        node.flip_x = true;
+                        node.flip_y = true;
+                        node.clip = Some(CalculatedClip::Rects(
+                            [CalculatedClipRect {
+                                rect: Rect::new(-30., -20., 28., 18.),
+                                world_to_clip_local: Affine2::from_angle(-0.13)
+                                    * Affine2::from_translation(-Vec2::new(64., 48.)),
+                            }]
+                            .into_iter()
+                            .collect(),
+                        ));
+                    }
+                    cases.push(Case {
+                        node,
+                        size,
+                        phase,
+                        rotated,
+                        atlas_flip_clip,
+                    });
+                }
+            }
+        }
+    }
+    cases
+}
+
+#[test]
+fn comparison_matrix_reaches_minified_and_clipped_cpu_slices() {
+    let cases = cases();
+    let mut cpu_cases = 0;
+    let mut minified = 0;
+    let mut clipped = 0;
+    for case in &cases {
+        let texture_size = Vec2::splat(64.);
+        assert!(CpuSlices::eligible(&case.node, texture_size, 7).is_none());
+        let eligible = CpuSlices::eligible(&case.node, texture_size, 1).is_some();
+        assert!(!(eligible && case.rotated));
+        if eligible {
+            cpu_cases += 1;
+            minified += usize::from(case.size.x < 64.);
+            clipped += usize::from(case.atlas_flip_clip);
+        }
+    }
+    assert_eq!(cpu_cases, 9);
+    assert_eq!(cases.len() - cpu_cases, 27);
+    assert!(minified > 0 && clipped > 0);
+}
+
 #[expect(clippy::print_stderr, reason = "report measured image-error bounds")]
 fn compare(backends: wgpu::Backends) {
     let gpu = Gpu::new(backends);
-    let mut cpu_cases = 0;
-    let mut fallback_cases = 0;
-    let mut minified_cpu_cases = 0;
-    let mut clipped_cpu_cases = 0;
-    for gamma in [false, true] {
-        let full = gpu.pipeline(false, gamma);
-        let cpu = gpu.pipeline(true, gamma);
-        for mips in [false, true] {
-            let mut overall_max = 0;
-            let mut total_error = 0u64;
-            let mut samples = 0;
-            for size in [
-                Vec2::new(90., 64.),
-                Vec2::new(36., 24.),
-                Vec2::new(12., 10.),
-            ] {
-                for phase in [0., 0.125, 0.5] {
-                    for rotated in [false, true] {
-                        for atlas_flip_clip in [false, true] {
-                            let mut node = node();
-                            node.rect.max = size;
-                            node.transform = Affine2::from_angle(if rotated { 0.23 } else { 0. });
-                            node.transform.translation = Vec2::new(64. + phase, 48. + phase);
-                            if atlas_flip_clip {
-                                node.atlas_rect = Some(Rect::new(8., 12., 56., 52.));
-                                node.flip_x = true;
-                                node.flip_y = true;
-                                node.clip = Some(CalculatedClip::Rects(
-                                    [CalculatedClipRect {
-                                        rect: Rect::new(-30., -20., 28., 18.),
-                                        world_to_clip_local: Affine2::from_angle(-0.13)
-                                            * Affine2::from_translation(-Vec2::new(64., 48.)),
-                                    }]
-                                    .into_iter()
-                                    .collect(),
-                                ));
-                            }
-                            let a = gpu.render(&node, &full, false, gamma, mips);
-                            let eligible = CpuSlices::eligible(
-                                &node,
-                                Vec2::splat(64.),
-                                if mips { 7 } else { 1 },
-                            )
-                            .is_some();
-                            if eligible {
-                                cpu_cases += 1;
-                                minified_cpu_cases += usize::from(size.x < 64.);
-                                clipped_cpu_cases += usize::from(atlas_flip_clip);
-                            } else {
-                                fallback_cases += 1;
-                            }
-                            if mips || rotated {
-                                assert!(!eligible);
-                            }
-                            let b = gpu.render(
-                                &node,
-                                if eligible { &cpu } else { &full },
-                                eligible,
-                                gamma,
-                                mips,
-                            );
-                            let max = a
-                                .iter()
-                                .zip(&b)
-                                .map(|(&a, &b)| a.abs_diff(b))
-                                .max()
-                                .unwrap();
-                            overall_max = overall_max.max(max);
-                            assert!(max <= 1, "gamma={gamma} mips={mips} size={size} phase={phase} rotation={rotated} atlas={atlas_flip_clip}: max={max}");
-                            if !eligible {
-                                assert_eq!(a, b, "fallback must be the unchanged reference");
-                            }
-                            if phase == 0.125 && size == Vec2::new(90., 64.) {
-                                capture(backends, &format!("gamma-{gamma}_mips-{mips}_rotated-{rotated}_atlas-flip-clip-{atlas_flip_clip}"), &a, &b);
-                            }
-                            total_error += a
-                                .iter()
-                                .zip(&b)
-                                .map(|(&a, &b)| a.abs_diff(b) as u64)
-                                .sum::<u64>();
-                            samples += a.len();
-                            if max > 5 {
-                                eprintln!("gamma={gamma} mips={mips} size={size} phase={phase} rotation={rotated} atlas={atlas_flip_clip}: max={max}");
-                            }
-                        }
-                    }
-                }
-            }
-            eprintln!(
-                "gamma={gamma} mips={mips}: max={overall_max} mean={}",
-                total_error as f64 / samples as f64
+    let full = gpu.pipeline(false);
+    let cpu = gpu.pipeline(true);
+    let mut overall_max = 0;
+    let mut total_error = 0u64;
+    let mut samples = 0;
+    for Case {
+        node,
+        size,
+        phase,
+        atlas_flip_clip,
+        ..
+    } in cases()
+    {
+        // Ineligible nodes keep the reference pipeline: there is nothing to compare.
+        if CpuSlices::eligible(&node, Vec2::splat(64.), 1).is_none() {
+            continue;
+        }
+        let a = gpu.render(&node, &full, false);
+        let b = gpu.render(&node, &cpu, true);
+        let max = a
+            .iter()
+            .zip(&b)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        overall_max = overall_max.max(max);
+        assert!(
+            max <= 1,
+            "size={size} phase={phase} atlas={atlas_flip_clip}: max={max}"
+        );
+        if phase == 0.125 && size == Vec2::new(90., 64.) {
+            capture(
+                backends,
+                &format!("atlas-flip-clip-{atlas_flip_clip}"),
+                &a,
+                &b,
             );
         }
+        total_error += a
+            .iter()
+            .zip(&b)
+            .map(|(&a, &b)| a.abs_diff(b) as u64)
+            .sum::<u64>();
+        samples += a.len();
     }
-    eprintln!("actual CPU cases={cpu_cases}; reference fallback cases={fallback_cases}");
-    assert_eq!(cpu_cases, 18);
-    assert_eq!(fallback_cases, 126);
-    assert!(minified_cpu_cases > 0 && clipped_cpu_cases > 0);
+    assert!(samples > 0);
+    eprintln!(
+        "max={overall_max} mean={}",
+        total_error as f64 / samples as f64
+    );
 
     // Exercise the newly eligible empty-border axes against the actual reference
     // shader, including its zero-width UV branches and pixel-center seams.
     let mut zero_border_cpu_cases = 0;
-    for gamma in [false, true] {
-        let full = gpu.pipeline(false, gamma);
-        let cpu = gpu.pipeline(true, gamma);
-        for (min_inset, max_inset) in [
-            (Vec2::ZERO, Vec2::ZERO),
-            (Vec2::new(6., 0.), Vec2::new(10., 0.)),
-            (Vec2::new(0., 4.), Vec2::new(0., 8.)),
-        ] {
-            for size in [Vec2::new(90., 64.), Vec2::new(36., 24.)] {
-                for phase in [0., 0.125, 0.5] {
-                    for flipped_atlas in [false, true] {
-                        let mut node = node();
-                        node.rect.max = size;
-                        node.transform.translation += Vec2::splat(phase);
-                        let SpriteImageMode::Sliced(slicer) = &mut node.image_scale_mode else {
-                            unreachable!()
-                        };
-                        slicer.border = BorderRect {
-                            min_inset,
-                            max_inset,
-                        };
-                        if flipped_atlas {
-                            node.atlas_rect = Some(Rect::new(8., 12., 56., 52.));
-                            node.flip_x = true;
-                            node.flip_y = true;
-                        }
-                        let eligible = CpuSlices::eligible(&node, Vec2::splat(64.), 1).is_some();
-                        zero_border_cpu_cases += usize::from(eligible);
-                        let a = gpu.render(&node, &full, false, gamma, false);
-                        let b = gpu.render(
-                            &node,
-                            if eligible { &cpu } else { &full },
-                            eligible,
-                            gamma,
-                            false,
-                        );
-                        let max = a
-                            .iter()
-                            .zip(&b)
-                            .map(|(&a, &b)| a.abs_diff(b))
-                            .max()
-                            .unwrap();
-                        assert!(max <= 1, "empty-border gamma={gamma} size={size} phase={phase} flipped_atlas={flipped_atlas} border={min_inset}/{max_inset}: max={max}");
-                        if !eligible {
-                            assert_eq!(a, b, "fallback must be the unchanged reference");
-                        }
+    for (min_inset, max_inset) in [
+        (Vec2::ZERO, Vec2::ZERO),
+        (Vec2::new(6., 0.), Vec2::new(10., 0.)),
+        (Vec2::new(0., 4.), Vec2::new(0., 8.)),
+    ] {
+        for size in [Vec2::new(90., 64.), Vec2::new(36., 24.)] {
+            for phase in [0., 0.125, 0.5] {
+                for flipped_atlas in [false, true] {
+                    let mut node = node();
+                    node.rect.max = size;
+                    node.transform.translation += Vec2::splat(phase);
+                    let SpriteImageMode::Sliced(slicer) = &mut node.image_scale_mode else {
+                        unreachable!()
+                    };
+                    slicer.border = BorderRect {
+                        min_inset,
+                        max_inset,
+                    };
+                    if flipped_atlas {
+                        node.atlas_rect = Some(Rect::new(8., 12., 56., 52.));
+                        node.flip_x = true;
+                        node.flip_y = true;
                     }
+                    if CpuSlices::eligible(&node, Vec2::splat(64.), 1).is_none() {
+                        continue;
+                    }
+                    zero_border_cpu_cases += 1;
+                    let a = gpu.render(&node, &full, false);
+                    let b = gpu.render(&node, &cpu, true);
+                    let max = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(&a, &b)| a.abs_diff(b))
+                        .max()
+                        .unwrap();
+                    assert!(max <= 1, "empty-border size={size} phase={phase} flipped_atlas={flipped_atlas} border={min_inset}/{max_inset}: max={max}");
                 }
             }
         }
@@ -631,7 +620,7 @@ fn capture(backend: wgpu::Backends, name: &str, original: &[u8], actual: &[u8]) 
         .collect();
     for (suffix, pixels) in [
         ("original", original),
-        ("cpu-or-fallback", actual),
+        ("cpu", actual),
         ("difference-x32", &difference),
     ] {
         let mut ppm = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();

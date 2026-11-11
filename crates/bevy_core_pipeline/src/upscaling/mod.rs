@@ -11,21 +11,6 @@ mod node;
 
 pub use node::upscaling;
 
-/// Output blending shared by the reference blit and replacement output passes.
-pub fn view_output_blend(camera: Option<&ExtractedCamera>) -> Option<BlendState> {
-    let camera = camera?;
-    match camera.output_mode {
-        CameraOutputMode::Write {
-            blend_state: Some(blend),
-            ..
-        } => Some(blend),
-        CameraOutputMode::Write {
-            blend_state: None, ..
-        } if camera.sorted_camera_index_for_target > 0 => Some(BlendState::ALPHA_BLENDING),
-        _ => None,
-    }
-}
-
 pub struct UpscalingPlugin;
 
 impl Plugin for UpscalingPlugin {
@@ -73,7 +58,29 @@ fn prepare_view_upscaling_pipelines(
     )>,
 ) {
     for (entity, view_target, camera, maybe_pipeline) in view_targets.iter() {
-        let blend_state = view_output_blend(camera);
+        let blend_state = if let Some(extracted_camera) = camera {
+            match extracted_camera.output_mode {
+                CameraOutputMode::Skip => None,
+                CameraOutputMode::Write { blend_state, .. } => {
+                    match blend_state {
+                        None => {
+                            // Auto-detect: the first camera to render to this output
+                            // (sorted_camera_index_for_target == 0) uses replace mode;
+                            // subsequent cameras default to alpha blending so they don't
+                            // accidentally overwrite earlier cameras' output.
+                            if extracted_camera.sorted_camera_index_for_target > 0 {
+                                Some(BlendState::ALPHA_BLENDING)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => blend_state,
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         let Some(target_format) = view_target.out_texture_view_format() else {
             continue;
