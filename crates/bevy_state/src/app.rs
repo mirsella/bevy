@@ -1,5 +1,9 @@
 use bevy_app::{App, MainScheduleOrder, Plugin, PreStartup, PreUpdate, SubApp};
-use bevy_ecs::{message::Messages, schedule::IntoScheduleConfigs, world::FromWorld};
+use bevy_ecs::{
+    message::Messages,
+    schedule::{common_conditions::on_message, IntoScheduleConfigs},
+    world::FromWorld,
+};
 use bevy_utils::once;
 use log::warn;
 
@@ -250,6 +254,9 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
         warn!("State scoped entities are enabled for state `{name}`, but the state wasn't initialized in the app!");
     }
 
+    // These systems do nothing without a transition, so a shared condition per
+    // group skips them on most frames instead of running each one.
+    //
     // Note: We work with `StateTransition` in set
     // `StateTransitionSystems::ExitSchedules` rather than `OnExit`, because
     // `OnExit` only runs for one specific variant of the state.
@@ -260,6 +267,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_on_exit_state::<S>,
             enable_entities_on_exit_state::<S>,
         )
+            .run_if(on_message::<StateTransitionEvent<S>>)
             .in_set(StateTransitionSystems::ExitSchedules),
     )
     // Note: We work with `StateTransition` in set
@@ -272,6 +280,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_on_enter_state::<S>,
             enable_entities_on_enter_state::<S>,
         )
+            .run_if(on_message::<StateTransitionEvent<S>>)
             .in_set(StateTransitionSystems::EnterSchedules),
     )
     .add_systems(
@@ -281,6 +290,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_when_state::<S>,
             enable_entities_when_state::<S>,
         )
+            .run_if(on_message::<StateTransitionEvent<S>>)
             .in_set(StateTransitionSystems::TransitionSchedules),
     );
 }
