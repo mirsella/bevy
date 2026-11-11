@@ -4,7 +4,11 @@ use crate::render_resource::{
     RenderPipeline, Sampler, Texture,
 };
 use crate::renderer::wgpu_wrapper;
-use bevy_ecs::resource::Resource;
+use bevy_ecs::{resource::Resource, system::Res};
+use bevy_platform::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 use wgpu::{
     util::DeviceExt, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BufferAsyncError, BufferBindingType, PollError, PollStatus,
@@ -19,6 +23,79 @@ wgpu_wrapper! {
 #[derive(Resource, Clone)]
 pub struct RenderDevice {
     device: WgpuDevice,
+    bind_groups: Arc<Mutex<BindGroupCache>>,
+}
+
+/// Bind groups already created this or last frame, keyed by layout and resources.
+///
+/// Many render systems recreate identical bind groups every frame. Bind groups are
+/// immutable, so an equal request can reuse the earlier one, which avoids a costly
+/// `createBindGroup` call on WebGPU and gives draw state tracking a stable id.
+#[derive(Default)]
+struct BindGroupCache(HashMap<BindGroupKey, (BindGroup, bool)>);
+
+/// Keys own clones of the wgpu resources, so their unique ids cannot be reused while cached.
+#[derive(PartialEq, Eq, Hash)]
+struct BindGroupKey {
+    layout: wgpu::BindGroupLayout,
+    entries: Vec<(u32, CachedResource)>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum CachedResource {
+    Buffer(CachedBuffer),
+    BufferArray(Vec<CachedBuffer>),
+    Sampler(wgpu::Sampler),
+    SamplerArray(Vec<wgpu::Sampler>),
+    TextureView(wgpu::TextureView),
+    TextureViewArray(Vec<wgpu::TextureView>),
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct CachedBuffer(wgpu::Buffer, wgpu::BufferAddress, Option<wgpu::BufferSize>);
+
+impl CachedBuffer {
+    fn new(binding: &wgpu::BufferBinding) -> Self {
+        Self(binding.buffer.clone(), binding.offset, binding.size)
+    }
+}
+
+impl BindGroupKey {
+    /// Returns `None` for resources the cache does not track; those bind groups are always created.
+    fn new(layout: &wgpu::BindGroupLayout, entries: &[BindGroupEntry]) -> Option<Self> {
+        use wgpu::BindingResource as R;
+        let entries = entries
+            .iter()
+            .map(|entry| {
+                let resource = match &entry.resource {
+                    R::Buffer(binding) => CachedResource::Buffer(CachedBuffer::new(binding)),
+                    R::BufferArray(bindings) => {
+                        CachedResource::BufferArray(bindings.iter().map(CachedBuffer::new).collect())
+                    }
+                    R::Sampler(sampler) => CachedResource::Sampler((*sampler).clone()),
+                    R::SamplerArray(samplers) => CachedResource::SamplerArray(
+                        samplers.iter().map(|sampler| (*sampler).clone()).collect(),
+                    ),
+                    R::TextureView(view) => CachedResource::TextureView((*view).clone()),
+                    R::TextureViewArray(views) => CachedResource::TextureViewArray(
+                        views.iter().map(|view| (*view).clone()).collect(),
+                    ),
+                    _ => return None,
+                };
+                Some((entry.binding, resource))
+            })
+            .collect::<Option<_>>()?;
+        Some(Self {
+            layout: layout.clone(),
+            entries,
+        })
+    }
+}
+
+/// Drops cached bind groups that were not requested since the previous sweep.
+pub fn sweep_bind_group_cache(render_device: Res<RenderDevice>) {
+    let mut cache = render_device.bind_group_cache();
+    cache.0.retain(|_, (_, used)| core::mem::take(used));
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -31,7 +108,14 @@ impl RenderDevice {
     pub fn new(device: wgpu::Device) -> Self {
         Self {
             device: WgpuDevice::new(device),
+            bind_groups: Arc::default(),
         }
+    }
+
+    fn bind_group_cache(&self) -> MutexGuard<'_, BindGroupCache> {
+        self.bind_groups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// List all [`Features`](wgpu::Features) that may be used with this device.
@@ -157,12 +241,24 @@ impl RenderDevice {
         layout: &'a BindGroupLayout,
         entries: &'a [BindGroupEntry<'a>],
     ) -> BindGroup {
-        let wgpu_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+        let key = BindGroupKey::new(layout, entries);
+        if let Some(key) = &key
+            && let Some((bind_group, used)) = self.bind_group_cache().0.get_mut(key)
+        {
+            *used = true;
+            return bind_group.clone();
+        }
+        let bind_group = BindGroup::from(self.device.create_bind_group(&BindGroupDescriptor {
             label: label.into(),
             layout,
             entries,
-        });
-        BindGroup::from(wgpu_bind_group)
+        }));
+        if let Some(key) = key {
+            self.bind_group_cache()
+                .0
+                .insert(key, (bind_group.clone(), true));
+        }
+        bind_group
     }
 
     /// Creates a [`BindGroupLayout`](wgpu::BindGroupLayout).

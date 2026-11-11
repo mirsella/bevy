@@ -430,7 +430,11 @@ impl Plugin for RenderPlugin {
                     (PipelineCache::process_pipeline_queue_system, render_system)
                         .chain()
                         .in_set(RenderSystems::Render),
-                    reset_render_asset_bytes_per_frame.in_set(RenderSystems::Cleanup),
+                    (
+                        reset_render_asset_bytes_per_frame,
+                        renderer::sweep_bind_group_cache,
+                    )
+                        .in_set(RenderSystems::Cleanup),
                 ),
             );
         }
