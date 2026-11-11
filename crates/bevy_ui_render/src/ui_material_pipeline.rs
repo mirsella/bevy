@@ -417,6 +417,11 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     mut previous_len: Local<usize>,
 ) {
+    // Most material types have no visible nodes on a given frame. Skip the bind
+    // group and the scan over every UI phase item, since nothing would be drawn.
+    if extracted_uinodes.uinodes.is_empty() {
+        return;
+    }
     if let (Some(view_binding), Some(globals_binding)) = (
         view_uniforms.uniforms.binding(),
         globals_buffer.buffer.binding(),
