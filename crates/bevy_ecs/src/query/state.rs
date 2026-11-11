@@ -560,12 +560,12 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         self.validate_world(world.id());
         D::update_archetypes(&mut self.fetch_state, world);
         F::update_archetypes(&mut self.filter_state, world);
+        let archetypes = world.archetypes();
+        let old_generation =
+            core::mem::replace(&mut self.archetype_generation, archetypes.generation());
+        let new_archetypes = &archetypes[old_generation..];
         if self.component_access.required.is_clear() {
-            let archetypes = world.archetypes();
-            let old_generation =
-                core::mem::replace(&mut self.archetype_generation, archetypes.generation());
-
-            for archetype in &archetypes[old_generation..] {
+            for archetype in new_archetypes {
                 // SAFETY: The validate_world call ensures that the world is the same the QueryState
                 // was initialized from.
                 unsafe {
@@ -574,7 +574,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             }
         } else {
             // skip if we are already up to date
-            if self.archetype_generation == world.archetypes().generation() {
+            if new_archetypes.is_empty() {
                 return;
             }
             // if there are required components, we can optimize by only iterating through archetypes
@@ -584,30 +584,41 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                 .required
                 .iter()
                 .filter_map(|component_id| {
-                    world
-                        .archetypes()
+                    archetypes
                         .component_index()
                         .get(&component_id)
                         .map(|index| index.keys())
                 })
                 // select the component with the fewest archetypes
                 .min_by_key(ExactSizeIterator::len);
-            if let Some(archetypes) = potential_archetypes {
-                for archetype_id in archetypes {
-                    // exclude archetypes that have already been processed
-                    if archetype_id < &self.archetype_generation.0 {
-                        continue;
-                    }
-                    // SAFETY: get_potential_archetypes only returns archetype ids that are valid for the world
-                    let archetype = &world.archetypes()[*archetype_id];
+            let Some(potential) = potential_archetypes else {
+                return;
+            };
+            // A few new archetypes are cheaper to check directly than rescanning every
+            // archetype of a common component each time the world gains one.
+            if potential.len() > new_archetypes.len() {
+                for archetype in new_archetypes {
                     // SAFETY: The validate_world call ensures that the world is the same the QueryState
                     // was initialized from.
                     unsafe {
                         self.new_archetype(archetype);
                     }
                 }
+                return;
             }
-            self.archetype_generation = world.archetypes().generation();
+            for archetype_id in potential {
+                // exclude archetypes that have already been processed
+                if archetype_id < &old_generation.0 {
+                    continue;
+                }
+                // SAFETY: get_potential_archetypes only returns archetype ids that are valid for the world
+                let archetype = &archetypes[*archetype_id];
+                // SAFETY: The validate_world call ensures that the world is the same the QueryState
+                // was initialized from.
+                unsafe {
+                    self.new_archetype(archetype);
+                }
+            }
         }
     }
 
