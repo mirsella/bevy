@@ -1,17 +1,17 @@
 use bevy_ecs::{
-    message::{MessageReader, MessageWriter},
-    schedule::{IntoScheduleConfigs, Schedule},
-    system::{Commands, IntoSystem, Res, ResMut},
+    message::{MessageReader, MessageWriter, Messages},
+    schedule::{IntoScheduleConfigs, Schedule, SystemCondition},
+    system::{Commands, Res, ResMut},
 };
 use variadics_please::all_tuples;
 
 use self::sealed::StateSetSealed;
 
 use super::{
-    computed_states::ComputedStates, internal_apply_state_transition, last_transition, run_enter,
-    run_exit, run_transition, sub_states::SubStates, take_next_state, ApplyStateTransition,
-    EnterSchedules, ExitSchedules, NextState, PreviousState, State, StateTransitionEvent,
-    StateTransitionSystems, States, TransitionSchedules,
+    add_transition_schedule_runners, computed_states::ComputedStates,
+    internal_apply_state_transition, requested, sub_states::SubStates, take_next_state,
+    transitioned, ApplyStateTransition, EnterSchedules, ExitSchedules, NextState, PreviousState,
+    State, StateTransitionEvent, StateTransitionSystems, States, TransitionSchedules,
 };
 
 mod sealed {
@@ -136,23 +136,13 @@ impl<S: InnerStateSet> StateSet for S {
                 .after(EnterSchedules::<S::RawState>::default()),
         ));
 
-        schedule
-            .add_systems(apply_state_transition.in_set(ApplyStateTransition::<T>::default()))
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_exit::<T>)
-                    .in_set(ExitSchedules::<T>::default()),
-            )
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_transition::<T>)
-                    .in_set(TransitionSchedules::<T>::default()),
-            )
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_enter::<T>)
-                    .in_set(EnterSchedules::<T>::default()),
-            );
+        schedule.add_systems(
+            apply_state_transition
+                .run_if(transitioned::<S::RawState>)
+                .in_set(ApplyStateTransition::<T>::default()),
+        );
+
+        add_transition_schedule_runners::<T>(schedule);
     }
 
     fn register_sub_state_systems_in_schedule<T: SubStates<SourceStates = Self>>(
@@ -235,23 +225,13 @@ impl<S: InnerStateSet> StateSet for S {
                 .after(EnterSchedules::<S::RawState>::default()),
         ));
 
-        schedule
-            .add_systems(apply_state_transition.in_set(ApplyStateTransition::<T>::default()))
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_exit::<T>)
-                    .in_set(ExitSchedules::<T>::default()),
-            )
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_transition::<T>)
-                    .in_set(TransitionSchedules::<T>::default()),
-            )
-            .add_systems(
-                last_transition::<T>
-                    .pipe(run_enter::<T>)
-                    .in_set(EnterSchedules::<T>::default()),
-            );
+        schedule.add_systems(
+            apply_state_transition
+                .run_if(transitioned::<S::RawState>.or_else(requested::<T>))
+                .in_set(ApplyStateTransition::<T>::default()),
+        );
+
+        add_transition_schedule_runners::<T>(schedule);
     }
 }
 
@@ -269,6 +249,10 @@ macro_rules! impl_state_set_sealed_tuples {
             fn register_computed_state_systems_in_schedule<T: ComputedStates<SourceStates = Self>>(
                 schedule: &mut Schedule,
             ) {
+                let sources_transitioned =
+                    |($($evt),*,): ($(Option<Res<Messages<StateTransitionEvent<$param::RawState>>>>),*,)| {
+                        $($evt.is_some_and(|transitions| !transitions.is_empty()))||*
+                    };
                 let apply_state_transition =
                     |($(mut $evt),*,): ($(MessageReader<StateTransitionEvent<$param::RawState>>),*,),
                      message: MessageWriter<StateTransitionEvent<T>>,
@@ -304,16 +288,26 @@ macro_rules! impl_state_set_sealed_tuples {
                         $(.after(EnterSchedules::<$param::RawState>::default()))*,
                 ));
 
-                schedule
-                    .add_systems(apply_state_transition.in_set(ApplyStateTransition::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_exit::<T>).in_set(ExitSchedules::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_transition::<T>).in_set(TransitionSchedules::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_enter::<T>).in_set(EnterSchedules::<T>::default()));
+                schedule.add_systems(
+
+                    apply_state_transition
+
+                        .run_if(sources_transitioned)
+
+                        .in_set(ApplyStateTransition::<T>::default()),
+
+                );
+
+                add_transition_schedule_runners::<T>(schedule);
             }
 
             fn register_sub_state_systems_in_schedule<T: SubStates<SourceStates = Self>>(
                 schedule: &mut Schedule,
             ) {
+                let sources_transitioned =
+                    |($($evt),*,): ($(Option<Res<Messages<StateTransitionEvent<$param::RawState>>>>),*,)| {
+                        $($evt.is_some_and(|transitions| !transitions.is_empty()))||*
+                    };
                 let apply_state_transition =
                     |($(mut $evt),*,): ($(MessageReader<StateTransitionEvent<$param::RawState>>),*,),
                      message: MessageWriter<StateTransitionEvent<T>>,
@@ -371,11 +365,17 @@ macro_rules! impl_state_set_sealed_tuples {
                         $(.after(EnterSchedules::<$param::RawState>::default()))*,
                 ));
 
-                schedule
-                    .add_systems(apply_state_transition.in_set(ApplyStateTransition::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_exit::<T>).in_set(ExitSchedules::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_transition::<T>).in_set(TransitionSchedules::<T>::default()))
-                    .add_systems(last_transition::<T>.pipe(run_enter::<T>).in_set(EnterSchedules::<T>::default()));
+                schedule.add_systems(
+
+                    apply_state_transition
+
+                        .run_if(sources_transitioned.or_else(requested::<T>))
+
+                        .in_set(ApplyStateTransition::<T>::default()),
+
+                );
+
+                add_transition_schedule_runners::<T>(schedule);
             }
         }
     };

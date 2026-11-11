@@ -1,14 +1,15 @@
 use core::{marker::PhantomData, mem};
 
 use bevy_ecs::{
-    message::{Message, MessageReader, MessageWriter},
+    message::{Message, MessageReader, MessageWriter, Messages},
     schedule::{IntoScheduleConfigs, Schedule, ScheduleLabel, Schedules, SystemSet},
-    system::{Commands, In, ResMut},
+    system::{Commands, In, IntoSystem, Res, ResMut},
     world::World,
 };
 
 use super::{
-    resources::{PreviousState, State},
+    freely_mutable_state::FreelyMutableState,
+    resources::{NextState, PreviousState, State},
     states::States,
 };
 
@@ -128,6 +129,43 @@ impl<S: States> Default for ApplyStateTransition<S> {
     fn default() -> Self {
         Self(Default::default())
     }
+}
+
+/// Adds the systems that run the exit, transition and enter schedules of `S`.
+///
+/// Each one is skipped on the frames without a transition, which is nearly
+/// every frame. They check separately, at the point where they would run, so
+/// a transition written earlier in the same schedule run is never missed.
+pub(crate) fn add_transition_schedule_runners<S: States>(schedule: &mut Schedule) {
+    schedule.add_systems((
+        last_transition::<S>
+            .pipe(run_exit::<S>)
+            .run_if(transitioned::<S>)
+            .in_set(ExitSchedules::<S>::default()),
+        last_transition::<S>
+            .pipe(run_transition::<S>)
+            .run_if(transitioned::<S>)
+            .in_set(TransitionSchedules::<S>::default()),
+        last_transition::<S>
+            .pipe(run_enter::<S>)
+            .run_if(transitioned::<S>)
+            .in_set(EnterSchedules::<S>::default()),
+    ));
+}
+
+/// Whether a transition of `S` is recent enough to still be observable.
+///
+/// Messages outlive the frame that wrote them, so this also holds for
+/// transitions written outside the [`StateTransition`] schedule.
+pub(crate) fn transitioned<S: States>(
+    transitions: Option<Res<Messages<StateTransitionEvent<S>>>>,
+) -> bool {
+    transitions.is_some_and(|transitions| !transitions.is_empty())
+}
+
+/// Whether a transition of `S` was requested through [`NextState`].
+pub(crate) fn requested<S: FreelyMutableState>(next_state: Option<Res<NextState<S>>>) -> bool {
+    next_state.is_some_and(|next_state| !matches!(*next_state, NextState::Unchanged))
 }
 
 /// This function actually applies a state change, and registers the required

@@ -1,17 +1,13 @@
 use bevy_app::{App, MainScheduleOrder, Plugin, PreStartup, PreUpdate, SubApp};
-use bevy_ecs::{
-    message::Messages,
-    schedule::{common_conditions::on_message, IntoScheduleConfigs},
-    world::FromWorld,
-};
+use bevy_ecs::{message::Messages, schedule::IntoScheduleConfigs, world::FromWorld};
 use bevy_utils::once;
 use log::warn;
 
 use crate::{
     state::{
-        setup_state_transitions_in_world, ComputedStates, FreelyMutableState, NextState,
-        PreviousState, State, StateTransition, StateTransitionEvent, StateTransitionSystems,
-        States, SubStates,
+        setup_state_transitions_in_world, transitioned, ComputedStates, FreelyMutableState,
+        NextState, PreviousState, State, StateTransition, StateTransitionEvent,
+        StateTransitionSystems, States, SubStates,
     },
     state_scoped::{
         despawn_entities_on_enter_state, despawn_entities_on_exit_state,
@@ -254,8 +250,9 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
         warn!("State scoped entities are enabled for state `{name}`, but the state wasn't initialized in the app!");
     }
 
-    // These systems do nothing without a transition, so a shared condition per
-    // group skips them on most frames instead of running each one.
+    // These systems do nothing without a transition, so each one is skipped
+    // on the other frames. They check separately so that a transition written
+    // between two of them is never missed.
     //
     // Note: We work with `StateTransition` in set
     // `StateTransitionSystems::ExitSchedules` rather than `OnExit`, because
@@ -267,7 +264,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_on_exit_state::<S>,
             enable_entities_on_exit_state::<S>,
         )
-            .run_if(on_message::<StateTransitionEvent<S>>)
+            .distributive_run_if(transitioned::<S>)
             .in_set(StateTransitionSystems::ExitSchedules),
     )
     // Note: We work with `StateTransition` in set
@@ -280,7 +277,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_on_enter_state::<S>,
             enable_entities_on_enter_state::<S>,
         )
-            .run_if(on_message::<StateTransitionEvent<S>>)
+            .distributive_run_if(transitioned::<S>)
             .in_set(StateTransitionSystems::EnterSchedules),
     )
     .add_systems(
@@ -290,7 +287,7 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
             disable_entities_when_state::<S>,
             enable_entities_when_state::<S>,
         )
-            .run_if(on_message::<StateTransitionEvent<S>>)
+            .distributive_run_if(transitioned::<S>)
             .in_set(StateTransitionSystems::TransitionSchedules),
     );
 }
@@ -352,10 +349,16 @@ impl Plugin for StatesPlugin {
 mod tests {
     use crate::{
         app::StatesPlugin,
-        state::{State, StateTransition, StateTransitionEvent},
+        state::{EnterSchedules, OnEnter, State, StateTransition, StateTransitionEvent},
+        state_scoped::despawn_entities_on_enter_state,
     };
     use bevy_app::App;
-    use bevy_ecs::message::Messages;
+    use bevy_ecs::{
+        message::{MessageWriter, Messages},
+        resource::Resource,
+        schedule::IntoScheduleConfigs,
+        system::ResMut,
+    };
     use bevy_state_macros::States;
 
     use super::AppExtStates;
@@ -406,5 +409,41 @@ mod tests {
         let last = reader.read(events).last().unwrap();
         assert_eq!(last.exited, None);
         assert_eq!(last.entered, Some(TestState::C));
+    }
+
+    #[test]
+    fn transition_written_after_scoped_cleanup_still_enters() {
+        #[derive(Resource, Default)]
+        struct Entered(bool);
+
+        let mut app = App::new();
+        app.add_plugins(StatesPlugin)
+            .init_state::<TestState>()
+            .init_resource::<Entered>()
+            .add_systems(OnEnter(TestState::B), |mut entered: ResMut<Entered>| {
+                entered.0 = true;
+            });
+        let world = app.world_mut();
+        world.run_schedule(StateTransition);
+        world
+            .resource_mut::<Messages<StateTransitionEvent<TestState>>>()
+            .clear();
+
+        world.schedule_scope(StateTransition, |_, schedule| {
+            schedule.add_systems(
+                (|mut writer: MessageWriter<StateTransitionEvent<TestState>>| {
+                    writer.write(StateTransitionEvent {
+                        exited: Some(TestState::A),
+                        entered: Some(TestState::B),
+                        allow_same_state_transitions: true,
+                    });
+                })
+                .after(despawn_entities_on_enter_state::<TestState>)
+                .before(EnterSchedules::<TestState>::default()),
+            );
+        });
+        world.run_schedule(StateTransition);
+
+        assert!(world.resource::<Entered>().0);
     }
 }

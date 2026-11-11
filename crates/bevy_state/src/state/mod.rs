@@ -974,4 +974,35 @@ mod tests {
         assert_eq!(transitions[7], "sub enter");
         assert_eq!(transitions[8], "computed enter");
     }
+
+    #[test]
+    fn transition_written_between_phases_runs_the_later_schedules() {
+        let mut world = World::new();
+        setup_state_transitions_in_world(&mut world);
+        MessageRegistry::register_message::<StateTransitionEvent<SimpleState>>(&mut world);
+        world.init_resource::<State<SimpleState>>();
+        world.init_resource::<TransitionTracker>();
+        let mut schedules = world.remove_resource::<Schedules>().unwrap();
+        let transitions = schedules.get_mut(StateTransition).unwrap();
+        SimpleState::register_state(transitions);
+        transitions.add_systems(
+            (|mut writer: MessageWriter<StateTransitionEvent<SimpleState>>| {
+                writer.write(StateTransitionEvent {
+                    exited: Some(SimpleState::A),
+                    entered: Some(SimpleState::B(true)),
+                    allow_same_state_transitions: true,
+                });
+            })
+            .in_set(StateTransitionSystems::TransitionSchedules),
+        );
+        schedules.add_systems(
+            OnEnter(SimpleState::B(true)),
+            |mut tracker: ResMut<TransitionTracker>| tracker.0.push("entered"),
+        );
+        world.insert_resource(schedules);
+
+        world.run_schedule(StateTransition);
+
+        assert_eq!(world.resource::<TransitionTracker>().0, ["entered"]);
+    }
 }

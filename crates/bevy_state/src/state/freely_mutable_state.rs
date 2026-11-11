@@ -2,7 +2,7 @@ use bevy_ecs::{
     message::MessageWriter,
     prelude::Schedule,
     schedule::IntoScheduleConfigs,
-    system::{Commands, IntoSystem, ResMut},
+    system::{Commands, ResMut},
 };
 
 use super::{states::States, take_next_state, transitions::*, NextState, PreviousState, State};
@@ -24,25 +24,12 @@ pub trait FreelyMutableState: States {
             EnterSchedules::<Self>::default().in_set(StateTransitionSystems::EnterSchedules),
         ));
 
-        schedule
-            .add_systems(
-                apply_state_transition::<Self>.in_set(ApplyStateTransition::<Self>::default()),
-            )
-            .add_systems(
-                last_transition::<Self>
-                    .pipe(run_exit::<Self>)
-                    .in_set(ExitSchedules::<Self>::default()),
-            )
-            .add_systems(
-                last_transition::<Self>
-                    .pipe(run_transition::<Self>)
-                    .in_set(TransitionSchedules::<Self>::default()),
-            )
-            .add_systems(
-                last_transition::<Self>
-                    .pipe(run_enter::<Self>)
-                    .in_set(EnterSchedules::<Self>::default()),
-            );
+        schedule.add_systems(
+            apply_state_transition::<Self>
+                .run_if(requested::<Self>)
+                .in_set(ApplyStateTransition::<Self>::default()),
+        );
+        add_transition_schedule_runners::<Self>(schedule);
     }
 }
 
