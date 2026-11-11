@@ -1,4 +1,5 @@
-use core::panic::AssertUnwindSafe;
+use alloc::vec::Vec;
+use core::{ops::Range, panic::AssertUnwindSafe};
 use fixedbitset::FixedBitSet;
 
 #[cfg(feature = "trace")]
@@ -35,6 +36,45 @@ pub struct SingleThreadedExecutor {
     unapplied_systems: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
+    /// What `init` learned about the systems. The run loop visits every system of the schedule
+    /// every time, so it reads these dense tables instead of calling into each system's own cold
+    /// memory just to ask what kind of system it is.
+    plan: Plan,
+}
+
+#[derive(Default)]
+struct Plan {
+    /// Systems that are [`ApplyDeferred`](super::ApplyDeferred) sync points.
+    sync_points: FixedBitSet,
+    /// Systems with deferred buffers. The others have nothing to apply.
+    deferred_systems: FixedBitSet,
+    /// The conditional sets of every system, back to back.
+    sets: Vec<usize>,
+    /// Where each system's sets are in `sets`.
+    sets_of_systems: Vec<Range<usize>>,
+}
+
+impl Plan {
+    fn new(schedule: &SystemSchedule) -> Self {
+        let system_count = schedule.systems.len();
+        let mut plan = Self {
+            sync_points: FixedBitSet::with_capacity(system_count),
+            deferred_systems: FixedBitSet::with_capacity(system_count),
+            sets: Vec::new(),
+            sets_of_systems: Vec::with_capacity(system_count),
+        };
+        for (index, system) in schedule.systems.iter().enumerate() {
+            plan.sync_points
+                .set(index, is_apply_deferred(&*system.system));
+            plan.deferred_systems
+                .set(index, system.system.has_deferred());
+            let start = plan.sets.len();
+            plan.sets
+                .extend(schedule.sets_with_conditions_of_systems[index].ones());
+            plan.sets_of_systems.push(start..plan.sets.len());
+        }
+        plan
+    }
 }
 
 impl SystemExecutor for SingleThreadedExecutor {
@@ -45,6 +85,7 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.evaluated_sets = FixedBitSet::with_capacity(set_count);
         self.completed_systems = FixedBitSet::with_capacity(sys_count);
         self.unapplied_systems = FixedBitSet::with_capacity(sys_count);
+        self.plan = Plan::new(schedule);
     }
 
     fn run(
@@ -77,7 +118,7 @@ impl SystemExecutor for SingleThreadedExecutor {
             let should_run_span = info_span!("check_conditions", name = name.to_string()).entered();
 
             let mut should_run = !self.completed_systems.contains(system_index);
-            for set_idx in schedule.sets_with_conditions_of_systems[system_index].ones() {
+            for &set_idx in &self.plan.sets[self.plan.sets_of_systems[system_index].clone()] {
                 if self.evaluated_sets.contains(set_idx) {
                     continue;
                 }
@@ -126,7 +167,7 @@ impl SystemExecutor for SingleThreadedExecutor {
                 continue;
             }
 
-            if is_apply_deferred(&**system) {
+            if self.plan.sync_points.contains(system_index) {
                 self.apply_deferred(schedule, world);
                 continue;
             }
@@ -159,7 +200,9 @@ impl SystemExecutor for SingleThreadedExecutor {
                 (f)();
             }
 
-            self.unapplied_systems.insert(system_index);
+            if self.plan.deferred_systems.contains(system_index) {
+                self.unapplied_systems.insert(system_index);
+            }
         }
 
         if self.apply_final_deferred {
@@ -184,6 +227,12 @@ impl SingleThreadedExecutor {
             completed_systems: FixedBitSet::new(),
             unapplied_systems: FixedBitSet::new(),
             apply_final_deferred: true,
+            plan: Plan {
+                sync_points: FixedBitSet::new(),
+                deferred_systems: FixedBitSet::new(),
+                sets: Vec::new(),
+                sets_of_systems: Vec::new(),
+            },
         }
     }
 
