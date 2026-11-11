@@ -88,6 +88,20 @@ pub trait Decodable: Send + Sync + 'static {
 
     /// Build and return a [`Self::Decoder`] of the implementing type
     fn decoder(&self) -> Self::Decoder;
+
+    /// Build a decoder that repeats the whole clip forever.
+    ///
+    /// The default keeps every decoded sample of the first pass in memory.
+    /// Override it when the decoder can restart from its encoded data instead.
+    fn looped_decoder(&self) -> impl rodio::Source + Send + use<Self> {
+        rodio::Source::repeat_infinite(self.decoder())
+    }
+
+    /// The encoded file, if any. On the web, the browser decodes and plays it instead of
+    /// [`Self::decoder`].
+    fn encoded(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl Decodable for AudioSource {
@@ -99,6 +113,20 @@ impl Decodable for AudioSource {
             .with_data(Cursor::new(self.clone()))
             .build()
             .unwrap()
+    }
+
+    fn looped_decoder(&self) -> impl rodio::Source + Send + use<> {
+        // Restarting from the encoded bytes avoids buffering a decoded copy of
+        // the clip, which is large for music.
+        rodio::Decoder::builder()
+            .with_byte_len(self.bytes.len() as u64)
+            .with_data(Cursor::new(self.clone()))
+            .build_looped()
+            .unwrap()
+    }
+
+    fn encoded(&self) -> Option<&[u8]> {
+        Some(&self.bytes)
     }
 }
 

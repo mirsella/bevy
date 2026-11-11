@@ -39,6 +39,30 @@ bevy_app = { path = "../bevy_app", version = "0.19.1", default-features = false,
 bevy_reflect = { path = "../bevy_reflect", version = "0.19.1", default-features = false, features = [
   "web",
 ] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "AudioBuffer",
+  "AudioBufferSourceNode",
+  "AudioContext",
+  "AudioContextState",
+  "AudioDestinationNode",
+  "AudioNode",
+  "AudioParam",
+  "AudioScheduledSourceNode",
+  "BaseAudioContext",
+  "Blob",
+  "Element",
+  "Event",
+  "EventTarget",
+  "GainNode",
+  "HtmlAudioElement",
+  "HtmlMediaElement",
+  "MediaElementAudioSourceNode",
+  "Url",
+  "Window",
+] }
 
 [features]
 aac = ["rodio/symphonia-aac"]

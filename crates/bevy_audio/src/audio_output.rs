@@ -14,22 +14,41 @@ use crate::{AudioSink, AudioSinkPlayback};
 /// Used internally to play audio on the current "audio device"
 #[derive(Resource)]
 pub(crate) struct AudioOutput {
-    stream: Option<MixerDeviceSink>,
+    /// `None` until opened. The web opens it for the first sound the browser cannot play, since
+    /// an open stream mixes on the main thread even while silent.
+    stream: Option<Option<MixerDeviceSink>>,
 }
 
 impl Default for AudioOutput {
     fn default() -> Self {
-        let stream = DeviceSinkBuilder::open_default_sink()
-            .inspect_err(|_err| {
-                warn!("No audio device found.");
-            })
-            .map(|mut s| {
-                s.log_on_drop(false);
-                s
-            })
-            .ok();
-        Self { stream }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::web::init();
+            Self { stream: None }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Self {
+            stream: Some(open_stream()),
+        }
     }
+}
+
+impl AudioOutput {
+    fn stream(&mut self) -> Option<&MixerDeviceSink> {
+        self.stream.get_or_insert_with(open_stream).as_ref()
+    }
+}
+
+fn open_stream() -> Option<MixerDeviceSink> {
+    DeviceSinkBuilder::open_default_sink()
+        .inspect_err(|_err| {
+            warn!("No audio device found.");
+        })
+        .map(|mut s| {
+            s.log_on_drop(false);
+            s
+        })
+        .ok()
 }
 
 /// Marker for internal use, to despawn entities when playback finishes.
@@ -82,7 +101,7 @@ impl<'w, 's> EarPositions<'w, 's> {
 /// This system detects such entities, checks if their source asset
 /// data is available, and creates/inserts the sink.
 pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
-    audio_output: Res<AudioOutput>,
+    mut audio_output: ResMut<AudioOutput>,
     audio_sources: Res<Assets<Source>>,
     global_volume: Res<GlobalVolume>,
     query_nonplaying: Query<
@@ -100,12 +119,6 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
 ) where
     f32: rodio::cpal::FromSample<rodio::Sample>,
 {
-    let Some(stream) = audio_output.stream.as_ref() else {
-        // audio output unavailable; cannot play sound
-        return;
-    };
-    let mixer = stream.mixer();
-
     for (entity, source_handle, settings, maybe_emitter_transform) in &query_nonplaying {
         let Some(audio_source) = audio_sources.get(&source_handle.0) else {
             continue;
@@ -132,8 +145,12 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
                 Vec3::ZERO.into()
             };
 
+            let Some(stream) = audio_output.stream() else {
+                // audio output unavailable; cannot play sound
+                continue;
+            };
             let sink = SpatialPlayer::connect_new(
-                mixer,
+                stream.mixer(),
                 emitter_translation,
                 (left_ear * scale).into(),
                 (right_ear * scale).into(),
@@ -162,7 +179,7 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
                     }
 
                     // full clip
-                    (None, None) => sink.append(decoder.repeat_infinite()),
+                    (None, None) => sink.append(audio_source.looped_decoder()),
                 },
                 PlaybackMode::Once | PlaybackMode::Despawn | PlaybackMode::Remove => {
                     match (settings.start_position, settings.duration) {
@@ -208,7 +225,16 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
                     .insert((sink, PlaybackRemoveMarker)),
             };
         } else {
-            let sink = Player::connect_new(mixer);
+            #[cfg(target_arch = "wasm32")]
+            if let Some(sink) = crate::web::sink(audio_source, &source_handle.0, settings) {
+                insert_sink(&mut commands, entity, sink, settings, &global_volume);
+                continue;
+            }
+            let Some(stream) = audio_output.stream() else {
+                // audio output unavailable; cannot play sound
+                continue;
+            };
+            let sink = Player::connect_new(stream.mixer());
             let decoder = audio_source.decoder();
 
             match settings.mode {
@@ -232,7 +258,7 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
                     }
 
                     // full clip
-                    (None, None) => sink.append(decoder.repeat_infinite()),
+                    (None, None) => sink.append(audio_source.looped_decoder()),
                 },
                 PlaybackMode::Once | PlaybackMode::Despawn | PlaybackMode::Remove => {
                     match (settings.start_position, settings.duration) {
@@ -253,32 +279,46 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
                 }
             }
 
-            let mut sink = AudioSink::new(sink);
-
-            if settings.muted {
-                sink.mute();
-            }
-
-            sink.set_speed(settings.speed);
-            sink.set_volume(settings.volume * global_volume.volume);
-
-            if settings.paused {
-                sink.pause();
-            }
-
-            match settings.mode {
-                PlaybackMode::Loop | PlaybackMode::Once => commands.entity(entity).insert(sink),
-                PlaybackMode::Despawn => commands
-                    .entity(entity)
-                    // PERF: insert as bundle to reduce archetype moves
-                    .insert((sink, PlaybackDespawnMarker)),
-                PlaybackMode::Remove => commands
-                    .entity(entity)
-                    // PERF: insert as bundle to reduce archetype moves
-                    .insert((sink, PlaybackRemoveMarker)),
-            };
+            insert_sink(
+                &mut commands,
+                entity,
+                AudioSink::new(sink),
+                settings,
+                &global_volume,
+            );
         }
     }
+}
+
+fn insert_sink(
+    commands: &mut Commands,
+    entity: Entity,
+    mut sink: AudioSink,
+    settings: &PlaybackSettings,
+    global_volume: &GlobalVolume,
+) {
+    if settings.muted {
+        sink.mute();
+    }
+
+    sink.set_speed(settings.speed);
+    sink.set_volume(settings.volume * global_volume.volume);
+
+    if settings.paused {
+        sink.pause();
+    }
+
+    match settings.mode {
+        PlaybackMode::Loop | PlaybackMode::Once => commands.entity(entity).insert(sink),
+        PlaybackMode::Despawn => commands
+            .entity(entity)
+            // PERF: insert as bundle to reduce archetype moves
+            .insert((sink, PlaybackDespawnMarker)),
+        PlaybackMode::Remove => commands
+            .entity(entity)
+            // PERF: insert as bundle to reduce archetype moves
+            .insert((sink, PlaybackRemoveMarker)),
+    };
 }
 
 pub(crate) fn cleanup_finished_audio<T: Decodable + Asset>(
@@ -334,7 +374,8 @@ pub(crate) fn cleanup_finished_audio<T: Decodable + Asset>(
 
 /// Run Condition to only play audio if the audio output is available
 pub(crate) fn audio_output_available(audio_output: Res<AudioOutput>) -> bool {
-    audio_output.stream.is_some()
+    // The browser plays most web audio without the stream.
+    cfg!(target_arch = "wasm32") || !matches!(audio_output.stream, Some(None))
 }
 
 /// Updates spatial audio sinks when emitter positions change.

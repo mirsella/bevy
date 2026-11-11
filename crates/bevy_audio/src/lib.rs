@@ -35,6 +35,8 @@ mod audio_source;
 mod pitch;
 mod sinks;
 mod volume;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 /// The audio prelude.
 ///
@@ -115,6 +117,8 @@ impl AddAudioSource for App {
             (play_queued_audio_system::<T>, cleanup_finished_audio::<T>)
                 .in_set(AudioPlaybackSystems),
         );
+        #[cfg(target_arch = "wasm32")]
+        self.add_systems(PostUpdate, web::forget_changed_sources::<T>);
         self
     }
 }

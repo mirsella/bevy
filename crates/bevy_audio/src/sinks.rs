@@ -6,6 +6,11 @@ use core::time::Duration;
 pub use rodio::source::SeekError;
 use rodio::{Player, SpatialPlayer};
 
+#[cfg(target_arch = "wasm32")]
+type Backend = crate::web::Player;
+#[cfg(not(target_arch = "wasm32"))]
+type Backend = Player;
+
 /// Common interactions with an audio sink.
 pub trait AudioSinkPlayback {
     /// Gets the volume of the sound as a [`Volume`].
@@ -137,7 +142,7 @@ pub trait AudioSinkPlayback {
 /// that source is unchanged, that translates to the audio restarting.
 #[derive(Component)]
 pub struct AudioSink {
-    pub(crate) sink: Player,
+    pub(crate) sink: Backend,
 
     /// Managed volume allows the sink to be muted without losing the user's
     /// intended volume setting.
@@ -155,9 +160,13 @@ pub struct AudioSink {
 
 impl AudioSink {
     /// Create a new audio sink.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(clippy::useless_conversion, reason = "wraps the player only on the web")
+    )]
     pub fn new(sink: Player) -> Self {
         Self {
-            sink,
+            sink: sink.into(),
             managed_volume: None,
         }
     }
