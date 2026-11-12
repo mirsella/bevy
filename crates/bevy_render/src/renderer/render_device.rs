@@ -41,6 +41,22 @@ struct BindGroupKey {
     entries: Vec<(u32, CachedResource)>,
 }
 
+// Left to the compiler, the proof that the device is `Send` and `Sync` descends through the
+// cache into every wgpu type and exceeds the recursion limit in downstream crates.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<wgpu::BindGroupLayout>();
+    assert_send_sync::<wgpu::Buffer>();
+    assert_send_sync::<wgpu::Sampler>();
+    assert_send_sync::<wgpu::TextureView>();
+};
+
+// SAFETY: A key holds plain data and the wgpu handles asserted `Send` above.
+unsafe impl Send for BindGroupKey {}
+
+// SAFETY: A key holds plain data and the wgpu handles asserted `Sync` above.
+unsafe impl Sync for BindGroupKey {}
+
 #[derive(PartialEq, Eq, Hash)]
 enum CachedResource {
     Buffer(CachedBuffer),
