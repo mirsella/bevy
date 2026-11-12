@@ -222,10 +222,10 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
         let vertex_layout =
             VertexBufferLayout::from_vertex_formats(VertexStepMode::Vertex, formats);
         let shader_defs = vec![MANUAL_SRGB_SHADER_DEF.into()];
-        let (shader, label) = if key.cpu_slices {
-            (&self.cpu_shader, "ui_texture_slice_cpu_pipeline")
+        let shader = if key.cpu_slices {
+            &self.cpu_shader
         } else {
-            (&self.shader, "ui_texture_slice_pipeline")
+            &self.shader
         };
 
         RenderPipelineDescriptor {
@@ -242,7 +242,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
                 ..default()
             }),
             layout: vec![self.view_layout.clone(), self.image_layout.clone()],
-            label: Some(label.into()),
+            label: Some("ui_texture_slice_pipeline".into()),
             ..default()
         }
     }

@@ -1,7 +1,7 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::{
     ops::{DerefMut, Range},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, ThreadId};
 
@@ -26,30 +26,6 @@ const MAX_PIPELINE_STATISTICS: u32 = 128;
 
 const TIMESTAMP_SIZE: u64 = 8;
 const PIPELINE_STATISTICS_SIZE: u64 = 40;
-const MAP_PENDING: u8 = 0;
-const MAP_READY: u8 = 1;
-const MAP_FAILED: u8 = 2;
-
-fn timestamp_delta(begin: u64, end: u64) -> Option<u64> {
-    let delta = end.checked_sub(begin);
-    if delta.is_none() {
-        // Vulkan counters can have fewer than 64 valid bits. wgpu does not
-        // expose that width, so wrapping_sub cannot recover this interval.
-        bevy_log::warn_once!(
-            begin,
-            end,
-            "GPU timestamp counter wrapped or reset; omitting such intervals"
-        );
-    }
-    delta
-}
-
-#[test]
-fn timestamp_wrap_is_not_a_negative_or_huge_duration() {
-    assert_eq!(timestamp_delta((1 << 36) - 3, 4), None);
-    assert_eq!(timestamp_delta(u64::MAX - 3, 4), None);
-    assert_eq!(timestamp_delta(50, 73), Some(23));
-}
 
 struct DiagnosticsRecorderInternal {
     timestamp_period_ns: f32,
@@ -111,16 +87,15 @@ impl DiagnosticsRecorder {
     /// Begins recording diagnostics for a new frame.
     pub fn begin_frame(&mut self) {
         let internal = &mut self.0;
-        // Each callback replaces the latest receipt. Do not publish a newer
-        // frame before an older pending mapping, or reorder through swap_remove.
-        let timestamp_period = internal.timestamp_period_ns;
-        while internal
-            .submitted_frames
-            .first_mut()
-            .is_some_and(|frame| frame.run_mapped_callback(timestamp_period))
-        {
-            let finished = internal.submitted_frames.remove(0);
-            internal.finished_frames.push(finished);
+        let mut idx = 0;
+        while idx < internal.submitted_frames.len() {
+            let timestamp = internal.timestamp_period_ns;
+            if internal.submitted_frames[idx].run_mapped_callback(timestamp) {
+                let removed = internal.submitted_frames.swap_remove(idx);
+                internal.finished_frames.push(removed);
+            } else {
+                idx += 1;
+            }
         }
 
         self.current_frame_mut().begin();
@@ -131,30 +106,6 @@ impl DiagnosticsRecorder {
     /// Should be called before [`DiagnosticsRecorder::finish_frame`].
     pub fn resolve(&mut self, encoder: &mut CommandEncoder) {
         self.current_frame_mut().resolve(encoder);
-    }
-
-    /// Opens the whole-frame GPU interval, returning the commands that must run
-    /// before everything else this frame, or `None` without encoder timestamps.
-    pub(super) fn begin_gpu_frame(&mut self) -> Option<wgpu::CommandBuffer> {
-        let frame = self.current_frame_mut();
-        if cfg!(target_os = "macos") || !frame.supports_timestamps_inside_encoders {
-            return None;
-        }
-        let set = frame.timestamps_query_set.as_ref()?;
-        assert_eq!(
-            frame.num_timestamps, 0,
-            "frame timestamps must be reserved first"
-        );
-        let mut encoder = frame
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render_frame_start"),
-            });
-        encoder.write_timestamp(set, 0);
-        // Reserve the end query as well: detailed spans may exhaust the pool.
-        frame.num_timestamps = 2;
-        frame.gpu_frame = true;
-        Some(encoder.finish())
     }
 
     /// Finishes recording diagnostics for the current frame.
@@ -267,7 +218,6 @@ struct FrameData {
     device: Device,
     timestamps_query_set: Option<QuerySet>,
     num_timestamps: u32,
-    gpu_frame: bool,
     supports_timestamps_inside_passes: bool,
     supports_timestamps_inside_encoders: bool,
     pipeline_statistics_query_set: Option<QuerySet>,
@@ -280,7 +230,7 @@ struct FrameData {
     open_spans: Vec<SpanRecord>,
     closed_spans: Vec<SpanRecord>,
     value_buffers: Vec<(Buffer, Cow<'static, str>, bool)>,
-    mapping: Arc<AtomicU8>,
+    is_mapped: Arc<AtomicBool>,
     callback: Option<Box<dyn FnOnce(RenderDiagnostics) + Send + Sync + 'static>>,
     #[cfg(feature = "tracing-tracy")]
     tracy_gpu_context: Option<tracy_client::GpuContext>,
@@ -342,7 +292,6 @@ impl FrameData {
             device: wgpu_device.clone(),
             timestamps_query_set,
             num_timestamps: 0,
-            gpu_frame: false,
             supports_timestamps_inside_passes: features
                 .contains(Features::TIMESTAMP_QUERY_INSIDE_PASSES),
             supports_timestamps_inside_encoders: features
@@ -357,7 +306,7 @@ impl FrameData {
             open_spans: Vec::new(),
             closed_spans: Vec::new(),
             value_buffers: Vec::new(),
-            mapping: Arc::new(AtomicU8::new(MAP_PENDING)),
+            is_mapped: Arc::new(AtomicBool::new(false)),
             callback: None,
             #[cfg(feature = "tracing-tracy")]
             tracy_gpu_context,
@@ -366,7 +315,6 @@ impl FrameData {
 
     fn begin(&mut self) {
         self.num_timestamps = 0;
-        self.gpu_frame = false;
         self.num_pipeline_statistics = 0;
         self.path_components.clear();
         self.open_spans.clear();
@@ -540,9 +488,6 @@ impl FrameData {
 
         match &self.timestamps_query_set {
             Some(set) if self.num_timestamps > 0 => {
-                if self.gpu_frame {
-                    encoder.write_timestamp(set, 1);
-                }
                 encoder.resolve_query_set(set, 0..self.num_timestamps, resolve_buffer, 0);
             }
             _ => {}
@@ -613,15 +558,14 @@ impl FrameData {
 
         self.callback = Some(Box::new(callback));
 
-        let mapping = self.mapping.clone();
+        let is_mapped = self.is_mapped.clone();
         read_buffer.slice(..).map_async(MapMode::Read, move |res| {
             if let Err(e) = res {
                 bevy_log::warn!("Failed to download render statistics buffer: {e}");
-                mapping.store(MAP_FAILED, Ordering::Release);
                 return;
             }
 
-            mapping.store(MAP_READY, Ordering::Release);
+            is_mapped.store(true, Ordering::Release);
         });
     }
 
@@ -630,16 +574,9 @@ impl FrameData {
         let Some(read_buffer) = &self.read_buffer else {
             return true;
         };
-        match self.mapping.load(Ordering::Acquire) {
-            MAP_PENDING => return false,
-            MAP_FAILED => {
-                self.callback = None;
-                self.value_buffers.clear();
-                self.mapping.store(MAP_PENDING, Ordering::Release);
-                return true;
-            }
-            MAP_READY => {}
-            state => panic!("invalid diagnostic mapping state: {state}"),
+        if !self.is_mapped.load(Ordering::Acquire) {
+            // need to wait more
+            return false;
         }
         let Some(callback) = self.callback.take() else {
             return true;
@@ -665,16 +602,6 @@ impl FrameData {
 
         let mut diagnostics = Vec::new();
 
-        if self.gpu_frame
-            && let Some(elapsed) = timestamp_delta(timestamps[0], timestamps[1])
-        {
-            diagnostics.push(RenderDiagnostic {
-                path: DiagnosticPath::new("render/frame/elapsed_gpu"),
-                suffix: "ms",
-                value: elapsed as f64 * f64::from(timestamp_period_ns) / 1e6,
-            });
-        }
-
         for span in &self.closed_spans {
             if let (Some(begin), Some(end)) = (span.begin_instant, span.end_instant) {
                 diagnostics.push(RenderDiagnostic {
@@ -686,12 +613,9 @@ impl FrameData {
 
             if let (Some(begin), Some(end)) = (span.begin_timestamp_index, span.end_timestamp_index)
             {
-                let begin = timestamps[begin as usize];
-                let end = timestamps[end as usize];
-                let Some(elapsed) = timestamp_delta(begin, end) else {
-                    continue;
-                };
-                let value = elapsed as f64 * f64::from(timestamp_period_ns) / 1e6;
+                let begin = timestamps[begin as usize] as f64;
+                let end = timestamps[end as usize] as f64;
+                let value = (end - begin) * (timestamp_period_ns as f64) / 1e6;
 
                 #[cfg(feature = "tracing-tracy")]
                 {
@@ -773,7 +697,7 @@ impl FrameData {
 
         drop(data);
         read_buffer.unmap();
-        self.mapping.store(MAP_PENDING, Ordering::Release);
+        self.is_mapped.store(false, Ordering::Release);
 
         true
     }

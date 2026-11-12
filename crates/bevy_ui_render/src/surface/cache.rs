@@ -62,7 +62,7 @@ pub struct UiCachedSurfaces;
 /// How the surface cache treated one surface this frame. Every state but
 /// [`Self::Reused`] draws the surface with its reference shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UiSurfaceCacheState {
+pub(crate) enum UiSurfaceCacheState {
     /// The camera's target or the surface's geometry cannot be cached.
     Unsupported,
     /// The reference or the replay pipeline has not compiled yet.
@@ -75,15 +75,6 @@ pub enum UiSurfaceCacheState {
     Building,
     /// Drawn from the retained texture.
     Reused,
-}
-
-/// Render-world telemetry on each opted-in surface's temporary render entity.
-#[derive(Component, Clone, Copy, Debug)]
-pub struct UiSurfaceCacheStatus {
-    pub main_entity: MainEntity,
-    pub state: UiSurfaceCacheState,
-    /// Conservative occupied pixel count, including the one-pixel raster guard.
-    pub pixel_count: u32,
 }
 
 pub(super) struct SurfaceCachePlugin;
@@ -487,26 +478,18 @@ impl SurfaceCache {
         source: &Source<'_>,
         pipeline: impl FnOnce() -> Option<RenderPipelineId>,
         layout: impl FnOnce() -> BindGroupLayout,
-    ) -> UiSurfaceCacheStatus {
-        let mut status = UiSurfaceCacheStatus {
-            main_entity: source.entity,
-            state: UiSurfaceCacheState::Unsupported,
-            pixel_count: 0,
-        };
+    ) -> UiSurfaceCacheState {
         if source.indices.is_empty() {
-            return status;
+            return UiSurfaceCacheState::Unsupported;
         }
         let Some(rect) = occupied_pixels(source.vertices, target.projection, target.size) else {
-            return status;
+            return UiSurfaceCacheState::Unsupported;
         };
-        status.pixel_count = rect.width() * rect.height();
-        status.state = if let Some(pipeline) = pipeline() {
-            let contents = Contents::snapshot(self.scratch.take(), target, source, rect, pipeline);
-            self.retain(device, queue, target, source, contents, layout)
-        } else {
-            UiSurfaceCacheState::PipelinePending
+        let Some(pipeline) = pipeline() else {
+            return UiSurfaceCacheState::PipelinePending;
         };
-        status
+        let contents = Contents::snapshot(self.scratch.take(), target, source, rect, pipeline);
+        self.retain(device, queue, target, source, contents, layout)
     }
 
     fn retain(
@@ -807,17 +790,10 @@ impl SurfaceCachePreparation<'_, '_> {
         paint: &[[u32; 4]],
     ) -> bool {
         let Some(target) = self.target(surface.camera) else {
-            commands
-                .entity(surface.render_entity)
-                .insert(UiSurfaceCacheStatus {
-                    main_entity: surface.entity,
-                    state: UiSurfaceCacheState::Unsupported,
-                    pixel_count: 0,
-                });
             return false;
         };
         let mut replay_pipeline = None;
-        let status = self.state.observe(
+        let state = self.state.observe(
             device,
             queue,
             &target,
@@ -854,26 +830,20 @@ impl SurfaceCachePreparation<'_, '_> {
             },
             || pipelines.get_bind_group_layout(&self.pipeline.texture_layout),
         );
-        let reuse = match status.state {
+        let reuse = match state {
             UiSurfaceCacheState::Reused => true,
             UiSurfaceCacheState::Building => false,
-            _ => {
-                commands.entity(surface.render_entity).insert(status);
-                return false;
-            }
+            _ => return false,
         };
-        commands.entity(surface.render_entity).insert((
-            CachedDraw {
-                key: CacheKey {
-                    entity: surface.entity,
-                    view: target.view,
-                },
-                pipeline: replay_pipeline
-                    .expect("a surface with pixels has a compiled replay pipeline"),
-                reuse,
+        commands.entity(surface.render_entity).insert((CachedDraw {
+            key: CacheKey {
+                entity: surface.entity,
+                view: target.view,
             },
-            status,
-        ));
+            pipeline: replay_pipeline
+                .expect("a surface with pixels has a compiled replay pipeline"),
+            reuse,
+        },));
         true
     }
 

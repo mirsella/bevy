@@ -390,9 +390,6 @@ struct Square {
     shade: f32,
 }
 
-/// The pixels a [`Square`] occupies, with its one-pixel raster guard.
-const SQUARE_PIXELS: u32 = 18 * 18;
-
 /// Frames of the cache as `prepare_surfaces` and `ui_surface_cache_pass` drive
 /// it, on `wgpu`'s noop backend.
 struct Frames {
@@ -466,7 +463,7 @@ impl Frames {
                 }
             }));
             let start = index as u32 * 6;
-            let status = self.cache.observe(
+            let state = self.cache.observe(
                 &self.device,
                 &self.queue,
                 &Target {
@@ -489,9 +486,7 @@ impl Frames {
                 || Some(self.pipeline),
                 || self.layout.clone(),
             );
-            assert_eq!(status.main_entity, entity(square.entity));
-            assert_eq!(status.pixel_count, SQUARE_PIXELS);
-            states.push(status.state);
+            states.push(state);
         }
         self.cache.finish_frame();
         if self.pass {
@@ -932,7 +927,7 @@ impl Replay {
                 &HashSet::from_iter([target.view]),
             );
             for (index, draw) in scene.draws.iter().enumerate() {
-                let status = self.cache.observe(
+                let state = self.cache.observe(
                     &self.device,
                     &self.queue,
                     &target,
@@ -951,7 +946,7 @@ impl Replay {
                     || Some(self.reference),
                     || self.layout.clone(),
                 );
-                states.push(status.state);
+                states.push(state);
             }
             self.cache.finish_frame();
             for (entry, pixels, source) in self.cache.pending(target.view) {

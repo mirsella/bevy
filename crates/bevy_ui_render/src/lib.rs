@@ -12,7 +12,7 @@ pub mod clipping;
 mod pipeline;
 pub mod render_pass;
 mod surface;
-pub use surface::cache::{UiCachedSurfaces, UiSurfaceCacheState, UiSurfaceCacheStatus};
+pub use surface::cache::UiCachedSurfaces;
 mod text;
 pub mod ui_material;
 mod ui_material_pipeline;
