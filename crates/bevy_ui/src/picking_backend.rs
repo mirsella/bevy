@@ -26,7 +26,7 @@ use bevy_app::prelude::*;
 use bevy_camera::{visibility::InheritedVisibility, Camera, RenderTarget};
 use bevy_ecs::{prelude::*, query::QueryData};
 use bevy_math::Vec2;
-use bevy_platform::collections::HashMap;
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_text::{ComputedTextBlock, TextLayoutInfo};
 use bevy_window::PrimaryWindow;
@@ -149,6 +149,11 @@ pub fn ui_picking(
     let mut hit_nodes =
         HashMap::<(Entity, PointerId), Vec<(Entity, Entity, Option<Pickable>, Vec2)>>::default();
 
+    // Nodes below a blocking one are never reported, so a pointer stops searching at
+    // its first blocking hit, and the walk ends once every pointer has one.
+    let searching: usize = pointer_pos_by_camera.values().map(HashMap::len).sum();
+    let mut blocked = HashSet::<(Entity, PointerId)>::default();
+
     // prepare an iterator that contains all the nodes that have the cursor in their rect,
     // from the top node to the bottom one. this will also reset the interaction to `None`
     // for all nodes encountered that are no longer hovered.
@@ -175,6 +180,9 @@ pub fn ui_picking(
 
         // Reverse the iterator to traverse the tree from closest nodes to furthest
         for node_entity in uinodes.iter().rev().cloned() {
+            if blocked.len() == searching {
+                break;
+            }
             let Ok(node) = node_query.get(node_entity) else {
                 continue;
             };
@@ -202,7 +210,8 @@ pub fn ui_picking(
             // (±0., 0.) is the center with the corners at points (±0.5, ±0.5).
             // Coordinates are relative to the entire node, not just the visible region.
             for (pointer_id, cursor_position) in pointers_on_this_cam.iter() {
-                if node.node.contains_point(*node.transform, *cursor_position)
+                if !blocked.contains(&(camera_entity, *pointer_id))
+                    && node.node.contains_point(*node.transform, *cursor_position)
                     && node
                         .calculated_clip
                         .is_none_or(|clip| clip.contains_point(*cursor_position))
@@ -235,6 +244,12 @@ pub fn ui_picking(
                             node.transform.inverse().transform_point2(*cursor_position)
                                 / node.node.size(),
                         ));
+                    if node
+                        .pickable
+                        .is_none_or(|pickable| pickable.should_block_lower)
+                    {
+                        blocked.insert((camera_entity, *pointer_id));
+                    }
                 }
             }
         }
