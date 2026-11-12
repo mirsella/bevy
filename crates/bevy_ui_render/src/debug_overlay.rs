@@ -11,6 +11,7 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
 use bevy_ecs::prelude::ReflectResource;
+use bevy_ecs::query::With;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::system::Commands;
 use bevy_ecs::system::Query;
@@ -186,7 +187,12 @@ pub fn extract_debug_overlay(
     >,
     ui_stack: Extract<Res<UiStack>>,
     camera_map: Extract<UiCameraMap>,
+    overrides: Extract<Query<(), With<UiDebugOptions>>>,
 ) {
+    // The overlay is almost always off, and then no node has anything to draw.
+    if !debug_options.enabled && overrides.is_empty() {
+        return;
+    }
     let mut camera_mapper = camera_map.get_mapper();
 
     for (entity, uinode, stack_index, transform, visibility, maybe_clip, computed_target, debug) in
