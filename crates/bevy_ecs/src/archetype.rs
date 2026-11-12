@@ -204,7 +204,9 @@ impl BundleComponentStatus for SpawnBundleStatus {
 /// [`World`]: crate::world::World
 #[derive(Default)]
 pub struct Edges {
-    insert_bundle: SparseArray<BundleId, ArchetypeAfterBundleInsert>,
+    // Bundle IDs are world-global. Most archetypes see only a few transitions, so
+    // reserving a large insertion record for every preceding ID wastes memory.
+    insert_bundle: HashMap<BundleId, ArchetypeAfterBundleInsert>,
     remove_bundle: SparseArray<BundleId, Option<ArchetypeId>>,
     take_bundle: SparseArray<BundleId, Option<ArchetypeId>>,
 }
@@ -228,7 +230,7 @@ impl Edges {
         &self,
         bundle_id: BundleId,
     ) -> Option<&ArchetypeAfterBundleInsert> {
-        self.insert_bundle.get(bundle_id)
+        self.insert_bundle.get(&bundle_id)
     }
 
     /// Caches the target archetype when inserting a bundle into the source archetype.
