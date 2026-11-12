@@ -158,7 +158,7 @@ pub fn ui_picking(
     // from the top node to the bottom one. this will also reset the interaction to `None`
     // for all nodes encountered that are no longer hovered.
     // Reverse the iterator to traverse the tree from closest slice to furthest
-    for uinodes in ui_stack
+    'walk: for uinodes in ui_stack
         .partition
         .iter()
         .rev()
@@ -181,7 +181,7 @@ pub fn ui_picking(
         // Reverse the iterator to traverse the tree from closest nodes to furthest
         for node_entity in uinodes.iter().rev().cloned() {
             if blocked.len() == searching {
-                break;
+                break 'walk;
             }
             let Ok(node) = node_query.get(node_entity) else {
                 continue;

@@ -89,12 +89,13 @@ pub fn update_clipping_system(
         // Summed so that the order entities are stored in does not matter.
         sources = sources.wrapping_add(hasher.finish());
     }
-    // Every reader is drained so that none holds a removal for a later frame.
-    let mut removals = orphaned
+    // `count` drains every reader so that none holds a removal for a later frame.
+    let left = orphaned
         .read()
         .chain(unclipped.read())
-        .chain(enabled.read());
-    let left = removals.by_ref().filter(|&e| in_tree.contains(e)).count();
+        .chain(enabled.read())
+        .filter(|&e| in_tree.contains(e))
+        .count();
     // An entity that stops being a ghost may have left the tree altogether.
     #[cfg(feature = "ghost_nodes")]
     let left = left + unghosted.read().count();

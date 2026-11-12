@@ -2,8 +2,8 @@
 //!
 //! Rodio decodes and mixes on the page's main thread, which the app also renders on. The browser
 //! decodes off it: loops stream through an `<audio>` element, and other sounds play Web Audio
-//! buffers decoded once per asset. Every voice ends in its own gain node. Components must be `Send`, so the JavaScript objects live in
-//! a thread-local registry and sinks hold an id.
+//! buffers decoded once per asset. Every voice ends in its own gain node. Components must be
+//! `Send`, so the JavaScript objects live in a thread-local registry and sinks hold an id.
 
 use crate::{AudioSink, Decodable, PlaybackMode, PlaybackSettings};
 use alloc::rc::Rc;
@@ -11,6 +11,7 @@ use bevy_asset::{Asset, AssetEvent, Handle, UntypedAssetId};
 use bevy_ecs::message::MessageReader;
 use core::{
     cell::{Cell, RefCell},
+    mem,
     time::Duration,
 };
 use js_sys::{Array, Reflect, Uint8Array};
@@ -85,16 +86,11 @@ pub(crate) fn sink<S: Decodable + Asset>(
     handle: &Handle<S>,
     settings: &PlaybackSettings,
 ) -> Option<AudioSink> {
-    let looped = match settings.mode {
-        // An element loops the whole clip only.
-        PlaybackMode::Loop => {
-            if settings.start_position.is_some() || settings.duration.is_some() {
-                return None;
-            }
-            true
-        }
-        PlaybackMode::Once | PlaybackMode::Despawn | PlaybackMode::Remove => false,
-    };
+    let looped = matches!(settings.mode, PlaybackMode::Loop);
+    // An element loops the whole clip only.
+    if looped && (settings.start_position.is_some() || settings.duration.is_some()) {
+        return None;
+    }
     let bytes = source.encoded()?;
     let asset = handle.id().untyped();
     let id = BROWSER.with_borrow_mut(|browser| {
@@ -165,39 +161,37 @@ impl Browser {
                 }) = browser.voices.get_mut(&id)
                 {
                     buffer.rebase(*speed);
-                    buffer.node = None;
-                    buffer.finished = true;
+                    buffer.state = BufferState::Finished;
                 }
             });
         });
+        let start = settings.start_position.unwrap_or_default();
         let mut buffer = Buffer {
             context: context.clone(),
-            node: None,
-            buffer: None,
+            state: BufferState::Decoding,
             ended,
-            start: settings.start_position.unwrap_or_default().as_secs_f64(),
-            offset: settings.start_position.unwrap_or_default().as_secs_f64(),
+            origin: start.as_secs_f64(),
+            offset: start.as_secs_f64(),
             played: 0.0,
             started_at: 0.0,
             end: settings
                 .duration
-                .map(|duration| settings.start_position.unwrap_or_default() + duration)
-                .map(|end| end.as_secs_f64()),
-            // A suspended context would queue sounds and play them all at once on resume.
-            finished: context.state() != AudioContextState::Running,
+                .map(|duration| (start + duration).as_secs_f64()),
         };
-        if buffer.finished {
+        // A suspended context would queue sounds and play them all at once on resume.
+        if context.state() != AudioContextState::Running {
+            buffer.state = BufferState::Finished;
             return Ok(buffer);
         }
         match self.buffers.get_mut(&asset) {
             Some(Decoded::Ready(decoded)) => {
-                buffer.buffer = Some(decoded.clone());
+                buffer.state = BufferState::Ready(decoded.clone());
                 if !settings.paused {
                     buffer.start(1.0, gain);
                 }
             }
             Some(Decoded::Pending(_, waiting)) => waiting.push(id),
-            Some(Decoded::Failed) => buffer.finished = true,
+            Some(Decoded::Failed) => buffer.state = BufferState::Finished,
             None => {
                 let decode_id = self.next_decode;
                 decode(context, asset, decode_id, bytes)?;
@@ -215,13 +209,14 @@ impl Browser {
         decode_id: u64,
         result: Result<AudioBuffer, JsValue>,
     ) {
-        // A changed or removed asset replaced or dropped its entry; a stale decode is discarded.
-        if !matches!(self.buffers.get(&asset), Some(Decoded::Pending(pending, _)) if *pending == decode_id)
-        {
-            return;
-        }
-        let Some(Decoded::Pending(_, waiting)) = self.buffers.remove(&asset) else {
-            unreachable!("checked above");
+        let waiting = match self.buffers.remove(&asset) {
+            Some(Decoded::Pending(pending, waiting)) if pending == decode_id => waiting,
+            // A changed or removed asset replaced or dropped its entry; a stale decode is discarded.
+            Some(newer) => {
+                self.buffers.insert(asset, newer);
+                return;
+            }
+            None => return,
         };
         let decoded = result
             .inspect_err(|error| warn!(?error, ?asset, "browser could not decode audio"))
@@ -233,14 +228,18 @@ impl Browser {
             let Kind::Buffer(buffer) = &mut voice.kind else {
                 unreachable!("only buffer voices wait for decodes");
             };
+            // A voice stopped while decoding stays finished.
+            if !matches!(buffer.state, BufferState::Decoding) {
+                continue;
+            }
             match &decoded {
                 Some(decoded) => {
-                    buffer.buffer = Some(decoded.clone());
+                    buffer.state = BufferState::Ready(decoded.clone());
                     if !voice.paused {
                         buffer.start(voice.speed, &voice.gain);
                     }
                 }
-                None => buffer.finished = true,
+                None => buffer.state = BufferState::Finished,
             }
         }
         self.buffers
@@ -278,7 +277,7 @@ pub(crate) fn forget_changed_sources<T: Asset>(mut events: MessageReader<AssetEv
                         ..
                     }) = browser.voices.get_mut(&id)
                     {
-                        buffer.finished = true;
+                        buffer.state = BufferState::Finished;
                     }
                 }
             });
@@ -299,15 +298,20 @@ enum Kind {
     Track(Track),
 }
 
+enum BufferState {
+    Decoding,
+    /// Decoded with no node playing: paused or not started yet.
+    Ready(AudioBuffer),
+    Playing(AudioBuffer, AudioBufferSourceNode),
+    Finished,
+}
+
 struct Buffer {
     context: AudioContext,
-    /// The node playing now; a paused or finished voice has none.
-    node: Option<AudioBufferSourceNode>,
-    /// `None` until decoded.
-    buffer: Option<AudioBuffer>,
+    state: BufferState,
     ended: Closure<dyn FnMut(Event)>,
     /// Clip position in seconds where sink time zero is.
-    start: f64,
+    origin: f64,
     /// Clip position in seconds when the node started or playback paused.
     offset: f64,
     /// Sink position at `offset`. Like rodio, sink time is clip time divided by the speed it
@@ -317,22 +321,21 @@ struct Buffer {
     started_at: f64,
     /// Clip position in seconds where playback ends; the clip's end if `None`.
     end: Option<f64>,
-    finished: bool,
 }
 
 impl Buffer {
     fn start(&mut self, speed: f32, gain: &GainNode) {
-        let Some(buffer) = self.buffer.clone() else {
+        let BufferState::Ready(buffer) = &self.state else {
             return;
         };
         let end = self.end.unwrap_or_else(|| buffer.duration());
-        if self.finished || self.node.is_some() || self.offset >= end {
-            self.finished |= self.offset >= end;
+        if self.offset >= end {
+            self.state = BufferState::Finished;
             return;
         }
         let started = (|| {
             let node = self.context.create_buffer_source()?;
-            node.set_buffer(Some(&buffer));
+            node.set_buffer(Some(buffer));
             node.playback_rate().set_value(speed);
             node.connect_with_audio_node(gain)?;
             AudioScheduledSourceNode::set_onended(&node, Some(self.ended.as_ref().unchecked_ref()));
@@ -343,40 +346,40 @@ impl Buffer {
             )?;
             Ok::<_, JsValue>(node)
         })();
-        match started {
+        self.state = match started {
             Ok(node) => {
                 self.started_at = self.context.current_time();
-                self.node = Some(node);
+                BufferState::Playing(buffer.clone(), node)
             }
             Err(error) => {
                 warn!(?error, "browser could not play audio");
-                self.finished = true;
+                BufferState::Finished
             }
-        }
+        };
     }
 
     fn stop_node(&mut self) {
-        if let Some(node) = self.node.take() {
-            let node: &AudioScheduledSourceNode = &node;
-            // Only natural ends finish the voice.
-            node.set_onended(None);
-            let _ = node.stop();
-        }
+        self.state = match mem::replace(&mut self.state, BufferState::Finished) {
+            BufferState::Playing(buffer, node) => {
+                let node: &AudioScheduledSourceNode = &node;
+                // Only natural ends finish the voice.
+                node.set_onended(None);
+                let _ = node.stop();
+                BufferState::Ready(buffer)
+            }
+            state => state,
+        };
     }
 
     /// Clip and sink seconds now.
     fn position(&self, speed: f32) -> (f64, f64) {
-        if self.node.is_none() {
+        let BufferState::Playing(buffer, _) = &self.state else {
             return (self.offset, self.played);
-        }
+        };
         let speed = f64::from(speed);
-        let end = self
-            .end
-            .or_else(|| self.buffer.as_ref().map(AudioBuffer::duration));
-        let mut elapsed = self.context.current_time() - self.started_at;
-        if let Some(end) = end {
-            elapsed = elapsed.min((end - self.offset) / speed);
-        }
+        let end = self.end.unwrap_or_else(|| buffer.duration());
+        let elapsed =
+            (self.context.current_time() - self.started_at).min((end - self.offset) / speed);
         (self.offset + elapsed * speed, self.played + elapsed)
     }
 
@@ -492,10 +495,11 @@ impl Voice {
         }
         match &mut self.kind {
             Kind::Buffer(buffer) => {
-                if let Some(node) = buffer.node.clone() {
+                if let BufferState::Playing(_, node) = &buffer.state {
+                    let rate = node.playback_rate();
                     // Later positions advance at the new speed.
                     buffer.rebase(self.speed);
-                    node.playback_rate().set_value(speed);
+                    rate.set_value(speed);
                 }
             }
             Kind::Track(track) => {
@@ -552,11 +556,11 @@ impl Voice {
     fn seek(&mut self, position: Duration) {
         match &mut self.kind {
             Kind::Buffer(buffer) => {
-                let playing = buffer.node.is_some();
+                let playing = matches!(buffer.state, BufferState::Playing(..));
                 buffer.stop_node();
                 // Like rodio, the target is sink time, so the clip moves by speed times as much.
                 buffer.played = position.as_secs_f64();
-                buffer.offset = buffer.start + buffer.played * f64::from(self.speed);
+                buffer.offset = buffer.origin + buffer.played * f64::from(self.speed);
                 if playing {
                     buffer.start(self.speed, &self.gain);
                 }
@@ -571,7 +575,7 @@ impl Voice {
         match &mut self.kind {
             Kind::Buffer(buffer) => {
                 buffer.stop_node();
-                buffer.finished = true;
+                buffer.state = BufferState::Finished;
             }
             Kind::Track(track) => {
                 let _ = track.audio.pause();
@@ -582,7 +586,7 @@ impl Voice {
 
     fn empty(&self) -> bool {
         match &self.kind {
-            Kind::Buffer(buffer) => buffer.finished,
+            Kind::Buffer(buffer) => matches!(buffer.state, BufferState::Finished),
             Kind::Track(track) => track.stopped || track.failed.get(),
         }
     }
@@ -604,8 +608,8 @@ impl BrowserPlayer {
 
 impl Drop for BrowserPlayer {
     fn drop(&mut self) {
-        let voice = BROWSER.with_borrow_mut(|browser| browser.voices.remove(&self.0));
-        drop(voice);
+        // The voice drops after the registry borrow ends.
+        drop(BROWSER.with_borrow_mut(|browser| browser.voices.remove(&self.0)));
     }
 }
 

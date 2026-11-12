@@ -65,12 +65,11 @@ impl AnchorChanges<'_, '_> {
                     .iter_descendants(entity)
                     .any(|descendant| accessible.contains(descendant))
         };
-        // Every reader is drained so that none holds a removal for a later frame.
-        let orphaned = self.orphaned.read().filter(|&e| carries_nodes(e)).count();
-        let removed = self.removed.read().count() + self.enabled.read().count();
-        orphaned + removed > 0
-            || !self.disabled.is_empty()
-            || self.reparented.iter().any(carries_nodes)
+        // `count` drains every reader so that none holds a removal for a later frame.
+        let left = self.orphaned.read().filter(|&e| carries_nodes(e)).count()
+            + self.removed.read().count()
+            + self.enabled.read().count();
+        left > 0 || !self.disabled.is_empty() || self.reparented.iter().any(carries_nodes)
     }
 }
 
@@ -93,6 +92,7 @@ fn sync_bounds_and_transforms(
         *paused = true;
         return;
     }
+    // `|` rather than `||`, so that `anchors` drains its readers on every frame.
     let mut all = core::mem::take(&mut *paused)
         | anchors.any()
         | semantic_only_nodes.iter().any(|node| node.is_changed());
@@ -100,7 +100,11 @@ fn sync_bounds_and_transforms(
     // needs placing again when either of them changed.
     let mut stale = Vec::new();
     for (entity, accessible, node, ui_transform) in &mut accessible_nodes_query {
+        // A new node can become the nearest accessible ancestor of any other.
         all |= accessible.is_added();
+        if all {
+            break;
+        }
         if accessible.is_changed()
             || ui_transform.is_changed()
             || node.is_some_and(|node| node.is_changed())
@@ -116,6 +120,10 @@ fn sync_bounds_and_transforms(
             .iter()
             .map(|(entity, ..)| entity)
             .collect();
+    } else {
+        // A moved panel lists each node once per moved ancestor.
+        stale.sort_unstable();
+        stale.dedup();
     }
 
     for entity in stale {

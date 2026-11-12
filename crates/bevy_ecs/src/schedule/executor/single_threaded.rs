@@ -36,9 +36,8 @@ pub struct SingleThreadedExecutor {
     unapplied_systems: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
-    /// What `init` learned about the systems. The run loop visits every system of the schedule
-    /// every time, so it reads these dense tables instead of calling into each system's own cold
-    /// memory just to ask what kind of system it is.
+    /// Per-system facts gathered in `init`. The run loop visits every system each time, so it
+    /// reads these dense tables instead of each system's cold memory.
     plan: Plan,
 }
 

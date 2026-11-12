@@ -289,13 +289,9 @@ macro_rules! impl_state_set_sealed_tuples {
                 ));
 
                 schedule.add_systems(
-
                     apply_state_transition
-
                         .run_if(sources_transitioned)
-
                         .in_set(ApplyStateTransition::<T>::default()),
-
                 );
 
                 add_transition_schedule_runners::<T>(schedule);
@@ -366,13 +362,9 @@ macro_rules! impl_state_set_sealed_tuples {
                 ));
 
                 schedule.add_systems(
-
                     apply_state_transition
-
                         .run_if(sources_transitioned.or_else(requested::<T>))
-
                         .in_set(ApplyStateTransition::<T>::default()),
-
                 );
 
                 add_transition_schedule_runners::<T>(schedule);

@@ -194,7 +194,7 @@ fn poll_receivers(
 
 /// Inputs of the window node, compared each frame because unrelated `Window`
 /// fields such as the cursor position change constantly.
-#[derive(Default, PartialEq)]
+#[derive(Default)]
 struct WindowSemantics {
     focused: bool,
     size: bevy_math::UVec2,
@@ -241,18 +241,20 @@ impl TreeChanges<'_, '_> {
                     .iter_ancestors(entity)
                     .any(|parent| self.nodes.contains(parent))
         };
-        // Drain the removals and messages on every call so old ones never trigger later updates.
-        let removed = self.removed_nodes.read().count() + self.enabled.read().count() > 0;
-        let removed = self
-            .removed_hierarchy
-            .read()
-            .fold(removed, |removed, entity| removed | in_tree(entity));
+        // `count` drains the removals and messages on every call so old ones never trigger
+        // later updates.
+        let removed = self.removed_nodes.read().count()
+            + self.enabled.read().count()
+            + self
+                .removed_hierarchy
+                .read()
+                .filter(|&e| in_tree(e))
+                .count();
         // The app may reject an action, such as an edit, without changing the tree, so the
         // adapter must restore the DOM the action came from.
-        let acted = self.actions.read().count() > 0;
+        let acted = self.actions.read().count();
         INITIAL_TREE_SENT.swap(false, Ordering::Relaxed)
-            || acted
-            || removed
+            || removed + acted > 0
             || self.focus.as_ref().is_some_and(DetectChanges::is_changed)
             // A new node below a layout-only root changes the window's children.
             || self.changed_nodes.iter().any(|(_, node)| node.is_added())
@@ -264,7 +266,6 @@ impl TreeChanges<'_, '_> {
 fn update_accessibility_nodes(
     accessibility_requested: Res<AccessibilityRequested>,
     manage_accessibility_updates: Res<ManageAccessibilityUpdates>,
-    focus: Option<Res<InputFocus>>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
     nodes: Query<(Entity, &AccessibilityNode)>,
     parents: Query<&ChildOf>,
@@ -292,7 +293,7 @@ fn update_accessibility_nodes(
         let Some(adapter) = adapters.get_mut(&primary_window_id) else {
             return;
         };
-        let Some(focus) = focus else {
+        let Some(focus) = changes.focus else {
             return;
         };
         let window_changed = sync.window.focused != primary_window.focused

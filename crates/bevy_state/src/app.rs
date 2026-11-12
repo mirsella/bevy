@@ -250,9 +250,8 @@ fn enable_state_scoped_entities<S: States>(app: &mut SubApp) {
         warn!("State scoped entities are enabled for state `{name}`, but the state wasn't initialized in the app!");
     }
 
-    // These systems do nothing without a transition, so each one is skipped
-    // on the other frames. They check separately so that a transition written
-    // between two of them is never missed.
+    // These systems do nothing without a transition. Each checks separately so
+    // that a transition written between two of them is never missed.
     //
     // Note: We work with `StateTransition` in set
     // `StateTransitionSystems::ExitSchedules` rather than `OnExit`, because

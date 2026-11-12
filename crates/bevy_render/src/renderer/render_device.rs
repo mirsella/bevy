@@ -31,8 +31,7 @@ pub struct RenderDevice {
 /// Many render systems recreate identical bind groups every frame. Bind groups are
 /// immutable, so an equal request can reuse the earlier one, which avoids a costly
 /// `createBindGroup` call on WebGPU and gives draw state tracking a stable id.
-#[derive(Default)]
-struct BindGroupCache(HashMap<BindGroupKey, (BindGroup, bool)>);
+type BindGroupCache = HashMap<BindGroupKey, (BindGroup, bool)>;
 
 /// Keys own clones of the wgpu resources, so their unique ids cannot be reused while cached.
 #[derive(PartialEq, Eq, Hash)]
@@ -85,9 +84,9 @@ impl BindGroupKey {
             .map(|entry| {
                 let resource = match &entry.resource {
                     R::Buffer(binding) => CachedResource::Buffer(CachedBuffer::new(binding)),
-                    R::BufferArray(bindings) => {
-                        CachedResource::BufferArray(bindings.iter().map(CachedBuffer::new).collect())
-                    }
+                    R::BufferArray(bindings) => CachedResource::BufferArray(
+                        bindings.iter().map(CachedBuffer::new).collect(),
+                    ),
                     R::Sampler(sampler) => CachedResource::Sampler((*sampler).clone()),
                     R::SamplerArray(samplers) => CachedResource::SamplerArray(
                         samplers.iter().map(|sampler| (*sampler).clone()).collect(),
@@ -110,8 +109,9 @@ impl BindGroupKey {
 
 /// Drops cached bind groups that were not requested since the previous sweep.
 pub fn sweep_bind_group_cache(render_device: Res<RenderDevice>) {
-    let mut cache = render_device.bind_group_cache();
-    cache.0.retain(|_, (_, used)| core::mem::take(used));
+    render_device
+        .bind_group_cache()
+        .retain(|_, (_, used)| core::mem::take(used));
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -259,7 +259,7 @@ impl RenderDevice {
     ) -> BindGroup {
         let key = BindGroupKey::new(layout, entries);
         if let Some(key) = &key
-            && let Some((bind_group, used)) = self.bind_group_cache().0.get_mut(key)
+            && let Some((bind_group, used)) = self.bind_group_cache().get_mut(key)
         {
             *used = true;
             return bind_group.clone();
@@ -271,7 +271,6 @@ impl RenderDevice {
         }));
         if let Some(key) = key {
             self.bind_group_cache()
-                .0
                 .insert(key, (bind_group.clone(), true));
         }
         bind_group

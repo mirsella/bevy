@@ -133,9 +133,8 @@ impl<S: States> Default for ApplyStateTransition<S> {
 
 /// Adds the systems that run the exit, transition and enter schedules of `S`.
 ///
-/// Each one is skipped on the frames without a transition, which is nearly
-/// every frame. They check separately, at the point where they would run, so
-/// a transition written earlier in the same schedule run is never missed.
+/// Each one is skipped without a transition, and checks separately where it
+/// would run, so a transition written earlier in the same run is never missed.
 pub(crate) fn add_transition_schedule_runners<S: States>(schedule: &mut Schedule) {
     schedule.add_systems((
         last_transition::<S>
