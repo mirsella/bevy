@@ -217,7 +217,8 @@ static INITIAL_TREE_SENT: AtomicBool = AtomicBool::new(false);
 struct TreeChanges<'w, 's> {
     focus: Option<Res<'w, InputFocus>>,
     nodes: Query<'w, 's, (), With<AccessibilityNode>>,
-    changed_nodes: Query<'w, 's, (), Changed<AccessibilityNode>>,
+    changed_nodes:
+        Query<'w, 's, (Entity, Ref<'static, AccessibilityNode>), Changed<AccessibilityNode>>,
     changed_hierarchy: Query<'w, 's, Entity, Changed<Children>>,
     parents: Query<'w, 's, &'static ChildOf>,
     removed_nodes: RemovedComponents<'w, 's, AccessibilityNode>,
@@ -230,8 +231,8 @@ struct TreeChanges<'w, 's> {
 }
 
 impl TreeChanges<'_, '_> {
-    /// Whether anything changed since the last call.
-    fn any(&mut self) -> bool {
+    /// Whether anything but the content of already published nodes changed since the last call.
+    fn structural(&mut self) -> bool {
         // Only children of semantic nodes, or of layout entities below one, shape the tree.
         let in_tree = |entity: Entity| {
             self.nodes.contains(entity)
@@ -253,7 +254,8 @@ impl TreeChanges<'_, '_> {
             || acted
             || removed
             || self.focus.as_ref().is_some_and(DetectChanges::is_changed)
-            || !self.changed_nodes.is_empty()
+            // A new node below a layout-only root changes the window's children.
+            || self.changed_nodes.iter().any(|(_, node)| node.is_added())
             || !self.disabled.is_empty()
             || self.changed_hierarchy.iter().any(in_tree)
     }
@@ -272,9 +274,12 @@ fn update_accessibility_nodes(
     _non_send_marker: NonSendMarker,
 ) {
     // Rebuilding clones every node and makes the platform adapter diff the
-    // whole tree, so only do it when its inputs changed. The flag persists
-    // through the early returns below until an update is published.
-    sync.stale |= changes.any();
+    // whole tree, so only do it when its structure changed; nodes that only
+    // changed content, such as animated bounds, are sent on their own.
+    let full = sync.stale | changes.structural();
+    // Changed nodes are only known now, so an update that the early returns
+    // below defer must send the whole tree.
+    sync.stale = full || !changes.changed_nodes.is_empty();
     if !(accessibility_requested.get() && manage_accessibility_updates.get()) {
         // Another owner or a fresh activation may replace the published tree.
         sync.stale = true;
@@ -300,6 +305,7 @@ fn update_accessibility_nodes(
                 title: primary_window.title.clone(),
             };
         }
+        let full = full | window_changed;
         sync.stale |= window_changed;
         if !sync.stale {
             return;
@@ -315,14 +321,26 @@ fn update_accessibility_nodes(
 
         sync.stale = false;
         adapter.update_if_active(|| {
-            update_adapter(
-                nodes,
-                parents,
-                children,
-                primary_window,
-                primary_window_id,
-                focus,
-            )
+            if full {
+                return update_adapter(
+                    nodes,
+                    parents,
+                    children,
+                    primary_window,
+                    primary_window_id,
+                    focus,
+                );
+            }
+            TreeUpdate {
+                nodes: changes
+                    .changed_nodes
+                    .iter()
+                    .map(|(entity, node)| tree_node(entity, &node, &children, &nodes))
+                    .collect(),
+                tree: None,
+                tree_id: TreeId::ROOT,
+                focus: NodeId(focus.get().unwrap_or(primary_window_id).to_bits()),
+            }
         });
     });
 }
@@ -338,17 +356,13 @@ fn update_adapter(
     let mut to_update = vec![];
     let mut window_children = vec![];
     for (entity, node) in &nodes {
-        let mut node = (**node).clone();
         if !parents
             .iter_ancestors(entity)
             .any(|parent| nodes.contains(parent))
         {
             window_children.push(NodeId(entity.to_bits()));
         }
-        node.clear_children();
-        add_children_nodes(entity, &children, &nodes, &mut node);
-        let node_id = NodeId(entity.to_bits());
-        to_update.push((node_id, node));
+        to_update.push(tree_node(entity, node, &children, &nodes));
     }
     let mut window_node = window_node(
         primary_window
@@ -366,6 +380,19 @@ fn update_adapter(
         tree_id: TreeId::ROOT,
         focus: NodeId(focus.get().unwrap_or(primary_window_id).to_bits()),
     }
+}
+
+/// The node as published: its children are the nearest semantic descendants.
+fn tree_node(
+    entity: Entity,
+    node: &AccessibilityNode,
+    children: &Query<&Children>,
+    nodes: &Query<(Entity, &AccessibilityNode)>,
+) -> (NodeId, Node) {
+    let mut node = (**node).clone();
+    node.clear_children();
+    add_children_nodes(entity, children, nodes, &mut node);
+    (NodeId(entity.to_bits()), node)
 }
 
 fn window_bounds(window: &Window) -> Rect {
@@ -508,23 +535,27 @@ mod tests {
     }
 
     #[derive(Resource, Default)]
-    struct Stale(bool);
+    struct Structural(bool);
 
     #[test]
-    fn disabling_a_layout_entity_invalidates_the_tree() {
+    fn only_structural_changes_invalidate_the_tree() {
         let mut world = World::new();
         world.init_resource::<Messages<ActionRequestWrapper>>();
-        world.init_resource::<Stale>();
+        world.init_resource::<Structural>();
         let root = world.spawn(AccessibilityNode(Node::new(Role::Group))).id();
         let layout = world.spawn(ChildOf(root)).id();
-        world.spawn((AccessibilityNode(Node::new(Role::Button)), ChildOf(layout)));
+        let button = world
+            .spawn((AccessibilityNode(Node::new(Role::Button)), ChildOf(layout)))
+            .id();
         let mut schedule = Schedule::default();
-        schedule.add_systems(|mut changes: TreeChanges, mut stale: ResMut<Stale>| {
-            stale.0 = changes.any();
-        });
+        schedule.add_systems(
+            |mut changes: TreeChanges, mut structural: ResMut<Structural>| {
+                structural.0 = changes.structural();
+            },
+        );
         let mut stale = |world: &mut World| {
             schedule.run(world);
-            world.resource::<Stale>().0
+            world.resource::<Structural>().0
         };
         assert!(stale(&mut world));
         assert!(!stale(&mut world));
@@ -534,5 +565,14 @@ mod tests {
         world.entity_mut(layout).remove::<Disabled>();
         assert!(stale(&mut world));
         assert!(!stale(&mut world));
+        // Content is sent for the changed node alone.
+        world
+            .get_mut::<AccessibilityNode>(button)
+            .unwrap()
+            .set_bounds(Rect::new(0., 0., 1., 1.));
+        assert!(!stale(&mut world));
+        // A node without a semantic ancestor becomes a child of the window.
+        world.spawn(AccessibilityNode(Node::new(Role::Button)));
+        assert!(stale(&mut world));
     }
 }

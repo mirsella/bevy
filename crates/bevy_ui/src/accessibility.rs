@@ -5,17 +5,19 @@ use crate::{
     widget::{ImageNode, TextUiReader},
     ComputedNode, UiSystems,
 };
-use bevy_a11y::{AccessibilityNode, AccessibilitySystems};
+use bevy_a11y::{AccessibilityNode, AccessibilityRequested, AccessibilitySystems};
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::{
+    change_detection::{DetectChanges, Ref},
     component::Component,
-    hierarchy::ChildOf,
-    lifecycle::HookContext,
-    prelude::Entity,
-    query::{Changed, With, Without},
+    entity_disabling::Disabled,
+    hierarchy::{ChildOf, Children},
+    lifecycle::{HookContext, RemovedComponents},
+    prelude::{Entity, Mut},
+    query::{Added, Changed, With, Without},
     reflect::ReflectComponent,
     schedule::IntoScheduleConfigs,
-    system::{Commands, Query},
+    system::{Commands, Local, Query, Res, SystemParam},
     world::DeferredWorld,
 };
 use bevy_reflect::prelude::ReflectDefault;
@@ -40,18 +42,88 @@ fn calc_label(
     name.map(String::into_boxed_str)
 }
 
+/// Changes that move nodes into another coordinate space without touching them.
+#[derive(SystemParam)]
+struct AnchorChanges<'w, 's> {
+    reparented: Query<'w, 's, Entity, Changed<ChildOf>>,
+    accessible: Query<'w, 's, (), With<AccessibilityNode>>,
+    children: Query<'w, 's, &'static Children>,
+    orphaned: RemovedComponents<'w, 's, ChildOf>,
+    removed: RemovedComponents<'w, 's, AccessibilityNode>,
+    disabled: Query<'w, 's, (), Added<Disabled>>,
+    enabled: RemovedComponents<'w, 's, Disabled>,
+}
+
+impl AnchorChanges<'_, '_> {
+    fn any(&mut self) -> bool {
+        // Moving an entity only matters when it is a node or carries some, and
+        // any kind of entity can sit between a node and its accessible ancestor.
+        let (accessible, children) = (&self.accessible, &self.children);
+        let carries_nodes = |entity| {
+            accessible.contains(entity)
+                || children
+                    .iter_descendants(entity)
+                    .any(|descendant| accessible.contains(descendant))
+        };
+        // Every reader is drained so that none holds a removal for a later frame.
+        let orphaned = self.orphaned.read().filter(|&e| carries_nodes(e)).count();
+        let removed = self.removed.read().count() + self.enabled.read().count();
+        orphaned + removed > 0
+            || !self.disabled.is_empty()
+            || self.reparented.iter().any(carries_nodes)
+    }
+}
+
 fn sync_bounds_and_transforms(
+    requested: Res<AccessibilityRequested>,
+    mut paused: Local<bool>,
     mut accessible_nodes_query: Query<(
         Entity,
         &mut AccessibilityNode,
-        &ComputedNode,
-        &UiGlobalTransform,
+        Option<Ref<ComputedNode>>,
+        Ref<UiGlobalTransform>,
     )>,
     accessible_transform_query: Query<&UiGlobalTransform, With<AccessibilityNode>>,
-    semantic_only_nodes: Query<&AccessibilityNode, Without<UiGlobalTransform>>,
+    semantic_only_nodes: Query<Ref<AccessibilityNode>, Without<UiGlobalTransform>>,
     parents: Query<&ChildOf>,
+    mut anchors: AnchorChanges,
 ) {
-    for (entity, mut accessible, node, ui_transform) in &mut accessible_nodes_query {
+    if !requested.get() {
+        // Nothing reads the tree, and what changes meanwhile goes untracked.
+        *paused = true;
+        return;
+    }
+    let mut all = core::mem::take(&mut *paused)
+        | anchors.any()
+        | semantic_only_nodes.iter().any(|node| node.is_changed());
+    // A node is placed relative to its nearest accessible ancestor, so it only
+    // needs placing again when either of them changed.
+    let mut stale = Vec::new();
+    for (entity, accessible, node, ui_transform) in &mut accessible_nodes_query {
+        all |= accessible.is_added();
+        if accessible.is_changed()
+            || ui_transform.is_changed()
+            || node.is_some_and(|node| node.is_changed())
+        {
+            stale.push(entity);
+        }
+        if ui_transform.is_changed() {
+            stale.extend(anchors.children.iter_descendants(entity));
+        }
+    }
+    if all {
+        stale = accessible_nodes_query
+            .iter()
+            .map(|(entity, ..)| entity)
+            .collect();
+    }
+
+    for entity in stale {
+        let Ok((_, mut accessible, Some(node), ui_transform)) =
+            accessible_nodes_query.get_mut(entity)
+        else {
+            continue;
+        };
         // Semantic-only ancestors inherit their parent's UI coordinate space,
         // with any explicit AccessKit transforms composed along the way.
         let mut parent_transform = Affine::IDENTITY;
@@ -93,6 +165,38 @@ fn sync_bounds_and_transforms(
     }
 }
 
+/// Gives `entity` the role and label, flagging an existing node only when they differ.
+///
+/// The components that trigger this also change for reasons unrelated to semantics,
+/// such as an animated image color, and each flagged node sends the whole tree again.
+fn set_role_and_label(
+    commands: &mut Commands,
+    entity: Entity,
+    accessible: Option<Mut<AccessibilityNode>>,
+    role: Role,
+    label: Option<Box<str>>,
+) {
+    let Some(mut accessible) = accessible else {
+        let mut node = Node::new(role);
+        if let Some(label) = label {
+            node.set_label(label);
+        }
+        commands
+            .entity(entity)
+            .try_insert(AccessibilityNode::from(node));
+        return;
+    };
+    if accessible.role() == role && accessible.label() == label.as_deref() {
+        return;
+    }
+    accessible.set_role(role);
+    if let Some(label) = label {
+        accessible.set_label(label);
+    } else {
+        accessible.clear_label();
+    }
+}
+
 fn button_changed(
     mut commands: Commands,
     mut query: Query<(Entity, Option<&mut AccessibilityNode>), Changed<Button>>,
@@ -101,22 +205,7 @@ fn button_changed(
 ) {
     for (entity, accessible) in &mut query {
         let label = calc_label(&mut text_reader, ui_children.iter_ui_children(entity));
-        if let Some(mut accessible) = accessible {
-            accessible.set_role(Role::Button);
-            if let Some(name) = label {
-                accessible.set_label(name);
-            } else {
-                accessible.clear_label();
-            }
-        } else {
-            let mut node = Node::new(Role::Button);
-            if let Some(label) = label {
-                node.set_label(label);
-            }
-            commands
-                .entity(entity)
-                .try_insert(AccessibilityNode::from(node));
-        }
+        set_role_and_label(&mut commands, entity, accessible, Role::Button, label);
     }
 }
 
@@ -131,22 +220,7 @@ fn image_changed(
 ) {
     for (entity, accessible) in &mut query {
         let label = calc_label(&mut text_reader, ui_children.iter_ui_children(entity));
-        if let Some(mut accessible) = accessible {
-            accessible.set_role(Role::Image);
-            if let Some(label) = label {
-                accessible.set_label(label);
-            } else {
-                accessible.clear_label();
-            }
-        } else {
-            let mut node = Node::new(Role::Image);
-            if let Some(label) = label {
-                node.set_label(label);
-            }
-            commands
-                .entity(entity)
-                .try_insert(AccessibilityNode::from(node));
-        }
+        set_role_and_label(&mut commands, entity, accessible, Role::Image, label);
     }
 }
 
@@ -225,7 +299,8 @@ pub(crate) struct AccessibilityPlugin;
 
 impl Plugin for AccessibilityPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        // The UI also runs without the plugin that owns this resource.
+        app.init_resource::<AccessibilityRequested>().add_systems(
             PostUpdate,
             (
                 button_changed,
@@ -246,12 +321,13 @@ impl Plugin for AccessibilityPlugin {
 mod tests {
     use super::*;
     use bevy_app::Update;
-    use bevy_ecs::change_detection::DetectChanges;
 
     #[test]
     fn bounds_follow_the_nearest_semantic_parent_across_layout_entities() {
         let mut app = App::new();
-        app.add_systems(Update, sync_bounds_and_transforms);
+        app.init_resource::<AccessibilityRequested>()
+            .add_systems(Update, sync_bounds_and_transforms);
+        app.world().resource::<AccessibilityRequested>().set(true);
         let parent = app
             .world_mut()
             .spawn((
@@ -342,5 +418,119 @@ mod tests {
             UiGlobalTransform::from(bevy_math::Affine2::from_scale(bevy_math::Vec2::ZERO));
         app.update();
         assert_eq!(transform(&app), None);
+    }
+
+    #[test]
+    fn disabling_a_semantic_parent_moves_its_children() {
+        let mut app = App::new();
+        app.init_resource::<AccessibilityRequested>()
+            .add_systems(Update, sync_bounds_and_transforms);
+        app.world().resource::<AccessibilityRequested>().set(true);
+        let parent = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::TabList)),
+                UiGlobalTransform::from_xy(100., 200.),
+            ))
+            .id();
+        let tab = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::Tab)),
+                ComputedNode::default(),
+                UiGlobalTransform::from_xy(130., 240.),
+                ChildOf(parent),
+            ))
+            .id();
+        let transform = |app: &App| {
+            app.world()
+                .get::<AccessibilityNode>(tab)
+                .unwrap()
+                .transform()
+                .copied()
+        };
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+        for expected in [(130., 240.), (30., 40.)] {
+            let mut parent = app.world_mut().entity_mut(parent);
+            if parent.contains::<Disabled>() {
+                parent.remove::<Disabled>();
+            } else {
+                parent.insert(Disabled);
+            }
+            app.update();
+            assert_eq!(transform(&app), Some(Affine::translate(expected)));
+        }
+    }
+
+    #[test]
+    fn moving_a_layout_entity_moves_the_nodes_below_it() {
+        let mut app = App::new();
+        app.init_resource::<AccessibilityRequested>()
+            .add_systems(Update, sync_bounds_and_transforms);
+        app.world().resource::<AccessibilityRequested>().set(true);
+        let [near, far] = [(100., 200.), (0., 0.)].map(|(x, y)| {
+            app.world_mut()
+                .spawn((
+                    AccessibilityNode::from(Node::new(Role::TabList)),
+                    UiGlobalTransform::from_xy(x, y),
+                ))
+                .id()
+        });
+        let layout = app.world_mut().spawn(ChildOf(near)).id();
+        let tab = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::Tab)),
+                ComputedNode::default(),
+                UiGlobalTransform::from_xy(130., 240.),
+                ChildOf(layout),
+            ))
+            .id();
+        let transform = |app: &App| {
+            app.world()
+                .get::<AccessibilityNode>(tab)
+                .unwrap()
+                .transform()
+                .copied()
+        };
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+        // The tab itself is untouched: only an entity above it moved.
+        app.world_mut().entity_mut(layout).insert(ChildOf(far));
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((130., 240.))));
+        app.world_mut().entity_mut(layout).remove::<ChildOf>();
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((130., 240.))));
+        app.world_mut().entity_mut(layout).insert(ChildOf(near));
+        app.update();
+        assert_eq!(transform(&app), Some(Affine::translate((30., 40.))));
+    }
+
+    #[test]
+    fn bounds_wait_until_accessibility_is_requested() {
+        let mut app = App::new();
+        app.init_resource::<AccessibilityRequested>()
+            .add_systems(Update, sync_bounds_and_transforms);
+        let node = app
+            .world_mut()
+            .spawn((
+                AccessibilityNode::from(Node::new(Role::Button)),
+                ComputedNode {
+                    size: bevy_math::Vec2::new(20., 10.),
+                    ..Default::default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+        let bounds = |app: &App| app.world().get::<AccessibilityNode>(node).unwrap().bounds();
+        app.update();
+        app.update();
+        assert_eq!(bounds(&app), None);
+        // Nothing changed since the node spawned, yet it still has to be placed.
+        app.world().resource::<AccessibilityRequested>().set(true);
+        app.update();
+        assert_eq!(bounds(&app), Some(Rect::new(-10., -5., 10., 5.)));
     }
 }
