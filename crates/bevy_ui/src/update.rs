@@ -12,10 +12,27 @@ use bevy_app::Propagate;
 use bevy_camera::Camera;
 use bevy_ecs::{
     entity::Entity,
-    query::{Has, Or, With},
-    system::{Commands, Query, Res},
+    entity_disabling::Disabled,
+    hierarchy::{ChildOf, Children},
+    lifecycle::RemovedComponents,
+    query::{Added, Changed, Has, Or, With},
+    system::{Commands, Local, Query, Res},
 };
 use bevy_math::UVec2;
+use bevy_platform::hash::FixedHasher;
+use core::hash::{BuildHasher, Hash, Hasher};
+
+/// Entities whose place in the hierarchy decides which clip a node inherits.
+#[cfg(feature = "ghost_nodes")]
+type InUiTree = Or<(With<Node>, With<crate::experimental::GhostNode>)>;
+#[cfg(not(feature = "ghost_nodes"))]
+type InUiTree = With<Node>;
+
+/// Entities that became part of the tree after they were parented.
+#[cfg(feature = "ghost_nodes")]
+type Joined = Or<(Added<Node>, Added<crate::experimental::GhostNode>)>;
+#[cfg(not(feature = "ghost_nodes"))]
+type Joined = Added<Node>;
 
 /// Updates clipping for all nodes
 pub fn update_clipping_system(
@@ -29,7 +46,63 @@ pub fn update_clipping_system(
         Has<OverrideClip>,
     )>,
     ui_children: UiChildren,
+    clip_sources: Query<(
+        Entity,
+        &Node,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Has<OverrideClip>,
+    )>,
+    changed_children: Query<(), (Changed<Children>, InUiTree)>,
+    in_tree: Query<(), InUiTree>,
+    joined: Query<(), Joined>,
+    mut orphaned: RemovedComponents<ChildOf>,
+    mut unclipped: RemovedComponents<CalculatedClip>,
+    mut enabled: RemovedComponents<Disabled>,
+    #[cfg(feature = "ghost_nodes")] mut unghosted: RemovedComponents<
+        crate::experimental::GhostNode,
+    >,
+    mut last_sources: Local<u64>,
 ) {
+    // Most nodes only pass their parent's clip on, so the clips can only change
+    // with the hierarchy or with the few nodes that clip, hide or opt out. Those
+    // are compared by value because layout writes most geometry without ticks.
+    let mut sources = 0_u64;
+    for (entity, node, computed_node, transform, overrides) in &clip_sources {
+        let hidden = node.display == Display::None;
+        let clips = !node.overflow.is_visible();
+        if !(hidden || overrides || clips) {
+            continue;
+        }
+        let mut hasher = FixedHasher.build_hasher();
+        (entity, hidden, overrides).hash(&mut hasher);
+        if clips {
+            let rect = computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin);
+            for value in [rect.min, rect.max]
+                .into_iter()
+                .flat_map(|corner| corner.to_array())
+                .chain(transform.to_cols_array())
+            {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+        // Summed so that the order entities are stored in does not matter.
+        sources = sources.wrapping_add(hasher.finish());
+    }
+    // Every reader is drained so that none holds a removal for a later frame.
+    let mut removals = orphaned
+        .read()
+        .chain(unclipped.read())
+        .chain(enabled.read());
+    let left = removals.by_ref().filter(|&e| in_tree.contains(e)).count();
+    // An entity that stops being a ghost may have left the tree altogether.
+    #[cfg(feature = "ghost_nodes")]
+    let left = left + unghosted.read().count();
+    let joined_or_left = left > 0 || !changed_children.is_empty() || !joined.is_empty();
+    if core::mem::replace(&mut *last_sources, sources) == sources && !joined_or_left {
+        return;
+    }
+
     for root_node in root_nodes.iter() {
         update_clipping(
             &mut commands,
@@ -126,6 +199,10 @@ pub fn propagate_ui_target_cameras(
             With<Propagate<ComputedUiRenderTargetInfo>>,
         )>,
     >,
+    propagated: Query<(
+        Option<&Propagate<ComputedUiTargetCamera>>,
+        Option<&Propagate<ComputedUiRenderTargetInfo>>,
+    )>,
 ) {
     let default_camera_entity = default_ui_camera.get();
 
@@ -146,9 +223,12 @@ pub fn propagate_ui_target_cameras(
             .or(default_camera_entity)
             .unwrap_or(Entity::PLACEHOLDER);
 
-        commands
-            .entity(root_entity)
-            .try_insert(Propagate(ComputedUiTargetCamera { camera }));
+        // Inserting an unchanged value would still propagate it down the tree.
+        let (current_camera, current_info) = propagated.get(root_entity).unwrap_or_default();
+        let target_camera = Propagate(ComputedUiTargetCamera { camera });
+        if current_camera != Some(&target_camera) {
+            commands.entity(root_entity).try_insert(target_camera);
+        }
 
         let (scale_factor, physical_size) = camera_query
             .get(camera)
@@ -161,12 +241,13 @@ pub fn propagate_ui_target_cameras(
             })
             .unwrap_or((1., UVec2::ZERO));
 
-        commands
-            .entity(root_entity)
-            .try_insert(Propagate(ComputedUiRenderTargetInfo {
-                scale_factor,
-                physical_size,
-            }));
+        let target_info = Propagate(ComputedUiRenderTargetInfo {
+            scale_factor,
+            physical_size,
+        });
+        if current_info != Some(&target_info) {
+            commands.entity(root_entity).try_insert(target_info);
+        }
     }
 }
 
@@ -360,6 +441,41 @@ mod tests {
         assert!(world.get::<CalculatedClip>(grandchild).is_some());
     }
 
+    #[test]
+    fn clipping_reaches_nodes_that_join_a_settled_tree() {
+        use super::update_clipping_system;
+        use crate::{CalculatedClip, ComputedNode, Overflow};
+        use bevy_ecs::{entity_disabling::Disabled, prelude::*};
+        use bevy_math::Vec2;
+        let mut world = World::new();
+        let root = world
+            .spawn((
+                Node {
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                ComputedNode {
+                    size: Vec2::splat(100.),
+                    ..default()
+                },
+            ))
+            .id();
+        let disabled = world.spawn((Node::default(), Disabled, ChildOf(root))).id();
+        let late = world.spawn(ChildOf(root)).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_clipping_system);
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+
+        // Neither change touches the hierarchy or a node that clips.
+        world.entity_mut(disabled).remove::<Disabled>();
+        world.entity_mut(late).insert(Node::default());
+        schedule.run(&mut world);
+        schedule.run(&mut world); // Observe deferred CalculatedClip insertion.
+        assert!(world.get::<CalculatedClip>(disabled).is_some());
+        assert!(world.get::<CalculatedClip>(late).is_some());
+    }
+
     #[cfg(feature = "ghost_nodes")]
     #[test]
     fn clipping_tracks_ghost_root_promotion() {
@@ -387,6 +503,33 @@ mod tests {
         schedule.run(&mut world);
         assert!(world.get::<CalculatedClip>(child).is_none());
         world.entity_mut(root).add_child(ghost);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<CalculatedClip>(child),
+            Some(&CalculatedClip::FullyClipped)
+        );
+    }
+
+    #[cfg(feature = "ghost_nodes")]
+    #[test]
+    fn clipping_follows_entities_that_turn_into_ghosts() {
+        use super::update_clipping_system;
+        use crate::{experimental::GhostNode, CalculatedClip, Display};
+        use bevy_ecs::prelude::*;
+        let mut world = World::new();
+        let child = world.spawn(Node::default()).id();
+        let between = world.spawn_empty().add_child(child).id();
+        world
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .add_child(between);
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_clipping_system);
+        schedule.run(&mut world);
+        assert!(world.get::<CalculatedClip>(child).is_none());
+        world.entity_mut(between).insert(GhostNode);
         schedule.run(&mut world);
         assert_eq!(
             world.get::<CalculatedClip>(child),
